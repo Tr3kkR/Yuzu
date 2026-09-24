@@ -39,8 +39,12 @@
 /// only its blocking path applies `connect_timeout` per host. So the probe
 /// parses the DSN (`PQconninfoParse`) and tries each host in turn — a frozen
 /// first host of `host=n1,n2,n3` costs one deadline, not every tick (Gate 4
-/// UP-1, reproduced). Residual: one host NAME resolving to several addresses is
-/// iterated inside libpq and keeps the no-advance behaviour.
+/// UP-1, reproduced) — and a reconnect starts from the host that last worked.
+/// Residuals, all keeping libpq's no-advance behaviour: one host NAME resolving
+/// to several addresses (libpq iterates those itself), and a host list that
+/// comes from `service=` or `PGHOST` (PQconninfoParse does not expand either).
+/// With `target_session_attrs=read-write` libpq itself refuses a read-only host,
+/// so such a host reads `unreachable` (the log detail says why), not `read_only`.
 ///
 /// Any failure, AND reaching a server that does not accept writes, CLOSES the
 /// connection so the next tick reconnects. The probe query checks both
@@ -65,7 +69,9 @@
 /// (~200ms) because every wait checks the stop flag. `stop()` may run while
 /// HTTP handlers are still executing (they keep running after
 /// `web_server_->stop()` until `listen()` returns): that is safe because
-/// `snapshot()` only reads atomics. The OBJECT must therefore outlive the
+/// `snapshot()` only copies fields under the probe's own leaf mutex (a member,
+/// never held across I/O) and the publishing thread is already joined. The
+/// OBJECT must therefore outlive the
 /// web thread — ServerImpl keeps it as a member destroyed at `~ServerImpl`,
 /// never `reset()` inside `stop()`.
 

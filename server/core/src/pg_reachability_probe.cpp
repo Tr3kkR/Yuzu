@@ -132,9 +132,10 @@ std::vector<ConnTarget> build_targets(const std::string& dsn) {
     char* errmsg = nullptr;
     std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> opts(
         PQconninfoParse(dsn.c_str(), &errmsg), &PQconninfoFree);
-    if (errmsg)
-        PQfreemem(errmsg);
-    if (!opts) // unparseable: hand libpq the raw DSN so it reports the error
+    // Owned, never read: libpq's parse message can echo a DSN fragment, including
+    // part of a password (e.g. a bad percent-escape), so it must not reach a log.
+    const std::unique_ptr<char, decltype(&PQfreemem)> errmsg_owner(errmsg, &PQfreemem);
+    if (!opts) // unparseable: hand libpq the raw DSN; connect_one reports a fixed message
         return {ConnTarget{ConnOptions{{"dbname", dsn}}, true}};
     for (const PQconninfoOption* o = opts.get(); o->keyword != nullptr; ++o) {
         if (o->val == nullptr)
@@ -222,20 +223,30 @@ public:
     }
 
 private:
-    /// Try each target in order, each under its own kConnectDeadline. Returns
-    /// the last error on total failure, nullopt on success.
+    /// Try each target, each under its own kConnectDeadline, STARTING FROM THE
+    /// LAST ONE THAT WORKED. Without that, a reconnect behind two or more silent
+    /// hosts listed ahead of the primary would pay every one of their deadlines
+    /// on every reconnect and read Stale while healthy (Gate 8, consistency +
+    /// unhappy-path). Only a genuine move — the last good host itself gone —
+    /// walks the list. Returns every host's error on total failure.
     std::optional<std::string> connect_any(const std::atomic<bool>& stop) {
-        std::string last = "no connection target";
-        for (const auto& t : targets_) {
+        std::string errors;
+        const std::size_t n = targets_.size();
+        for (std::size_t k = 0; k < n; ++k) {
             if (stop.load(std::memory_order_acquire))
                 return std::string("stopped");
-            auto err = connect_one(t, stop);
-            if (!err)
+            const std::size_t i = (preferred_ + k) % n;
+            auto err = connect_one(targets_[i], stop);
+            if (!err) {
+                preferred_ = i;
                 return std::nullopt;
+            }
             conn_.reset();
-            last = std::move(*err);
+            if (n > 1)
+                errors += (errors.empty() ? "" : "; ") + ("host " + std::to_string(i + 1) + ": ");
+            errors += *err;
         }
-        return last;
+        return errors.empty() ? std::string("no connection target") : errors;
     }
 
     std::optional<std::string> connect_one(const ConnTarget& target,
@@ -256,8 +267,11 @@ private:
         PGconn* c = conn_.get();
         if (c == nullptr)
             return std::string("PQconnectStartParams returned null (out of memory)");
-        if (PQstatus(c) == CONNECTION_BAD)
+        if (PQstatus(c) == CONNECTION_BAD) {
+            if (target.expand_dbname) // the unparseable-DSN fallback: never echo libpq's text
+                return std::string("the configured Postgres DSN could not be parsed");
             return pq_error(c, "connection failed");
+        }
         // libpq contract: after PQconnectStart, proceed as if PQconnectPoll had
         // returned PGRES_POLLING_WRITING.
         PostgresPollingStatusType st = PGRES_POLLING_WRITING;
@@ -339,6 +353,7 @@ private:
     }
 
     std::vector<ConnTarget> targets_;
+    std::size_t preferred_{0}; ///< index of the last target that connected
     std::string sql_;
     pg::PgConn conn_;
 };

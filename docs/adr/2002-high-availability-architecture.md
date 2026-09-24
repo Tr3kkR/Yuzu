@@ -1572,8 +1572,8 @@ gaps closed:
   (`PgReachabilityProbe`, never a pool lease) now feeds a gating `pg_reachable` row: not ready after
   two failed probes, immediately on reaching a server that refuses writes (`pg_is_in_recovery()` or
   `transaction_read_only` — core is the sole writer, so a replica pointed at a standby, or at a primary
-  in read-only mode, cannot serve), or after 15 s without a success. Every libpq wait runs under a
-  client-side deadline (non-blocking API) because a blocking query against a frozen backend was
+  in read-only mode, cannot serve), or after 15 s without a success. Every libpq socket wait runs under a
+  client-side deadline (a host-name lookup is bounded by the system resolver instead) (non-blocking API) because a blocking query against a frozen backend was
   measured at 101 s; a multi-host DSN is split so each host gets its own deadline (libpq's
   non-blocking connect never advances past a silent first host); and a read-only answer drops the
   connection so the next probe re-resolves, rather than staying on a standby that a proxy, DNS name

@@ -410,7 +410,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a terminated backend is one blip, th
 
     REQUIRE(admin_scalar(db.dsn(),
                          "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
-                         "WHERE application_name = $1",
+                         "WHERE application_name = $1 AND datname = current_database()",
                          app)
                 .has_value());
     REQUIRE(wait_for_backends(db.dsn(), app, 0) == 0);
@@ -491,7 +491,19 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): stop() interrupts a real in-flight q
     auto probe = PgReachabilityProbe::make_libpq(
         dsn_with(db.dsn(), "application_name", "yuzu_ws8_probe_stopq"), {}, "SELECT pg_sleep(30)");
     probe->start();
-    std::this_thread::sleep_for(500ms); // connected, query in flight
+    // Wait until the probe's query is actually running server-side, so stop()
+    // lands in the QUERY wait, not the connect wait.
+    bool active = false;
+    for (int i = 0; i < 100 && !active; ++i) {
+        const auto n = admin_scalar(db.dsn(),
+                                    "SELECT count(*) FROM pg_stat_activity WHERE "
+                                    "application_name = $1 AND state = 'active'",
+                                    "yuzu_ws8_probe_stopq");
+        active = n && *n == "1";
+        if (!active)
+            std::this_thread::sleep_for(100ms);
+    }
+    REQUIRE(active);
     const auto t = std::chrono::steady_clock::now();
     probe->stop();
     CHECK(std::chrono::steady_clock::now() - t < 1s);
@@ -514,14 +526,24 @@ std::string multi_host_dsn(const std::string& dsn, const std::string& hosts,
     char* err = nullptr;
     std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> opts(
         PQconninfoParse(dsn.c_str(), &err), &PQconninfoFree);
-    if (err)
-        PQfreemem(err);
+    const std::unique_ptr<char, decltype(&PQfreemem)> err_owner(err, &PQfreemem);
+    // Keyword-DSN quoting: a value is single-quoted, and ' and \ inside it are
+    // backslash-escaped (libpq conninfo syntax).
+    auto quote = [](const char* v) {
+        std::string q = "'";
+        for (const char* c = v; *c; ++c) {
+            if (*c == '\'' || *c == '\\')
+                q += '\\';
+            q += *c;
+        }
+        return q + "'";
+    };
     std::string out = "host=" + hosts + " port=" + ports;
     for (const PQconninfoOption* o = opts.get(); o && o->keyword; ++o) {
         const std::string k = o->keyword;
         if (!o->val || k == "host" || k == "hostaddr" || k == "port")
             continue;
-        out += " " + k + "='" + o->val + "'";
+        out += " " + k + "=" + quote(o->val);
     }
     return out;
 }
@@ -538,8 +560,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     char* err = nullptr;
     std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> opts(
         PQconninfoParse(db.dsn().c_str(), &err), &PQconninfoFree);
-    if (err)
-        PQfreemem(err);
+    const std::unique_ptr<char, decltype(&PQfreemem)> err_owner(err, &PQfreemem);
     REQUIRE(opts);
     std::string pg_host = "localhost", pg_port = "5432";
     for (const PQconninfoOption* o = opts.get(); o->keyword; ++o) {
@@ -562,5 +583,20 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     probe->probe_once();
     CHECK(probe->verdict() == pr::Verdict::Ready);
     CHECK(std::chrono::steady_clock::now() - t2 < 1s);
+
+    // A RECONNECT starts from the host that last worked (Gate 8): kill the probe's
+    // backend; the next tick fails on the dead session, the one after reconnects
+    // straight to the second host — no second payment of the frozen host's deadline.
+    REQUIRE(admin_scalar(db.dsn(),
+                         "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+                         "WHERE application_name = $1 AND datname = current_database()",
+                         "yuzu-readyz-probe")
+                .has_value());
+    REQUIRE(wait_for_backends(db.dsn(), "yuzu-readyz-probe", 0) == 0);
+    probe->probe_once(); // dead session → one failure
+    const auto t3 = std::chrono::steady_clock::now();
+    probe->probe_once(); // reconnect
+    CHECK(probe->verdict() == pr::Verdict::Ready);
+    CHECK(std::chrono::steady_clock::now() - t3 < pr::kConnectDeadline - 1s);
 }
 #endif

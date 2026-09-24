@@ -7740,7 +7740,8 @@ public:
         // (same #1867 rationale as the NVD thread above), and its FIRST probe runs
         // SYNCHRONOUSLY here, before start_web_server() binds the listener, so
         // there is no post-bind `not_yet_probed` 503 window (every libpq wait is
-        // deadline-bounded — ≤ kConnectDeadline + kQueryDeadline). A failing first
+        // deadline-bounded — at most one kConnectDeadline per host in the DSN plus
+        // kQueryDeadline; a host-name lookup is bounded by the system resolver). A failing first
         // probe does NOT fail boot: the pool just proved Postgres reachable, so a
         // failure here is a transient blip or a broken dedicated-connection DSN —
         // either way /readyz reports it loudly and the node stays out of rotation,
@@ -9215,11 +9216,13 @@ public:
         // shutdown_drain_rules.hpp.
         {
             using namespace std::chrono;
-            // No NEW heavy maintenance from here on (RD-1): the catalogue roll-up is
-            // told to stop without a join (an in-flight recompute finishes and is
-            // joined later, as before); the app-perf loop watches draining_ itself.
-            // Otherwise a recompute starting inside the grace would add its full
-            // statement budget AFTER the grace, past the orchestrator's stop timeout.
+            // The two ROLL-UPS start no new work from here on (RD-1): the catalogue
+            // roll-up is told to stop without a join (an in-flight recompute finishes
+            // and is joined later, as before); the app-perf loop watches draining_
+            // itself. Those two are the maintenance passes whose join can wait out a
+            // long statement budget (120s / 60s); a recompute starting inside the
+            // grace would otherwise add that AFTER it. Other passes are unaffected —
+            // their stops are already bounded (e.g. NVD sync's 5s cancel-then-detach).
             if (software_catalog_rollup_)
                 software_catalog_rollup_->request_stop();
             const seconds min_grace{std::clamp(cfg_.shutdown_drain_seconds, 0,
@@ -9234,15 +9237,14 @@ public:
             for (;;) {
                 const auto elapsed = steady_clock::now() - drain_start;
                 std::size_t running = 0;
-                // Skip the running-executions query while this replica's probe says
-                // Postgres is unreachable: the query runs on a pooled connection with
-                // no client-side deadline, and against a frozen primary it can block
-                // ~100s, past the cap (Gate 3 SAFE-2). An unreachable database has no
-                // execution that can complete anyway.
-                const bool pg_ok = !pg_reachability_probe_ ||
-                                   pg_reachability_probe_->verdict() ==
-                                       pg_reachability::Verdict::Ready;
-                if (execution_tracker_ && pg_ok && elapsed < shutdown_drain::kExecutionDrainCap)
+                // Queried every tick, whatever the reachability probe says. Skipping
+                // it while the probe was not Ready (tried in governance round 1) ended
+                // the drain early on a probe false-negative — the probe refused at
+                // max_connections, or a slow probe query — while the pool still
+                // served and executions were still completing (Gate 8 UP-G8-1).
+                // Residual, pre-existing: against a FROZEN primary this pooled query
+                // has no client-side deadline and can overrun the cap.
+                if (execution_tracker_ && elapsed < shutdown_drain::kExecutionDrainCap)
                     running = execution_tracker_->query_executions({.status = "running"}).size();
                 if (!shutdown_drain::keep_draining(elapsed, min_grace, running > 0))
                     break;

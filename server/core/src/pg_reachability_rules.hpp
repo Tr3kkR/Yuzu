@@ -22,7 +22,9 @@
 ///
 /// Timing budget (why `kStaleAfter` is 15s): the normal gap between two
 /// successes is at most interval + connect deadline + query deadline =
-/// 2 + 5 + 2 = 9s, so 15s never reds a healthy replica. A FROZEN backend (a
+/// 2 + 5 + 2 = 9s, so 15s never reds a healthy replica. A reconnect starts from
+/// the host that last worked, so a multi-host DSN adds nothing in steady state;
+/// only a move to another host pays one connect deadline per host tried. A FROZEN backend (a
 /// `docker pause`d / black-holed primary whose kernel still ACKs, so no
 /// socket-level timeout fires) is normally caught before that by the probe's
 /// own client-side deadlines — the query times out (2s), the reconnect times

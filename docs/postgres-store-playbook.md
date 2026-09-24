@@ -535,7 +535,7 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   `/readyz`: every replica shares the database, so evicting one fixes nothing — it surfaces
   as the store's own request-path 503s (or, for a store that fails open, its degraded answers)
   and, where the store emits one, its `*_read_degrade_total` counter; several existing stores
-  (e.g. `deployment_store`, `result_set_store`, `session_store`, `notification_store`) have no
+  (e.g. `deployment_store`, `result_set_store`, `notification_store`) have no
   such counter, so only the HTTP 5xx rate shows it. A NEW store adds its `/readyz` (and
   `/health`) row for boot-state parity AND a `*_read_degrade_total{reason}` counter, so this
   decision holds for it.

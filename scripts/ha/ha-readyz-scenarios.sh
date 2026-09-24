@@ -142,30 +142,27 @@ boot() { # <dsn> [extra server flags...]
 }
 # wait_exit <limit-s> <start-epoch> — wait for the server to exit WITHOUT sending
 # anything (a SECOND SIGTERM is the documented hard exit, which would fake a fast
-# graceful stop); echoes seconds since <start-epoch>.
+# graceful stop). Sets ELAPSED (seconds since <start-epoch>) and clears SERVER_PID
+# on exit. Call it directly, never as $(wait_exit ...): a command-substitution
+# subshell would clear SERVER_PID only in the subshell.
+ELAPSED=0
 wait_exit() {
     local limit="$1" start="$2" now
     while kill -0 "$SERVER_PID" 2>/dev/null; do
         now=$(date +%s)
-        (( now - start >= limit )) && { echo $((now - start)); return 1; }
+        ELAPSED=$((now - start))
+        (( ELAPSED >= limit )) && return 1
         sleep 0.5
     done
     wait "$SERVER_PID" 2>/dev/null
     SERVER_PID=""
-    now=$(date +%s); echo $((now - start))
+    ELAPSED=$(( $(date +%s) - start ))
 }
-stop_server() { # ONE graceful SIGTERM, then wait up to <limit>s; echoes seconds taken
-    local limit="${1:-60}" start now
+stop_server() { # ONE graceful SIGTERM, then wait up to <limit>s (sets ELAPSED)
+    local limit="${1:-60}" start
     start=$(date +%s)
     kill -TERM "$SERVER_PID" 2>/dev/null
-    while kill -0 "$SERVER_PID" 2>/dev/null; do
-        now=$(date +%s)
-        (( now - start >= limit )) && { echo $((now - start)); return 1; }
-        sleep 0.5
-    done
-    wait "$SERVER_PID" 2>/dev/null
-    SERVER_PID=""
-    now=$(date +%s); echo $((now - start))
+    wait_exit "$limit" "$start"
 }
 
 start_pg "$PG" "$PGPORT" || { echo "postgres did not start" >&2; exit 2; }
@@ -201,7 +198,7 @@ if t=$(wait_for /readyz 200 15); then pass "/readyz 200 again ${t}s after the re
 else fail "/readyz did not recover within 15s: $(body /readyz)"; fi
 
 echo "== C: drain (--shutdown-drain-seconds 5)"
-stop_server 120 >/dev/null
+stop_server 120
 boot "$DSN" --shutdown-drain-seconds 5 || exit 1
 sig_at=$(date +%s)
 kill -TERM "$SERVER_PID"
@@ -210,9 +207,9 @@ else fail "/readyz not draining after SIGTERM: $(body /readyz)"; fi
 sleep 2
 [[ "$(code /livez)" == 200 ]] && pass "/livez 200 inside the grace window" || fail "/livez not served inside the grace window"
 [[ "$(code /health)" == 200 ]] && pass "/health (an ordinary route) served inside the grace window" || fail "/health not served inside the grace window"
-if t=$(wait_exit 60 "$sig_at"); then
-    if (( t >= 5 )); then pass "server exited ${t}s after SIGTERM (grace 5s honoured)"
-    else fail "server exited ${t}s after SIGTERM — before the 5s grace"; fi
+if wait_exit 60 "$sig_at"; then
+    if (( ELAPSED >= 5 )); then pass "server exited ${ELAPSED}s after SIGTERM (grace 5s honoured)"
+    else fail "server exited ${ELAPSED}s after SIGTERM — before the 5s grace"; fi
 else fail "server still running 60s after SIGTERM"; fi
 
 echo "== F: drain x frozen primary (--shutdown-drain-seconds 10)"
@@ -233,17 +230,17 @@ else fail "/livez took ${lt}s inside the grace"; fi
 # without a drain grace — measured identically at --shutdown-drain-seconds 0.
 # Tracked as #3706's class. So F asserts only that the grace is honoured (no
 # exit before it), reports the exit time, and unpauses to let the process go.
-if t=$(wait_exit 30 "$sig_at"); then
-    if (( t >= 10 )); then pass "server exited ${t}s after SIGTERM with the database frozen (grace 10s)"
-    else fail "server exited ${t}s after SIGTERM — before the 10s grace"; fi
+if wait_exit 30 "$sig_at"; then
+    if (( ELAPSED >= 10 )); then pass "server exited ${ELAPSED}s after SIGTERM with the database frozen (grace 10s)"
+    else fail "server exited ${ELAPSED}s after SIGTERM — before the 10s grace"; fi
 else
-    echo "  NOTE  server still in teardown ${t}s after SIGTERM with the database frozen —"
+    echo "  NOTE  server still in teardown ${ELAPSED}s after SIGTERM with the database frozen —"
     echo "        pre-existing join overrun (#3706 class), not the drain grace; unpausing"
 fi
 docker unpause "$PG" >/dev/null
 if [[ -n "$SERVER_PID" ]]; then
-    if t=$(wait_exit 240 "$sig_at"); then pass "server exited ${t}s after SIGTERM once the database thawed"
-    else fail "server still running ${t}s after SIGTERM even after the database thawed"; fi
+    if wait_exit 240 "$sig_at"; then pass "server exited ${ELAPSED}s after SIGTERM once the database thawed"
+    else fail "server still running ${ELAPSED}s after SIGTERM even after the database thawed"; fi
 fi
 
 echo "== E: frozen first host of a multi-host DSN"
@@ -260,11 +257,11 @@ done
 if [[ "$(code /readyz)" == 200 ]] && (( max_red <= 20 )); then
     pass "/readyz 200 via the second host 20s after freezing the first (longest red run $((max_red / 2))s)"
 else fail "/readyz not back to 200 via the second host: $(body /readyz) (longest red run $((max_red / 2))s)"; fi
-stop_server 210 >/dev/null
+stop_server 210
 bstart=$(date +%s)
 if boot "$MDSN"; then pass "a server booted with the first host frozen became ready in $(( $(date +%s) - bstart ))s"
 else fail "a server booted with the first host frozen never became ready"; fi
-stop_server 210 >/dev/null
+stop_server 210
 docker unpause "$PG" >/dev/null
 
 echo

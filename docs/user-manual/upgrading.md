@@ -196,7 +196,7 @@ What you may observe after upgrading:
   set it for any deployment behind a load balancer, **and raise your orchestrator's stop timeout by the
   same amount** (guidance in `docs/user-manual/server-admin.md`, "Load balancers and shutdown drain"). The
   execution-drain wait it sits alongside is now timed in wall-clock seconds (at most 30 s) rather than
-  counted as 30 polls, and is skipped while Postgres is unreachable.
+  counted as 30 polls.
 - **`/readyz` also goes red on a primary that refuses writes** (`default_transaction_read_only` on — some
   managed Postgres services do this when storage fills), reported as `"pg":"read_only"`.
 - **Docker healthchecks.** The demo and viz-UAT composes healthcheck `/readyz`; that is right for

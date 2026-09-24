@@ -19,10 +19,11 @@
 ///      `kExecutionDrainCap` from drain start.
 ///
 /// Total wait is therefore max(N, time for executions to finish), normally at
-/// most max(N, kExecutionDrainCap). stop() skips the executions query while the
-/// reachability probe reports Postgres unreachable; one query already in flight
-/// when a primary freezes can still overrun (it runs on a pooled connection with
-/// no client-side deadline).
+/// most max(N, kExecutionDrainCap). Residual: the executions query runs on a
+/// pooled connection with no client-side deadline, so against a FROZEN primary
+/// one query can overrun the cap. (Skipping the query while the reachability
+/// probe is not Ready was tried and reverted: a probe false-negative then ended
+/// the drain while executions were still completing.)
 ///
 /// WHAT THIS DOES TO THE STOP BUDGET — and what it does not claim. The grace ADDS
 /// up to N seconds to the front of a stacked shutdown whose other stages (the

@@ -230,8 +230,9 @@ struct Deps {
     pg::PgPool* pg_pool{nullptr};
     /// HA WS-8 (ADR-2002 §12): the runtime Postgres-reachability probe —
     /// `/readyz`'s gating `pg_reachable` row, and the `yuzu_server_pg_*`
-    /// reachability gauges refreshed on `/metrics` scrape. Read through
-    /// lock-free atomics only (`snapshot()`/`verdict()`). Null degrades
+    /// reachability gauges refreshed on `/metrics` scrape. Read only through
+    /// `snapshot()`/`verdict()` — a copy under the probe's leaf mutex, never
+    /// held across I/O, so a stalled probe cannot stall a handler. Null degrades
     /// FAIL-CLOSED (row reports not ready), matching the store-pointer idiom;
     /// never null in production whenever `pg_pool` is set.
     PgReachabilityProbe* pg_reachability_probe{nullptr};

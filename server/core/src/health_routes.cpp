@@ -107,9 +107,9 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
                 deps.metrics->gauge("yuzu_server_command_outbox_pending")
                     .set(static_cast<double>(*pending));
         }
-        // HA WS-8: Postgres reachability as THIS replica sees it (lock-free
-        // read of the probe). Set on scrape so the value is never older than
-        // the scrape itself.
+        // HA WS-8: Postgres reachability as THIS replica sees it (a leaf-locked
+        // copy of the probe's snapshot, no I/O). Set on scrape so the value is
+        // never older than the scrape itself.
         if (deps.pg_reachability_probe) {
             const auto snap = deps.pg_reachability_probe->snapshot();
             const auto now = yuzu::server::PgReachabilityProbe::now_ns();
@@ -194,7 +194,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         bool pg_pool_ok =
             deps.pg_pool && deps.pg_pool->valid() && !deps.pg_pool->connect_breaker_open();
         // HA WS-8: the runtime reachability probe — mirrors /readyz's gating
-        // `pg_reachable` row so the two probes agree (lock-free atomics, no I/O).
+        // `pg_reachable` row so the two probes agree (a leaf-locked copy, no I/O).
         bool pg_reachable_ok =
             deps.pg_reachability_probe &&
             deps.pg_reachability_probe->verdict() == yuzu::server::pg_reachability::Verdict::Ready;
@@ -651,7 +651,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // core cannot reach Postgres. The pg_pool row above cannot: its
             // breaker arms only when a NEW connect fails, so with idle pooled
             // connections (or no traffic) it stays green through an outage.
-            // Lock-free read of the probe's atomics; a null probe fails closed.
+            // A leaf-locked copy of the probe's snapshot (no I/O); a null probe fails closed.
             {"pg_reachable", pg_verdict == yuzu::server::pg_reachability::Verdict::Ready},
             // First migrated store (#1368). The server fails closed without
             // Postgres, so this is true whenever it serves; a false here is
