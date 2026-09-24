@@ -2846,6 +2846,27 @@ TEST_CASE("POST /api/v1/result-sets: a malformed or empty parent_id is refused w
     }
 }
 
+// #4734: this route had no length bound on parent_id at all -- an oversized
+// value was copied verbatim into the persisted source_payload's
+// scope_input_id with no cap.
+TEST_CASE("POST /api/v1/result-sets: an oversized parent_id is refused with 400",
+          "[pg][result_set][security][4734]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["name"] = "x";
+    body["parent_id"] = std::string(65, 'p');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("parent_id must be at most 64 bytes") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
 TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",
           "[pg][result_set][async][tar][security][depth]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
