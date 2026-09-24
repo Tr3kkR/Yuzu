@@ -16389,19 +16389,11 @@ private:
         // device/group/tag_cohort/version_devices) internally, and is the SOLE
         // consumer every surface (REST, MCP, dashboard) reads.
         //
-        // GAP-1 (#4857): `.tag_values` has NO home in `DexPerfApi` (no public
-        // fleet-wide "distinct tag values" resource exists yet — see
-        // `DexRoutes::TagValuesFn`'s own doc comment) — kept here, standalone,
-        // as a disclosed presentation-side data dependency outside the seam.
-        DexRoutes::TagValuesFn dex_tag_values_fn =
-            [this](const std::string& tag_key) -> std::optional<std::vector<std::string>> {
-            if (!tag_store_)
-                return std::nullopt;
-            auto values = tag_store_->get_distinct_values(tag_key);
-            if (!values)
-                return std::nullopt;
-            return *values;
-        };
+        // GAP-1 CLOSED (#4857, architect D1 ruling): the model-picker's
+        // device-model scope-selector values no longer need a standalone
+        // TagStore-reading lambda here — `DexRoutes` now derives them
+        // in-seam from `dex_perf_api`'s own `fleet_snapshot` (see
+        // `DexPerfApi`'s own doc comment).
         // ADR-0031 WS-A4 #4250: the /auto VERIFY compare resource's store-reaching
         // assembly (members-then-B1-rows, ADR-0012 §1) moved verbatim behind the
         // VerifyApi seam (verify_api.{hpp,cpp}) — ONE instance, shared by the
@@ -16546,10 +16538,7 @@ private:
             // The devices-by-version drill's sole gate (ADR-0017) — the SAME
             // fleet_read_fn lambda wired into RestApiV1/McpServer, so all three
             // surfaces resolve visibility identically.
-            fleet_read_fn,
-            // GAP-1 (#4857): the device-model scope selector's distinct-tag-
-            // values reader (see TagValuesFn's own doc comment).
-            dex_tag_values_fn);
+            fleet_read_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).

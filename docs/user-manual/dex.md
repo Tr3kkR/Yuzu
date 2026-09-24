@@ -210,7 +210,16 @@ numbers match.
   **mutually exclusive**: picking one clears the other, and a management
   group takes precedence if a URL somehow names both. Choosing a model calls
   the same trend read the `GET /api/v1/dex/perf/tag` / `get_dex_tag_app_perf`
-  endpoints expose. A **version filter**
+  endpoints expose. The **Model** picker's own value list is the current fleet
+  snapshot's device-model cohorts — the SAME population `GET
+  /api/v1/dex/perf/cohorts?key=model` reports, so the two can never disagree —
+  which means it lists device models **seen reporting performance in the
+  current heartbeat cycle**, not every model ever tagged; a model with only
+  retained historical data (no device of that model currently reporting) is
+  omitted from the dropdown but can still be viewed directly by URL
+  (`?model=<value>`). When no device is reporting this cycle (or the
+  read is unavailable), the picker shows an honest "no reporting devices this
+  cycle" note instead of an empty or misleading selector. A **version filter**
   narrows the trend to one version at a time (the same `version` parameter the
   `GET /api/v1/dex/perf/app` / `/perf/group` / `/perf/tag` endpoints already
   accept); "all
