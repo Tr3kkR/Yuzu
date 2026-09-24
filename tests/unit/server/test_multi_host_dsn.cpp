@@ -146,7 +146,8 @@ TEST_CASE("multi-host DSN guard: load_balance_hosts is refused, whatever else th
         CHECK(r.error().find("s3cret") == std::string::npos);
     }
     SECTION("an unrecognised value is refused and not echoed") {
-        const auto r = enforce_multi_host_read_write("host=a,b load_balance_hosts='x password=hunter2'");
+        const auto r =
+            enforce_multi_host_read_write("host=a,b load_balance_hosts='x password=hunter2'");
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().find("hunter2") == std::string::npos);
     }

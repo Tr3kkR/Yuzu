@@ -7740,11 +7740,12 @@ public:
         // (same #1867 rationale as the NVD thread above), and its FIRST probe runs
         // SYNCHRONOUSLY here, before start_web_server() binds the listener, so
         // there is no post-bind `not_yet_probed` 503 window (every libpq wait is
-        // deadline-bounded — at most one kConnectDeadline per host in the DSN plus
-        // kQueryDeadline; a host-name lookup is bounded by the system resolver). A
-        // failing first
-        // probe does NOT fail boot: the pool just proved Postgres reachable, so a
-        // failure here is a transient blip or a broken dedicated-connection DSN —
+        // deadline-bounded: a single host at most kConnectDeadline, a host list the
+        // pool's connect_timeout per host address — the same wait as one of the
+        // pool's own connects — plus kQueryDeadline; a host-name lookup is bounded
+        // by the system resolver). A failing first probe does NOT fail boot: the
+        // pool just proved Postgres reachable, so a failure here is a transient
+        // blip or a broken dedicated-connection DSN —
         // either way /readyz reports it loudly and the node stays out of rotation,
         // which is the correct posture, rather than refusing to start.
         if (pg_pool_ && !startup_failed_) {
@@ -7757,8 +7758,7 @@ public:
                     metrics_.counter("yuzu_server_pg_reachability_probe_failures_total")
                         .increment();
                 }},
-                std::string(PgReachabilityProbe::kProbeSql),
-                pg::PgPool::Options{}.connect_timeout_s);
+                std::string(PgReachabilityProbe::kProbeSql), pg_pool_->connect_timeout_s());
             pg_reachability_probe_->probe_once();
             const auto v = pg_reachability_probe_->verdict();
             if (v != pg_reachability::Verdict::Ready) {

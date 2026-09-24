@@ -61,13 +61,9 @@ std::string rebuild_with_read_write(const Values& v) {
         if (key == kTsa)
             continue;
         out += key;
-        out += "='";
-        for (const char ch : val) {
-            if (ch == '\'' || ch == '\\')
-                out += '\\';
-            out += ch;
-        }
-        out += "' ";
+        out += '=';
+        out += quote_conninfo_value(val);
+        out += ' ';
     }
     out += kTsa;
     out += "='read-write'";
@@ -75,6 +71,47 @@ std::string rebuild_with_read_write(const Values& v) {
 }
 
 } // namespace
+
+std::string quote_conninfo_value(std::string_view value) {
+    std::string out = "'";
+    for (const char ch : value) {
+        if (ch == '\'' || ch == '\\')
+            out += '\\';
+        out += ch;
+    }
+    out += '\'';
+    return out;
+}
+
+std::expected<void, std::string> check_effective_connection(PGconn* conn) {
+    if (conn == nullptr)
+        return std::unexpected(std::string("no connection to check"));
+    const OptionsPtr info(PQconninfo(conn), &PQconninfoFree);
+    if (!info)
+        return std::unexpected(std::string("could not read the connection's settings"));
+    const Values v = values_of(info.get());
+    const std::string_view lbh = get(v, "load_balance_hosts");
+    if (!lbh.empty() && lbh != "disable")
+        return std::unexpected(
+            std::string("load_balance_hosts") + (lbh == "random" ? "=random" : "") +
+            " is set in the Postgres connection settings (a service file or the environment) "
+            "and is not supported for the server: remove it, or set load_balance_hosts=disable.");
+    const std::size_t hosts =
+        std::max<std::size_t>({list_len(get(v, "host")), list_len(get(v, "hostaddr")), 1});
+    const std::string_view tsa = get(v, kTsa);
+    if (hosts >= 2 && tsa != "read-write" && tsa != "primary") {
+        const bool known = std::ranges::find(kKnownTsaValues, tsa) != std::end(kKnownTsaValues);
+        return std::unexpected(
+            "the Postgres connection settings list " + std::to_string(hosts) +
+            " hosts (from a service file or the environment) with " +
+            (tsa.empty() ? std::string("no target_session_attrs")
+                         : "target_session_attrs=" +
+                               (known ? std::string(tsa) : std::string("<unrecognised>"))) +
+            ": set target_session_attrs=read-write where the host list is defined, so the "
+            "server only connects to a writable primary.");
+    }
+    return {};
+}
 
 std::expected<MultiHostDsn, std::string> enforce_multi_host_read_write(const std::string& dsn) {
     MultiHostDsn out{.dsn = dsn};

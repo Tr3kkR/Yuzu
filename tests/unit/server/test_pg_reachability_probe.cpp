@@ -10,6 +10,7 @@
 #include "shutdown_drain_rules.hpp"
 
 #include "../test_helpers.hpp"
+#include "pg/multi_host_dsn.hpp"
 #include "pg/pg_raii.hpp"
 
 #include <libpq-fe.h>
@@ -29,6 +30,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <filesystem>
+#include <fstream>
 #include <tuple>
 
 #ifndef _WIN32
@@ -52,6 +55,10 @@ namespace {
 /// exactly as a pool built with that default would — and the tests stay fast.
 constexpr int kTestPoolConnectTimeoutS = 3;
 constexpr std::chrono::seconds kTestHostWait{kTestPoolConnectTimeoutS};
+/// Before libpq 17 its blocking connect — and so the probe, which reproduces it
+/// — times connect_timeout in whole wall-clock seconds, so a host-list wait lands
+/// anywhere in (timeout - 1s, timeout + 1s). Lower bounds allow for that.
+constexpr std::chrono::seconds kWallJitter{1};
 
 std::unique_ptr<PgReachabilityProbe> make_host_list_probe(const std::string& dsn) {
     return PgReachabilityProbe::make_libpq(dsn, {}, std::string(PgReachabilityProbe::kProbeSql),
@@ -615,7 +622,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     probe->probe_once();
     const auto took = std::chrono::steady_clock::now() - t;
     CHECK(probe->verdict() == pr::Verdict::Ready);
-    CHECK(took >= kTestHostWait - 100ms); // paid the frozen host's connect_timeout once
+    CHECK(took >= kTestHostWait - kWallJitter - 100ms); // paid the frozen host's timeout once
     CHECK(took < kTestHostWait + 5s);
     // The connection is now held on the second host: the next tick is fast.
     const auto t2 = std::chrono::steady_clock::now();
@@ -637,7 +644,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     const auto t3 = std::chrono::steady_clock::now();
     probe->probe_once(); // reconnect: frozen host first, then the second host
     CHECK(probe->verdict() == pr::Verdict::Ready);
-    CHECK(std::chrono::steady_clock::now() - t3 >= kTestHostWait - 100ms);
+    CHECK(std::chrono::steady_clock::now() - t3 >= kTestHostWait - kWallJitter - 100ms);
 }
 #endif
 
@@ -812,7 +819,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a silent first host from a PGHOST li
     probe->probe_once();
     const auto took = std::chrono::steady_clock::now() - t;
     CHECK(probe->verdict() == pr::Verdict::Ready);
-    CHECK(took >= kTestHostWait - 100ms);
+    CHECK(took >= kTestHostWait - kWallJitter - 100ms);
     CHECK(took < kTestHostWait + 5s);
 }
 
@@ -849,6 +856,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): an empty host entry whose default so
     probe->probe_once();
     const auto took = std::chrono::steady_clock::now() - t;
     CHECK(probe->verdict() == pr::Verdict::Ready);
+    CHECK(took >= kTestHostWait - kWallJitter - 100ms); // really reached the silent socket
     CHECK(took < 2 * kTestHostWait + 5s);
 }
 
@@ -871,7 +879,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): the per-host deadline follows the DS
         probe->probe_once();
         const auto took = std::chrono::steady_clock::now() - t;
         CHECK(probe->verdict() == pr::Verdict::Ready);
-        CHECK(took >= 2s - 100ms);
+        CHECK(took >= 2s - kWallJitter - 100ms);
         CHECK(took < pr::kConnectDeadline - 1s);
     }
     SECTION("connect_timeout=8: the probe waits the full 8s on the silent host, as the pool does") {
@@ -882,8 +890,42 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): the per-host deadline follows the DS
         probe->probe_once();
         const auto took = std::chrono::steady_clock::now() - t;
         CHECK(probe->verdict() == pr::Verdict::Ready);
-        CHECK(took >= 8s - 100ms);
+        CHECK(took >= 8s - kWallJitter - 100ms);
         CHECK(took < 8s + 5s);
+    }
+    SECTION("PGCONNECT_TIMEOUT applies when the DSN sets none, as it does for the pool") {
+        struct EnvRestore {
+            std::optional<std::string> saved;
+            EnvRestore() {
+                if (const char* v = std::getenv("PGCONNECT_TIMEOUT"))
+                    saved = v;
+            }
+            ~EnvRestore() {
+                if (saved)
+                    ::setenv("PGCONNECT_TIMEOUT", saved->c_str(), 1);
+                else
+                    ::unsetenv("PGCONNECT_TIMEOUT");
+            }
+        } restore;
+        ::setenv("PGCONNECT_TIMEOUT", "2", 1);
+        auto probe = make_host_list_probe(dsn); // pool default 3s, overridden by the env
+        const auto t = std::chrono::steady_clock::now();
+        probe->probe_once();
+        const auto took = std::chrono::steady_clock::now() - t;
+        CHECK(probe->verdict() == pr::Verdict::Ready);
+        CHECK(took >= 2s - kWallJitter - 100ms);
+        CHECK(took < 3s + kWallJitter);
+    }
+    SECTION("a SINGLE host is capped at kConnectDeadline even with a longer connect_timeout") {
+        auto probe = PgReachabilityProbe::make_libpq(
+            "host=127.0.0.1 port=" + std::to_string(frozen.port) +
+            " dbname=yuzu user=yuzu connect_timeout=30");
+        const auto t = std::chrono::steady_clock::now();
+        probe->probe_once();
+        const auto took = std::chrono::steady_clock::now() - t;
+        CHECK(probe->verdict() == pr::Verdict::Unreachable);
+        CHECK(took >= pr::kConnectDeadline - 100ms);
+        CHECK(took < pr::kConnectDeadline + 3s);
     }
     SECTION("connect_timeout=0: the pool would wait for ever, so the probe does not move on") {
         auto probe = PgReachabilityProbe::make_libpq(dsn + " connect_timeout=0");
@@ -897,7 +939,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): the per-host deadline follows the DS
         probe->probe_once();
         const auto took = std::chrono::steady_clock::now() - t;
         CHECK(probe->verdict() == pr::Verdict::Ready);
-        CHECK(took >= 3s - 100ms);
+        CHECK(took >= 3s - kWallJitter - 100ms);
         CHECK(took < pr::kConnectDeadline - 1s);
     }
 }
@@ -918,7 +960,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): the restart over untried hosts — a
         probe->probe_once();
         const auto took = std::chrono::steady_clock::now() - t;
         CHECK(probe->verdict() == pr::Verdict::Unreachable);
-        CHECK(took >= 2 * kTestHostWait - 200ms);
+        CHECK(took >= 2 * (kTestHostWait - kWallJitter) - 200ms);
         CHECK(took < 3 * kTestHostWait + 2s);
     }
     SECTION("a silent host listed twice costs one deadline, not two") {
@@ -939,6 +981,97 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): the restart over untried hosts — a
         auto probe = make_host_list_probe(dsn);
         probe->probe_once();
         CHECK(probe->verdict() == pr::Verdict::Ready);
+    }
+}
+
+TEST_CASE("PgReachabilityProbe (libpq, pg): a restart keeps an EMPTY list entry (the default) "
+          "instead of dropping it",
+          "[server][readyz][pg_reachability][pg]") {
+    // Gate 8 round 7 (cross-platform, cpp-safety, unhappy-path): the restart
+    // passed host/hostaddr/port as separate array entries, and libpq drops an
+    // empty one — so an untried entry whose value is EMPTY (the default) lost it
+    // and the DSN's original list came back. Here the second entry's hostaddr is
+    // empty (resolve the host name); the old restart re-sent hostaddr=127.0.0.1,
+    // for one host and libpq refused the mismatched lists.
+    YUZU_REQUIRE_PG_DB(db);
+    SilentListener frozen;
+    REQUIRE(frozen.port > 0);
+    const auto [pg_host, pg_port] = pg_host_port(db.dsn());
+    std::string dsn = multi_host_dsn(db.dsn(), "127.0.0.1," + pg_host,
+                                     std::to_string(frozen.port) + "," + pg_port);
+    dsn += " hostaddr='127.0.0.1,'";
+    auto probe = make_host_list_probe(dsn);
+    probe->probe_once();
+    CHECK(probe->verdict() == pr::Verdict::Ready);
+}
+
+TEST_CASE("check_effective_connection: a service file's load_balance_hosts or read-write-less "
+          "host list refuses the connection settings",
+          "[server][readyz][multi_host_dsn][pg]") {
+    // Gate 8 round 7 (architect, consistency-auditor, cpp-expert,
+    // security-guardian, unhappy-path): the DSN-only guard cannot see a
+    // service file, which libpq applies at connect time. main.cpp checks what
+    // libpq resolved on the first pooled connection.
+    YUZU_REQUIRE_PG_DB(db);
+    const auto [pg_host, pg_port] = pg_host_port(db.dsn());
+    yuzu::test::TempDir dir("yuzu_test_readyz_svc_");
+    std::filesystem::create_directories(dir.path);
+    const auto svc_file = dir.path / "pg_service.conf";
+    std::string no_hosts; // the test DSN without host/hostaddr/port
+    {
+        char* err = nullptr;
+        std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> opts(
+            PQconninfoParse(db.dsn().c_str(), &err), &PQconninfoFree);
+        const std::unique_ptr<char, decltype(&PQfreemem)> err_owner(err, &PQfreemem);
+        REQUIRE(opts);
+        for (const PQconninfoOption* o = opts.get(); o->keyword; ++o) {
+            const std::string k = o->keyword;
+            if (!o->val || k == "host" || k == "hostaddr" || k == "port")
+                continue;
+            no_hosts += k + "=" + yuzu::server::pg::quote_conninfo_value(o->val) + " ";
+        }
+    }
+    struct EnvRestore {
+        const char* name;
+        std::optional<std::string> saved;
+        explicit EnvRestore(const char* n) : name(n) {
+            if (const char* v = std::getenv(n))
+                saved = v;
+        }
+        ~EnvRestore() {
+            if (saved)
+                ::setenv(name, saved->c_str(), 1);
+            else
+                ::unsetenv(name);
+        }
+    } restore{"PGSERVICEFILE"};
+    ::setenv("PGSERVICEFILE", svc_file.string().c_str(), 1);
+    auto check_with = [&](const std::string& entry) {
+        {
+            std::ofstream f(svc_file, std::ios::trunc);
+            f << "[yzsvc]\n" << entry;
+        }
+        yuzu::server::pg::PgConn c{PQconnectdb((no_hosts + "service=yzsvc").c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        return yuzu::server::pg::check_effective_connection(c.get());
+    };
+    const std::string hosts = "host=" + pg_host + "," + pg_host + "\nport=" + pg_port + "\n";
+    SECTION("load_balance_hosts=random in the service file is refused") {
+        const auto r = check_with(hosts + "target_session_attrs=read-write\n"
+                                          "load_balance_hosts=random\n");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("load_balance_hosts") != std::string::npos);
+    }
+    SECTION("a service-file host list without target_session_attrs is refused") {
+        const auto r = check_with(hosts);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("target_session_attrs") != std::string::npos);
+    }
+    SECTION("a service-file host list with read-write is accepted") {
+        CHECK(check_with(hosts + "target_session_attrs=read-write\n").has_value());
+    }
+    SECTION("a single host from the service file is accepted") {
+        CHECK(check_with("host=" + pg_host + "\nport=" + pg_port + "\n").has_value());
     }
 }
 
@@ -1011,3 +1144,11 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): 57P03 (cannot connect now) moves on 
     CHECK(probe->verdict() == pr::Verdict::Ready);
 }
 #endif
+
+TEST_CASE("pg_reachability: libpq < 17's whole-second connect wait",
+          "[server][readyz][pg_reachability]") {
+    STATIC_REQUIRE(pr::libpq_wall_wait_seconds(110, 100) == 10);
+    STATIC_REQUIRE(pr::libpq_wall_wait_seconds(110, 109) == 1);
+    STATIC_REQUIRE(pr::libpq_wall_wait_seconds(110, 110) == 0); // due: poll once with 0 ms
+    STATIC_REQUIRE(pr::libpq_wall_wait_seconds(110, 111) == 0);
+}

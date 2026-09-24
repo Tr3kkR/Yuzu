@@ -9,8 +9,11 @@
 /// `pg_pool` false-negatives under saturation and would evict a busy-but-
 /// healthy replica from the load balancer (the governance UP-2 precedent on the
 /// `pg_pool` row). The probe owns ONE connection of its own (+1 connection per
-/// replica against `max_connections`). It is built from the pool's DSN via
-/// `build_coord_dsn` (keepalives), the same augmentation the LeaderElector uses.
+/// replica against `max_connections`). It connects with the server's raw DSN,
+/// built into parameters exactly as `PgPool` builds its own (see below) — not
+/// through `build_coord_dsn`: every probe socket wait has its own client-side
+/// deadline, so keepalives add nothing, and the pool's parameters are what
+/// decide which host a connection reaches.
 ///
 /// WHY NOT REUSE THE LEADERELECTOR'S PING (pre-implementation review Q1). The
 /// elector is best-effort (boot continues without it), its `is_open()` takes a
@@ -35,29 +38,30 @@
 /// choosing a huge SCRAM iteration count) the authentication exchange.
 ///
 /// LIBPQ WALKS THE HOST LIST; THE PROBE ONLY ADDS A DEADLINE PER HOST. The
-/// probe connects with the DSN as given, so libpq alone decides the order
-/// (DSN order, or a fresh shuffle under `load_balance_hosts=random`), which
-/// failures move on to the next host or address, and which end the attempt —
-/// exactly as for the pool's own connections. Gate 8 rounds 2–5 found every
-/// probe that re-implemented part of that walk diverging from the pool and
-/// reporting ready while the pool could not connect (all reproduced). The one
-/// addition: libpq's non-blocking connect never advances past a host that
-/// accepts TCP and then goes silent (its blocking connect, which the pool uses,
-/// moves on after `connect_timeout`), so in a host list a host address libpq
-/// has been on for exactly its effective `connect_timeout` (the probe passes the DSN through
-/// `dbname` exactly as the pool does, so empty values, the PG* environment and
-/// the pool's timeout default resolve identically) is given up and the attempt
-/// restarted over the hosts it has not tried — once per host; with no
-/// `connect_timeout` at all the pool waits for ever and so the probe reports the
-/// failure after `kConnectDeadline` rather than moving on. The host list is read back from
-/// libpq (`PQconninfo`), so a `PGHOST` or `service=` list counts too. A frozen
-/// first host of `host=n1,n2,n3` costs one deadline, not every tick (Gate 4
-/// UP-1, reproduced). Residual: a silent
-/// ADDRESS of a host name with several addresses gives up that name's other
-/// addresses too, where the pool would try them — it can err either way, so
-/// such names are documented as a configuration to avoid. With
-/// `target_session_attrs=read-write` libpq itself refuses a read-only host, so such a host reads `unreachable` (the log detail says
-/// why), not `read_only`.
+/// probe connects with exactly the pool's parameters (the DSN through `dbname`
+/// with expand_dbname=1, the pool's `connect_timeout` default where the DSN and
+/// PGCONNECT_TIMEOUT set none), so libpq alone decides the order, which
+/// failures move on to the next host or address and which end the attempt —
+/// as for the pool's own connections. Gate 8 rounds 2–5 found every probe that
+/// re-implemented part of that walk diverging from the pool and reporting ready
+/// while the pool could not connect (all reproduced). The one addition:
+/// libpq's non-blocking connect never advances past a host that accepts TCP and
+/// then goes silent (its blocking connect, which the pool uses, moves on after
+/// `connect_timeout`), so in a host list a host address libpq has been on for
+/// its effective `connect_timeout` — timed the way the linked libpq's blocking
+/// connect times it (whole wall-clock seconds before libpq 17) — is given up
+/// and the attempt restarted over the hosts it has not tried, once per host.
+/// With no `connect_timeout` the pool waits for ever, so the probe reports the
+/// failure after `kConnectDeadline` rather than moving on; a single host is
+/// capped at `kConnectDeadline` (nothing to move on to). The host list is read
+/// back from libpq (`PQconninfo`), so a `PGHOST` or `service=` list counts too.
+/// A frozen first host of `host=n1,n2,n3` costs one timeout, not every tick
+/// (Gate 4 UP-1, reproduced). Residual: a silent ADDRESS of a host name with
+/// several addresses gives up that name's other addresses too, where the pool
+/// would try them — it can err either way, so such names are documented as a
+/// configuration to avoid. With `target_session_attrs=read-write` libpq itself
+/// refuses a read-only host, so such a host reads `unreachable` (the log detail
+/// says why), not `read_only`.
 ///
 /// Any failure, AND reaching a server that does not accept writes, CLOSES the
 /// connection so the next tick reconnects. The probe query checks both
@@ -127,13 +131,13 @@ public:
     static constexpr const char* kProbeSql =
         "SELECT pg_is_in_recovery() OR current_setting('transaction_read_only')::boolean";
 
-    /// Production: a real libpq probe against `dsn` (already augmented by
-    /// `build_coord_dsn`). Does not connect until `probe_once()`. `probe_sql`
+    /// Production: a real libpq probe against the server's raw `dsn` (the one the
+    /// pool uses). Does not connect until `probe_once()`. `probe_sql`
     /// exists for tests only (e.g. `SELECT true` to simulate a standby without
     /// one); production always passes the default.
     /// `pool_connect_timeout_s` is the server pool's `connect_timeout` default
-    /// (`PgPool::Options::connect_timeout_s`), applied exactly where the pool
-    /// applies it, so the probe gives up on a host no later than the pool does.
+    /// (`PgPool::connect_timeout_s()`), applied exactly where the pool applies
+    /// it, so the probe gives up on a host when the pool does.
     static std::unique_ptr<PgReachabilityProbe> make_libpq(std::string dsn, Observer obs = {},
                                                            std::string probe_sql = kProbeSql,
                                                            int pool_connect_timeout_s = 10);

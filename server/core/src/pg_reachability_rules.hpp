@@ -26,8 +26,8 @@
 /// multi-host DSN a reconnect walks the hosts as libpq does for the pool's
 /// fresh connections, paying the pool's `connect_timeout` per silent host it
 /// meets before the one that answers (so a reconnect behind a silent host can
-/// run past kStaleAfter and read `stale` — as slow as the pool's own connects); the probe holds its connection in steady
-/// state. A FROZEN backend (a `docker pause`d / black-holed primary whose
+/// run past kStaleAfter and read `stale` — as slow as the pool's own
+/// connects); the probe holds its connection in steady state. A FROZEN backend (a `docker pause`d / black-holed primary whose
 /// kernel still ACKs, so no socket-level timeout fires) is normally caught
 /// before that by the probe's own client-side deadlines — the query times out
 /// (2s), the reconnect times out (5s), two failures ⇒ Unreachable, measured
@@ -62,6 +62,16 @@ inline constexpr int kFailThreshold = 2;
 /// Catches a probe blocked on a frozen backend (the tick never completes, so
 /// the counter never advances) and a wedged probe thread.
 inline constexpr std::chrono::milliseconds kStaleAfter{15000};
+
+/// libpq < 17's blocking connect keeps `connect_timeout` as a whole-second
+/// wall-clock finish time and re-derives each socket wait from it in whole
+/// seconds (`pqSocketPoll`: (finish - time(NULL)) * 1000 ms, 0 once due). The
+/// probe waits the same way so it gives up on a host address exactly when the
+/// pool's connect does (Gate 8 round 7).
+constexpr std::int64_t libpq_wall_wait_seconds(std::int64_t finish_wall_s,
+                                               std::int64_t now_wall_s) noexcept {
+    return finish_wall_s > now_wall_s ? finish_wall_s - now_wall_s : 0;
+}
 
 /// Sentinel for "no probe has ever succeeded".
 // Parenthesised so a windows.h min() macro can never expand it (#4722 class).

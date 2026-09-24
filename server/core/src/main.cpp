@@ -1393,6 +1393,22 @@ int main(int argc, char* argv[]) {
                           auth_pg_pool->last_error());
             return EXIT_FAILURE;
         }
+        // HA WS-8: the multi-host guard above sees only the DSN and PG* env; a
+        // service file (service= / PGSERVICE) is applied by libpq at connect time.
+        // Check what libpq actually resolved on a live connection, and refuse to
+        // start on load_balance_hosts or a host list without read-write (Gate 8
+        // round 7). Every later connection resolves the same settings.
+        {
+            auto lease = auth_pg_pool->acquire();
+            if (!lease) {
+                spdlog::error("Cannot connect to PostgreSQL to check the connection settings");
+                return EXIT_FAILURE;
+            }
+            if (auto ok = yuzu::server::pg::check_effective_connection(lease.get()); !ok) {
+                spdlog::critical("Invalid Postgres connection settings: {}", ok.error());
+                return EXIT_FAILURE;
+            }
+        }
         const std::filesystem::path key_dir =
             cfg.ca_dir.empty() ? yuzu::server::auth::default_cert_dir() : cfg.ca_dir;
         auth_key_provider.emplace(key_dir);

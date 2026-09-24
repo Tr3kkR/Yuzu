@@ -1576,7 +1576,8 @@ gaps closed:
   client-side deadline via the non-blocking API (a host-name lookup is bounded by the system
   resolver instead), because a blocking query against a frozen backend was
   measured at 101 s; libpq walks a multi-host DSN itself with the pool's exact connection parameters, and the
-  probe only gives each host its own deadline (exactly the pool's effective `connect_timeout`),
+  probe only gives each host its own deadline (the pool's effective `connect_timeout`, timed as the
+  linked libpq's blocking connect times it),
   restarting the walk over the untried hosts when one goes silent — and not moving on at all when that
   timeout is unlimited, because the pool does not either (libpq's non-blocking
   connect never advances past a silent host); and a read-only answer drops the

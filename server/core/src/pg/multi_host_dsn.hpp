@@ -34,19 +34,25 @@
 ///   - multi-host with any other value (`any`, `read-only`, `standby`,
 ///     `prefer-standby`, or anything unrecognised): REFUSED — the caller exits
 ///     with the returned message.
-/// A host list that arrives through `PGHOST`/`PGHOSTADDR` counts. Residuals,
-/// documented, not seen here: a list from a `service=`/`PGSERVICE` entry
-/// (libpq resolves it at connect time), and a SINGLE host name that resolves to
-/// several servers (DNS round-robin, a headless service) — set
-/// `target_session_attrs=read-write` explicitly for those.
+/// A host list that arrives through `PGHOST`/`PGHOSTADDR` counts. What only
+/// libpq sees — a `service=`/`PGSERVICE` entry (or anything else resolved at
+/// connect time) — is checked by `check_effective_connection` on the first
+/// pooled connection at boot (Gate 8 round 7: a service-file
+/// `load_balance_hosts=random` bypassed this DSN-only check). Residual, not
+/// seen by either: a SINGLE host name that resolves to several servers (DNS
+/// round-robin, a headless service) — set `target_session_attrs=read-write`
+/// explicitly for those.
 ///
 /// The error message never contains the DSN (it can carry a password), and
 /// echoes the offending `target_session_attrs` / `load_balance_hosts` value
 /// only when it is one of libpq's own values.
 
+#include <libpq-fe.h>
+
 #include <cstddef>
 #include <expected>
 #include <string>
+#include <string_view>
 
 namespace yuzu::server::pg {
 
@@ -60,5 +66,19 @@ struct MultiHostDsn {
 /// Apply the policy above. An empty or unparseable DSN is returned unchanged
 /// (the server reports it at boot, as before).
 std::expected<MultiHostDsn, std::string> enforce_multi_host_read_write(const std::string& dsn);
+
+/// The same policy, applied to the settings libpq actually RESOLVED for a live
+/// connection (`PQconninfo`: DSN, environment and any `service=` file), for
+/// what the DSN-only check above cannot see: `load_balance_hosts` other than
+/// `disable` is refused, and a host list of two or more needs
+/// `target_session_attrs` of `read-write` or `primary` (nothing can be added
+/// here — it came from outside the DSN). main.cpp runs it on the auth
+/// bootstrap pool's first connection and refuses to start on an error.
+std::expected<void, std::string> check_effective_connection(PGconn* conn);
+
+/// `value` as a single-quoted libpq keyword/value conninfo value (`'` and `\`
+/// backslash-escaped). Shared by the DSN rebuild here and the readiness probe's
+/// restart, so neither ever string-appends to an operator's DSN.
+std::string quote_conninfo_value(std::string_view value);
 
 } // namespace yuzu::server::pg

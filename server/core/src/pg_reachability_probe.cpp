@@ -20,12 +20,16 @@
 #include "pg_reachability_probe.hpp"
 
 #include "background_jobs.hpp"
+#include "pg/multi_host_dsn.hpp"
 #include "pg/pg_raii.hpp"
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <ctime>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -58,11 +62,15 @@ bool wait_socket(int sock, Want want, Clock::time_point deadline, const std::ato
         if (stop.load(std::memory_order_acquire))
             return false;
         const auto now = Clock::now();
-        if (now >= deadline)
-            return false;
-        const auto slice = std::min<Clock::duration>(deadline - now, kPollSlice);
-        const int timeout_ms = static_cast<int>(
-            std::max<std::int64_t>(1, std::chrono::ceil<std::chrono::milliseconds>(slice).count()));
+        // At or past the deadline, still poll ONCE with a zero timeout — as libpq
+        // does — so a socket that is already ready is not reported as timed out.
+        const bool expired = now >= deadline;
+        const auto slice = expired ? Clock::duration::zero()
+                                   : std::min<Clock::duration>(deadline - now, kPollSlice);
+        const int timeout_ms =
+            expired ? 0
+                    : static_cast<int>(std::max<std::int64_t>(
+                          1, std::chrono::ceil<std::chrono::milliseconds>(slice).count()));
 #ifdef _WIN32
         WSAPOLLFD pfd{};
         pfd.fd = static_cast<SOCKET>(sock);
@@ -70,7 +78,7 @@ bool wait_socket(int sock, Want want, Clock::time_point deadline, const std::ato
         const int rc = WSAPoll(&pfd, 1, timeout_ms);
         if (rc > 0)
             return true;
-        if (rc < 0)
+        if (rc < 0 || expired)
             return false;
 #else
         pollfd pfd{};
@@ -79,7 +87,7 @@ bool wait_socket(int sock, Want want, Clock::time_point deadline, const std::ato
         const int rc = ::poll(&pfd, 1, timeout_ms);
         if (rc > 0)
             return true;
-        if (rc < 0 && errno != EINTR)
+        if ((rc < 0 && errno != EINTR) || expired)
             return false;
 #endif
     }
@@ -111,7 +119,8 @@ using ConnOptions = std::vector<std::pair<std::string, std::string>>;
 /// PGAPPNAME names one. `unparseable` only suppresses libpq's error text, which
 /// can echo part of a password.
 struct ProbeConnInfo {
-    ConnOptions opts;
+    ConnOptions opts;   ///< the connection parameters: opts[0] is {"dbname", <conninfo>}
+    ConnOptions parsed; ///< every option the DSN itself sets, as libpq parsed it
     bool unparseable{false};
 };
 
@@ -136,6 +145,9 @@ ProbeConnInfo probe_conninfo(const std::string& dsn, int pool_connect_timeout_s)
     ProbeConnInfo info;
     info.unparseable = !parsed;
     info.opts.emplace_back("dbname", dsn);
+    for (const PQconninfoOption* o = parsed.get(); o && o->keyword != nullptr; ++o)
+        if (o->val != nullptr)
+            info.parsed.emplace_back(o->keyword, o->val);
     if (parsed && !option_set(parsed.get(), "connect_timeout") && !env_set("PGCONNECT_TIMEOUT"))
         info.opts.emplace_back("connect_timeout", std::to_string(pool_connect_timeout_s));
     if (parsed && !option_set(parsed.get(), "application_name") && !env_set("PGAPPNAME"))
@@ -157,7 +169,8 @@ int effective_connect_timeout_s(PGconn* c) {
         const long v = std::strtol(o->val, &end, 10);
         if (end == o->val || v <= 0)
             return 0;
-        return v < 2 ? 2 : static_cast<int>(std::min<long>(v, 3600));
+        return v < 2 ? 2
+                     : static_cast<int>(std::min<long>(v, std::numeric_limits<int>::max()));
     }
     return 0;
 }
@@ -244,8 +257,8 @@ public:
 
 private:
     /// Connect the way a new pool connection does, and let LIBPQ walk the host
-    /// list: its order (DSN order, or a fresh shuffle per connection under
-    /// `load_balance_hosts=random`), which failures move it to the next host or
+    /// list: its order (the DSN's; `load_balance_hosts` is refused at boot),
+    /// which failures move it to the next host or
     /// address (a refused or failed connect, 57P03, a target_session_attrs
     /// rejection) and which end the attempt (a failed login, too many clients,
     /// an SSL or protocol failure, a peer that hangs up), and the addresses of
@@ -313,14 +326,28 @@ private:
             // With a single host there is nothing to move on to, so the deadline is
             // capped at kConnectDeadline (giving up sooner than the pool can only err
             // red) and a frozen single primary is still detected in ~11s.
-            const Clock::duration ct = std::chrono::seconds(timeout_s);
-            const Clock::duration per_host =
-                timeout_s <= 0      ? Clock::duration(pr::kConnectDeadline)
-                : hosts.size() >= 2 ? ct
-                                    : std::min<Clock::duration>(ct, pr::kConnectDeadline);
-            std::string current; // "host:port" libpq is on
+            // `connect_timeout` is timed as the linked libpq's BLOCKING connect times
+            // it: libpq < 17 keeps a whole-second wall-clock finish time
+            // (time(NULL) + timeout, set on each new address) and re-derives each
+            // wait from it in whole seconds, so its real wait jitters by up to a
+            // second either way (Gate 8 round 7, cpp-expert + security-guardian,
+            // reproduced); libpq 17+ times it exactly. The probe reproduces
+            // whichever applies, so it neither outlasts nor undercuts the pool.
+            const bool exact_timing =
+                timeout_s <= 0 ||
+                (hosts.size() < 2 && std::chrono::seconds(timeout_s) > pr::kConnectDeadline);
+            const bool wall_seconds = !exact_timing && PQlibVersion() < 170000;
+            const Clock::duration exact =
+                timeout_s <= 0 || hosts.size() < 2
+                    ? std::min<Clock::duration>(
+                          pr::kConnectDeadline,
+                          timeout_s > 0 ? Clock::duration(std::chrono::seconds(timeout_s))
+                                        : Clock::duration(pr::kConnectDeadline))
+                    : Clock::duration(std::chrono::seconds(timeout_s));
+            std::string current;      // "host:port" libpq is on
             std::string current_addr; // plus the address, for the per-address deadline
-            auto host_deadline = Clock::now() + per_host;
+            auto addr_deadline = Clock::now() + exact;
+            std::time_t finish_wall = std::time(nullptr) + timeout_s;
             // libpq contract: after PQconnectStart, proceed as if PQconnectPoll had
             // returned PGRES_POLLING_WRITING.
             PostgresPollingStatusType st = PGRES_POLLING_WRITING;
@@ -344,13 +371,18 @@ private:
                 }
                 if (at_addr != current_addr) { // ...or another address: a new deadline
                     current_addr = at_addr;
-                    host_deadline = Clock::now() + per_host;
+                    addr_deadline = Clock::now() + exact;
+                    finish_wall = std::time(nullptr) + timeout_s;
                 }
                 const int sock = PQsocket(c); // may change between addresses — re-read
                 if (sock < 0)
                     return stalled + std::string("connection has no socket");
+                const auto wait_until =
+                    wall_seconds ? Clock::now() + std::chrono::seconds(pr::libpq_wall_wait_seconds(
+                                                      finish_wall, std::time(nullptr)))
+                                 : addr_deadline;
                 if (wait_socket(sock, st == PGRES_POLLING_READING ? Want::Read : Want::Write,
-                                host_deadline, stop)) {
+                                wait_until, stop)) {
                     st = PQconnectPoll(c);
                     continue;
                 }
@@ -396,13 +428,24 @@ private:
                     tried[i] = true;
     }
 
-    /// The probe's parameters with host/hostaddr/port overridden by the hosts libpq
-    /// has not tried yet, in the original order (libpq re-shuffles them under
-    /// load_balance_hosts=random). Empty when none remain.
+    /// The probe's parameters for a restart over the hosts libpq has not tried
+    /// yet, in the original order: the DSN's own options, re-quoted, with the
+    /// host/hostaddr/port lists narrowed to those hosts, passed as the `dbname`
+    /// conninfo exactly as the first attempt was. A list keeps an EMPTY entry
+    /// as a quoted empty value, which libpq honours as "the default" — an
+    /// override passed as a separate array entry would be dropped for being
+    /// empty (Gate 8 round 7, cross-platform + cpp-safety + unhappy-path).
+    /// Empty when none remain.
     ConnOptions with_untried_hosts(const std::vector<HostEntry>& hosts,
                                    const std::vector<bool>& tried) const {
+        bool list_host = false, list_addr = false, list_port = false;
+        for (const auto& e : hosts) {
+            list_host = list_host || !e.host.empty();
+            list_addr = list_addr || !e.hostaddr.empty();
+            list_port = list_port || !e.port.empty();
+        }
         std::string hl, al, pl;
-        bool any = false, has_host = false, has_addr = false, has_port = false;
+        bool any = false;
         for (std::size_t i = 0; i < hosts.size(); ++i) {
             if (tried[i])
                 continue;
@@ -410,20 +453,22 @@ private:
             hl += sep + hosts[i].host;
             al += sep + hosts[i].hostaddr;
             pl += sep + hosts[i].port;
-            has_host = has_host || !hosts[i].host.empty();
-            has_addr = has_addr || !hosts[i].hostaddr.empty();
-            has_port = has_port || !hosts[i].port.empty();
             any = true;
         }
-        if (!any)
+        if (!any || info_.opts.empty())
             return {};
-        ConnOptions out = info_.opts; // later array entries override the expanded DSN
-        if (has_host)
-            out.emplace_back("host", hl);
-        if (has_addr)
-            out.emplace_back("hostaddr", al);
-        if (has_port)
-            out.emplace_back("port", pl);
+        std::string conninfo;
+        for (const auto& [k, v] : info_.parsed)
+            if (k != "host" && k != "hostaddr" && k != "port")
+                conninfo += k + "=" + pg::quote_conninfo_value(v) + " ";
+        if (list_host)
+            conninfo += "host=" + pg::quote_conninfo_value(hl) + " ";
+        if (list_addr)
+            conninfo += "hostaddr=" + pg::quote_conninfo_value(al) + " ";
+        if (list_port)
+            conninfo += "port=" + pg::quote_conninfo_value(pl) + " ";
+        ConnOptions out = info_.opts;
+        out[0].second = std::move(conninfo); // opts[0] is {"dbname", <conninfo>}
         return out;
     }
 

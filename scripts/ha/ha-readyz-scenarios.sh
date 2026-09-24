@@ -29,7 +29,8 @@
 #                       without a grace (#3706 class). (Chaos CH-6.)
 #   E. frozen FIRST host of a multi-host DSN  two databases behind
 #                       `host=h1,h2 target_session_attrs=read-write`; pause h1 ->
-#                       /readyz returns to (or stays) 200 via h2 within ~15s, and
+#                       /readyz returns to (or stays) 200 via h2 within ~20s (a
+#                       reconnect pays h1's connect_timeout, 10s by default), and
 #                       a server BOOTED with h1 already frozen still becomes ready.
 #                       libpq's non-blocking connect never advances past a silent
 #                       first host on its own (Gate 4 UP-1 / chaos CH-2).
@@ -42,6 +43,9 @@
 #                       naming the value, never the password.
 #   J. load_balance_hosts=random (even with read-write): the server refuses to
 #                       boot (Gate 8 round 6 operator decision), never naming the password.
+#   K. the same setting from a pg_service.conf entry (service=): the DSN-only
+#                       guard cannot see it, so the server checks what libpq resolved
+#                       on its first connection and refuses to boot (Gate 8 round 7).
 #
 # Before WS-8, scenario A stayed green indefinitely and C closed the listener
 # immediately (see pg_reachability_probe.hpp / shutdown_drain_rules.hpp).
@@ -331,6 +335,27 @@ if wait_exit 20 "$(date +%s)"; then
         pass "refused to start ${ELAPSED}s in, naming load_balance_hosts and not the password"
     else fail "exited, but without the expected refusal message (or with the password in it)"; fi
 else fail "server did not refuse load_balance_hosts=random"; kill -KILL "$SERVER_PID" 2>/dev/null; SERVER_PID=""; fi
+
+echo "== K: load_balance_hosts=random from a service file -> refused at boot"
+cat > "$RIG/pg_service.conf" <<SVC
+[yzsvc]
+host=127.0.0.1,127.0.0.1
+port=${PGPORT},${PG2PORT}
+target_session_attrs=read-write
+load_balance_hosts=random
+SVC
+KDSN="service=yzsvc user=yuzu password=${PG_PASS} dbname=yuzu"
+: > "$RIG/server.log"
+PGSERVICEFILE="$RIG/pg_service.conf" "$SERVER_BIN" --listen "127.0.0.1:${GRPC}" --no-tls --no-https --no-default-certs \
+    --web-address 127.0.0.1 --web-port "$WEB" --management "127.0.0.1:${MGMT}" \
+    --postgres-dsn "$KDSN" --config "$RIG/yuzu-server.cfg" --data-dir "$RIG" \
+    --ca-dir "$RIG/certs" >> "$RIG/server.log" 2>&1 &
+SERVER_PID=$!
+if wait_exit 30 "$(date +%s)"; then
+    if grep -q "Invalid Postgres connection settings: load_balance_hosts=random" "$RIG/server.log" && ! grep -q "$PG_PASS" "$RIG/server.log"; then
+        pass "refused to start ${ELAPSED}s in on the service file's load_balance_hosts, password not logged"
+    else fail "exited, but without the expected refusal message (or with the password in it)"; fi
+else fail "server did not refuse load_balance_hosts from a service file"; kill -KILL "$SERVER_PID" 2>/dev/null; SERVER_PID=""; fi
 
 echo
 if (( FAILS == 0 )); then echo "ha-readyz-scenarios: ALL PASS"; exit 0; fi

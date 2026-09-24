@@ -199,9 +199,13 @@ grep -rnE 'YUZU_POSTGRES_DSN|postgres-dsn|PGHOST|PGHOSTADDR|PGLOADBALANCEHOSTS|P
   number of hosts: **the server refuses to start**. Remove it (or set `disable`) before upgrading. The
   server writes to one primary, so with read-write the shuffle balances nothing — and `/readyz` holds
   one connection, so it cannot see a host that fails only some of the pool's shuffled connections.
-- **Not checked — set `target_session_attrs=read-write` yourself:** a host list that comes from a
-  `service=` entry or `PGSERVICE` (libpq reads it only at connect time), and one host *name* that
-  resolves to several servers (DNS round-robin, a Kubernetes headless service).
+- **A `service=` entry or `PGSERVICE`:** libpq applies the service file only when it connects, so
+  the server checks what libpq resolved on its first Postgres connection at startup, and refuses to
+  start if the resolved settings set `load_balance_hosts`, or list several hosts without
+  `target_session_attrs=read-write` (or `primary`) — it cannot add the attribute to a service file,
+  so set it there yourself.
+- **Not checked — set `target_session_attrs=read-write` yourself:** one host *name* that resolves to
+  several servers (DNS round-robin, a Kubernetes headless service).
 
 ## Behaviour change: `/readyz` now goes red when Postgres is unreachable, and shutdown can hold for a drain grace (HA WS-8, ADR-2002 §12)
 
