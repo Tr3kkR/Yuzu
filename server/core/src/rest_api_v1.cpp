@@ -12,6 +12,8 @@
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
+#include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
+#include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
 #include "dex_read_model.hpp" // #4035: shared REST+MCP model structs + serializers (device score, ...)
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
@@ -1839,7 +1841,7 @@ void RestApiV1::register_routes(
     std::shared_ptr<const NetworkApi> network_api,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store,
-    ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
+    ResponseScopeFn response_scope_fn,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
@@ -1859,8 +1861,7 @@ void RestApiV1::register_routes(
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
                     std::move(network_api), std::move(lockout_clear_fn), baseline_store,
                     std::move(scoped_perm_fn), software_inventory_store,
-                    std::move(response_scope_fn),
-                    std::move(app_perf_providers), engine_principal_store, access_review_store,
+                    std::move(response_scope_fn), engine_principal_store, access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn),
@@ -1884,7 +1885,7 @@ void RestApiV1::register_routes(
     std::shared_ptr<const NetworkApi> network_api,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store,
-    ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
+    ResponseScopeFn response_scope_fn,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,

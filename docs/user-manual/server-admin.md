@@ -440,6 +440,75 @@ operator-facing detail, and
 `docs/security-reviews/2963-token-rotation-default-permission-2026-09-17.md`
 for the decision record.
 
+### vNEXT — CRL publishing is serialised in Postgres, and a missed CRL now republishes itself (HA WS-6 6.1, #4126; NOT breaking)
+
+Every CRL publish (startup, an operator revoke, a subordinate-CA import, and the
+freshness re-publish) now runs as one Postgres transaction under a lock on the
+`ca_store.ca_crl_versions` table, instead of behind a lock inside one server
+process. The `ca_store` schema migrates to v4: v3 adds a nullable
+`revoked_count` column on `ca_crl_versions` (nothing is backfilled), v4 adds a
+trigger that refuses to delete or change a revoked `ca_issued` row. A
+subordinate-CA import (`POST /api/v1/ca/import-chain`) now waits for any CRL
+publish already in progress before it swaps the root; if that takes longer than
+the database's lock timeout (10 s by default) the import fails with a
+database error and can simply be retried.
+
+What changes on **every** deployment, including single-server:
+
+- **A CRL publish can now fail on lock contention.** A publish that waits more
+  than 5 s for the table lock gives up. On `POST /api/v1/ca/revoke` and MCP
+  `revoke_certificate` that shows as `crl_republished:false` plus a
+  `ca.crl.published` failure audit; every trigger increments
+  `yuzu_server_ca_crl_publish_failures_total`. The revocation itself still
+  takes effect immediately server-side.
+- **A revocation missing from the served CRL is now republished automatically.**
+  Previously, if a revoke's own CRL publish failed, the revocation stayed out of
+  `GET /api/v1/ca/crl` until the next revoke or until the CRL was within 24 h of
+  its `nextUpdate` (up to ~6 days); retrying the revoke returns "already
+  revoked" and does not publish. The freshness pass now also republishes, on its
+  next 15 s tick, whenever the latest CRL was not built from the current revoked
+  set (after a failed attempt it waits 5 minutes before trying again). You may
+  occasionally see a redundant CRL version shortly after a revoke.
+- **A revoked default server certificate now stays revoked.** Previously,
+  regenerating the built-in default certificates (for example after changing
+  `--cert-san`) deleted their old inventory rows, including revoked ones, so a
+  revoked default leaf was accepted again and dropped from the CRL. Revoked rows
+  are now kept, and the database now refuses to delete them (migration v4
+  trigger) — during a rolling upgrade an older server's default-cert purge fails
+  with "failed to purge prior default-cert inventory rows" instead. **This does not restore a revocation already lost that way:** the
+  purged serial is no longer in the inventory, so revoking it again returns
+  `404`. This only affects you if you revoked a default server certificate (for
+  example because its key may have leaked) **and** the default certificates were
+  regenerated **before you upgraded to this release**. Check first: find the
+  serial in the audit log (the `ca.cert.revoked` event for that revocation; if
+  that event has aged out of audit retention — 365 days by default — and you
+  cannot establish the serial another way, you cannot tell whether it was lost:
+  treat it as lost), then
+  page through `GET /api/v1/ca/issued` (follow `offset` until `has_more` is
+  false) or decode the CRL (`curl … /api/v1/ca/crl | openssl crl -inform DER
+  -noout -text`). If the serial is still listed as revoked, nothing was lost. If
+  it is missing, re-root
+  the internal CA with the clean re-root in `docs/pki-architecture.md`
+  ("Deliberate clean re-root") — `POST /api/v1/ca/import-chain` is not enough,
+  because it keeps the issuing key the leaked certificate chains to. A re-root
+  re-enrolls the whole fleet.
+
+Single-server remains the only supported topology. If you nevertheless run two
+server versions against one database during an upgrade, a publish from the
+**older** binary does not take the lock and can still publish a CRL that omits a
+revocation the newer binary just recorded; the newer binary's freshness pass
+republishes to cover it (and can do so on every tick for as long as the older
+binary keeps publishing).
+
+**Rollback** to the previous release is safe: an older binary boots against the
+v4 schema and ignores the new column. It will not self-heal a missed CRL (rolling
+forward again republishes once), and its default-cert inventory purge fails
+while any revoked default leaf exists (logged, harmless) because the trigger stays
+in place — which is the point: it cannot un-revoke anything. Multi-replica PKI also still
+needs WS-6 slices 6.2 (enrollment) and 6.3 (CA key and KEK custody): today the
+freshness pass runs only on the elected leader, and a leader whose CA directory
+lacks the CA key can never publish.
+
 ### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
 
 New, non-breaking, and inert on a single-server deployment. As one step toward
@@ -2405,7 +2474,12 @@ issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
 2. Optionally type a **reason** (e.g. `key compromise`, `decommissioned`) — it is
    stored on the revocation record and audited.
 3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
-   *Revoked* and the public CRL is republished automatically.
+   *Revoked* and the public CRL is republished automatically. If that publish
+   fails (the panel does not show this; the REST/MCP revoke response returns
+   `crl_republished:false` and a `ca.crl.published` failure is audited), the
+   server republishes it on its own: on the next
+   15-second freshness tick once the cause clears, or up to about 5 minutes later
+   if that attempt fails too. You do not need to revoke again.
 
 Revocation takes effect **immediately server-side**: the agent is refused on its
 next connection, and any already-open command stream is torn down by the
