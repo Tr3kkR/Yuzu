@@ -2,7 +2,6 @@
 
 #include "guardian_rule_spec.hpp" // dangerous_enforce_in_spec (H1 push backstop)
 #include "mcp_jsonrpc.hpp"        // json_exceeds_depth / kMcpMaxJsonDepth (depth guard)
-#include "on_behalf_guard.hpp"    // onbehalf::sanitize_for_log
 #include "yuzu/metrics.hpp"
 
 #include <algorithm>
@@ -13,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // log_id_token / log_key_token
 
 namespace yuzu::server::guardian {
 
@@ -222,8 +222,7 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
                 spdlog::error(
                     "Guardian push: rule {} ('{}') has spec_json nested past the depth "
                     "guard (max {}); excluding it from this push, cannot be safely parsed",
-                    onbehalf::sanitize_for_log(row.rule_id, 128),
-                    onbehalf::sanitize_for_log(row.name, 128),
+                    log_id_token(row.rule_id), log_key_token(row.name),
                     yuzu::server::mcp::kMcpMaxJsonDepth);
             continue;
         }
@@ -247,7 +246,7 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
             if (std::string why = dangerous_enforce_in_spec(row.spec_json); !why.empty()) {
                 spdlog::warn("Guardian push: rule {} ('{}') requests enforce on {} — downgrading to "
                              "audit (enforce-safety denylist, contract §6/H1)",
-                             row.rule_id, row.name, why);
+                             log_id_token(row.rule_id), log_key_token(row.name), why);
                 mode = "audit";
             }
         }
