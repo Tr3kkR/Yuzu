@@ -1932,7 +1932,11 @@ are rejected. Response:
 
 `crl_republished: false` means the revocation stands (the agent is refused on its
 next gRPC call) but the public CRL could not be rebuilt — external CRL consumers
-will not see it until the next successful publish. Errors: `400` (missing/invalid
+will not see it until the next successful publish. The server retries on its own:
+the leader's freshness pass republishes on its next 15-second tick once the cause
+clears (up to about 5 minutes later if that attempt fails too). Repeating the
+`POST` is not a retry — it returns `404` because the serial is already revoked.
+Errors: `400` (missing/invalid
 serial, unknown field, bad JSON), `403` (missing `Security:Delete`), `404` (serial
 not found or already revoked), `413` (body too large), `503` (CA unavailable).
 
