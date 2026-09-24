@@ -215,7 +215,7 @@ enum class LegacySendOutcome : std::uint8_t { Sent, LinkDown, WriteFailed };
  *    (`yuzu_fleet_guardian_legacy_sink_events_lost`). Fully closing this
  *    needs a durable spool of the lost event's own content, which D1d
  *    explicitly declined as out of scope - tracked as a separate follow-up
- *    issue, #TBD (not yet filed as of this comment).
+ *    issue, #4888.
  *
  *  - UP-3 (fixed here, restart semantics). snapshot()/restore() make the gap
  *    ledger and loss counters survive an agent restart mid-outage - without
