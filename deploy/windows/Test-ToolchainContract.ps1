@@ -796,7 +796,7 @@ Check 'the job-scoped vcpkg assertion script remains syntactically valid' {
   $vcpkgParseErrors.Count -eq 0
 }
 Check 'the standalone toolchain assertion script remains syntactically valid' {
-  # QE-3: guarded by Test-Path and run INSIDE the Check body — the earlier
+  # Guarded by Test-Path and run INSIDE the Check body — the earlier
   # shape ran ParseFile at top level, unconditionally, so a missing
   # $AssertPath aborted the whole harness run instead of producing one
   # clean FAIL + tally entry like every other Check.
@@ -858,24 +858,50 @@ Check 'the settings fingerprint never fails the assertion' {
   # is a parse error the file's own parse-validity Check already catches
   # above), so this also proves the probe is still guarded, not merely
   # that $fail is untouched — deleting the try/catch around the fingerprint
-  # would otherwise still pass this Check. CA-5: match ANY reference to
+  # would otherwise still pass this Check. Match ANY reference to
   # $fail (not only the increment form `$fail++`) — an `if(...) { $fail =
   # $fail + 1 }` or similar rewrite would still touch $fail without ever
   # spelling `$fail++`, and would slip past a narrower pattern.
   ($span -notmatch '\$fail\b') -and ($span -match '\}\s*catch\s*\{')
 }
+Check 'the fingerprint SQL carries all six expected field tokens' {
+  $assertText = Get-Content -LiteralPath $AssertPath -Raw
+  $sqlAt = $assertText.IndexOf('$fingerprintSql =')
+  if($sqlAt -lt 0){ return $false }
+  $sqlLineEnd = $assertText.IndexOf("`n", $sqlAt)
+  $sqlLine = if($sqlLineEnd -gt $sqlAt){ $assertText.Substring($sqlAt, $sqlLineEnd - $sqlAt) } else { $assertText.Substring($sqlAt) }
+  @('fsync=%s','synchronous_commit=%s','full_page_writes=%s','data_directory=%s','databases=%s','active_backends=%s') |
+    ForEach-Object { $sqlLine.Contains($_) } |
+    Where-Object { -not $_ } |
+    Measure-Object | ForEach-Object { $_.Count -eq 0 }
+}
+Check 'Format-YuzuDurabilityFingerprint classifies an all-off real capture as info' {
+  # Real PostgreSQL 18.6 capture (orchestrator probe, 2026-09-24) of the
+  # fingerprint SQL against a freshly-provisioned, durability-off cluster.
+  $r = Format-YuzuDurabilityFingerprint -Agent 1 -Port 5434 `
+    -FingerprintLine 'fsync=off synchronous_commit=off full_page_writes=off data_directory=D:\ci\pg\agent-1 databases=3 active_backends=0'
+  $r.Color -eq 'Cyan' -and $r.Text -eq '[info] agent 1 :5434 fsync=off synchronous_commit=off full_page_writes=off data_directory=D:\ci\pg\agent-1 databases=3 active_backends=0'
+}
+Check 'Format-YuzuDurabilityFingerprint classifies a drifted real capture as warn' {
+  # Real PostgreSQL 18.6 capture (orchestrator probe, 2026-09-24): a
+  # synchronous_commit that drifted to 'local' (still not 'off').
+  $r = Format-YuzuDurabilityFingerprint -Agent 0 -Port 5433 `
+    -FingerprintLine 'fsync=off synchronous_commit=local full_page_writes=off data_directory=/tmp/x databases=3 active_backends=0'
+  $r.Color -eq 'Yellow' -and $r.Text -eq '[warn] agent 0 :5433 drifted: fsync=off synchronous_commit=local full_page_writes=off data_directory=/tmp/x databases=3 active_backends=0'
+}
 Check 'the CI psql export is opt-in and agent-guarded' {
   $assertText = Get-Content -LiteralPath $AssertPath -Raw
   $exportIfAt = $assertText.IndexOf('if($ExportCiEnv)')
   if($exportIfAt -lt 0){ return $false }
-  $matchAt = $assertText.IndexOf('-match ''-(\d+)$''', $exportIfAt)
+  $matchAt = $assertText.IndexOf('-(\d+)$', $exportIfAt)
   if($matchAt -lt 0){ return $false }
-  # CA-5: pin the literal `-le 9` bound (the AGENT_IDX>9-is-not-a-pool-index
-  # rule ensure-postgres.sh's own AGENT_IDX derivation mirrors) rather than
-  # only requiring SOME numeric comparison — a silent widening/narrowing of
-  # the bound here would desync the two derivations without failing
-  # anything else in this Check.
-  $leNineAt = $assertText.IndexOf('-le 9', $matchAt)
+  # Pin the literal `-le 9)` bound (the AGENT_IDX>9-is-not-a-pool-index rule
+  # ensure-postgres.sh's own AGENT_IDX derivation mirrors) rather than only
+  # requiring SOME numeric comparison — a silent widening/narrowing of the
+  # bound here would desync the two derivations without failing anything
+  # else in this Check. The trailing `)` is load-bearing: `-le 9` alone
+  # also matches `-le 99`, which would silently pass a widened bound.
+  $leNineAt = $assertText.IndexOf('-le 9)', $matchAt)
   if($leNineAt -lt 0){ return $false }
   $writeAt = $assertText.IndexOf('YUZU_CI_PSQL=', $leNineAt)
   $occurrences = @([regex]::Matches($assertText, [regex]::Escape('YUZU_CI_PSQL='))).Count
@@ -907,6 +933,16 @@ Check 'ci.yml passes the CI psql export switch to the Windows manifest assertion
   $nextManifestStepAt = $ciText.IndexOf("`n      - name:", $manifestAt + 1)
   $manifestStep = if($nextManifestStepAt -gt $manifestAt){ $ciText.Substring($manifestAt, $nextManifestStepAt - $manifestAt) } else { '' }
   $manifestStep -match 'Assert-Toolchain\.ps1[^\r\n]*-ExportCiEnv'
+}
+Check 'the Windows Ensure Postgres step timeout exceeds the script''s own worst case' {
+  $ciText = Get-Content -LiteralPath $CiWorkflowPath -Raw
+  $windowsJobAt = $ciText.IndexOf("`n  windows:")
+  if($windowsJobAt -lt 0){ return $false }
+  $stepAt = $ciText.IndexOf('- name: Ensure Postgres (server tests)', $windowsJobAt)
+  if($stepAt -lt 0){ return $false }
+  $nextStepAt = $ciText.IndexOf("`n      - name:", $stepAt + 1)
+  $step = if($nextStepAt -gt $stepAt){ $ciText.Substring($stepAt, $nextStepAt - $stepAt) } else { '' }
+  ($step -match '(?m)timeout-minutes:\s*8\s*$') -and ($step -match '(?m)run:\s*source scripts/ci/ensure-postgres\.sh\s*$')
 }
 Check 'provisioning parameter defaults equal every reviewed pin' {
   $mapping = [ordered]@{

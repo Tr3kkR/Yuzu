@@ -1208,17 +1208,28 @@ Resolution order inside the script:
    already read `off`, that's a one-line `ok`. Otherwise: only under
    GitHub Actions, against a loopback host, with a
    toolchain-manifest-vouched `psql` (`YUZU_CI_PSQL`, see below), with a
-   **plain URI DSN** (`pg_dsn_target_provable` — no query string and
-   exactly one `@`; a keyword-form, IPv6, or multi-host DSN is
-   report-only, since the per-agent derivation regex reads it as an
-   unparsed `?` host anyway), and with none of
+   **plain URI DSN** (`pg_dsn_target_provable` — no query string, and its
+   RFC 3986 authority, the substring between `://` and the first following
+   `/`, contains exactly one `@` and a bare `host:port`; a keyword-form,
+   IPv6, multi-host, or userinfo-in-the-*path* DSN — e.g. a Unix-socket
+   path that happens to contain a literal `@` before the real host — is
+   report-only, since the per-agent derivation regex reads the first two
+   as an unparsed `?` host anyway and this function's own authority-only
+   parse refuses the third), and with none of
    `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` set in the job/runner
-   environment (libpq honours those over a URI's own authority) does the
-   guard even ATTEMPT to **heal**. The DSN-string checks above only bound
+   environment (`PGHOSTADDR`/`PGSERVICE` actually redirect a plain URI DSN
+   — probed live against psql 18.6; `PGHOST`/`PGPORT` are only defaults
+   libpq applies when the DSN sets neither, so a URI DSN's own host/port
+   normally win regardless — refused too, conservatively, rather than
+   relied on to redirect) does the guard even ATTEMPT to **heal**. The DSN-string checks above only bound
    the attempt — the heal session's own first two statements are
    in-session `DO` blocks, under `ON_ERROR_STOP=1`, that RAISE before any
    `ALTER SYSTEM` runs unless (a) the server this session is actually
-   talking to is loopback on the exact port the DSN claims, and (b)
+   talking to is loopback on the exact port the DSN claims — checked by
+   explicit `IS NULL` disjuncts ahead of the loopback/port predicate, so a
+   NULL `inet_server_addr()`/`inet_server_port()` (a Unix-socket session)
+   RAISEs directly rather than falling through PL/pgSQL's three-valued
+   `IF NULL` (which takes no branch at all) — and (b)
    `pg_file_settings` has no parse error (a stale/broken
    `postgresql.conf` would otherwise make the coming `pg_reload_conf()`
    apply nothing while any other pending edit, e.g. `pg_hba.conf`, still
@@ -1264,8 +1275,10 @@ Resolution order inside the script:
    for a non-superuser role to run it is `ALTER SYSTEM` on the three
    parameters, `EXECUTE` on `pg_reload_conf()`, and read access to
    `pg_file_settings`; dropping `-ExportCiEnv` from the Windows job turns
-   off both the heal and the manifest per-agent no-fallback rule (path 1
-   then behaves as it did before this guard). (Test seam:
+   off both the heal and the manifest per-agent no-fallback rule — path 1
+   then demotes to a PATH `psql` (still reads and reports drift, never
+   heals) or, with no `psql` at all, reports conformance **UNVERIFIED**.
+   (Test seam:
    `YUZU_CI_PG_SLEEP_SCALE` scales the guard's bounded sleeps — 1 in
    production, 0 in the docs-suite selftest.)
 2. **Docker** (self-hosted Linux) — idempotent persistent container
@@ -1352,23 +1365,36 @@ never healed or failed. Locally the tests still skip when
 `YUZU_TEST_POSTGRES_DSN` is unset; when it is set but unreachable they
 fail rather than skip.
 
-**Durability-guard message → meaning → next step (ER-2).** Under GitHub
-Actions the raw psql text behind most of these is deliberately withheld
-(a malformed DSN's password can otherwise echo verbatim into a public
-annotation) — re-run the printed `psql -X -w --dbname=<dsn> ...` form
-yourself on the runner (or in a dev shell against the same DSN, where the
-guard prints it in full) to see it.
+**Durability-guard message → meaning → next step.** Under GitHub Actions the
+raw psql text behind most of these is deliberately withheld (a malformed
+DSN's password can otherwise echo verbatim into a public annotation) — no
+message prints a ready-to-paste command; re-run
+`psql -X -w --dbname=<dsn> -tA -c "SELECT name, setting, source FROM
+pg_settings WHERE name IN ('fsync','synchronous_commit','full_page_writes')
+ORDER BY name"` yourself on the runner (or in a dev shell against the same
+DSN, where the guard prints the real text since there is no public
+annotation to leak into) to see it. Every `psql rc=N` in a message is the
+exit code of that specific invocation: `1` is a fatal client-side error
+(bad DSN syntax, an invalid option), `2` is a connection failure (nothing
+listening, wrong credential, auth rejected), `3` is a script/SQL error
+under `-v ON_ERROR_STOP=1` (the query itself failed server-side), and
+`126`/`127` mean psql itself failed to *execute* (permissions, an MSYS2
+wrapper problem, or a missing DLL) rather than a database fault. To check
+for orphaned backends holding a stale connection on the port in question,
+compare `SELECT count(*) FROM pg_stat_activity` against
+`SHOW max_connections` on that cluster.
 
 | Message | Meaning | Next step |
 |---|---|---|
-| `durability read failed` | The first `pg_settings` read itself failed to connect/authenticate. | Re-run the printed `psql` command on the box; check the service is up and the credential is right. |
-| `durability settings unreadable ... unparseable` | psql connected (rc 0) but the output wasn't 3 clean `name\|setting\|source` rows (e.g. a permission error). | Check the role has `pg_read_all_settings` (or is superuser); re-run the printed command to see the real text. |
-| `... NOT healing (cannot prove the target)` | The DSN has a query string / more than one `@`, or a `PGHOST`-family var is set in the job env — the string can't prove where libpq actually connects. | Use a plain `postgresql://user@host:port/db` DSN with no query string, and don't set `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` in the job/runner env. |
+| `durability read failed on <host:port>: ...` | The first `pg_settings` read itself failed to connect/authenticate. | Run the query above against the DSN by hand; check the service is up and the credential is right. |
+| `durability settings unreadable on <host:port> (...): ...` | psql connected (rc 0) but the output wasn't 3 clean `name\|setting\|source` rows (e.g. a permission error) — this is the READ arm, so the raw text is withheld under Actions even though psql itself succeeded. | Check the role has `pg_read_all_settings` (or is superuser); run the query above by hand to see the real text. |
+| `... NOT healing (cannot prove the target)` | The DSN has a query string, more than one `@` in its authority, an `@` that is actually inside the DSN's path rather than its authority, or a `PGHOST`-family var is set in the job env — the string can't prove where libpq actually connects. | Use a plain `postgresql://user@host:port/db` DSN with no query string, and don't set `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` in the job/runner env. |
 | `... NOT healing (heal runs only under GitHub Actions ...)` | Host isn't loopback, or the psql isn't manifest-vouched (`YUZU_CI_PSQL`), or you're outside Actions. | Expected for a developer shell / bespoke remote DB — tune durability by hand if you want it off. |
-| `heal failed on ... (this includes the in-session ... guard)` | Either the `ALTER SYSTEM` sequence itself failed, or one of the two in-session `DO`-block guards (loopback/target identity, or a `pg_file_settings` parse error) raised first. | The printed `ERROR:` line names which — a `yuzu-heal-identity-guard`/`yuzu-heal-config-parse-guard` line names the guard; anything else is a genuine `ALTER SYSTEM` failure (grant/permission). |
-| `could not re-read after heal (psql rc=N)` | The heal itself succeeded, but the bounded re-read afterward couldn't even connect. | Check the service is still up; rc 124/126/127 are timeout/exec-failure, not a settings problem. |
+| `heal failed on ... (psql rc=N; this includes the in-session ... guard)` | Either the `ALTER SYSTEM` sequence itself failed, or one of the two in-session `DO`-block guards (loopback/target identity — including a NULL server address/port, e.g. a Unix-socket session — or a `pg_file_settings` parse error) raised first. | The printed `ERROR:` line names which — a `yuzu-heal-identity-guard`/`yuzu-heal-config-parse-guard` line names the guard; anything else is a genuine `ALTER SYSTEM` failure (grant/permission). |
+| `could not re-read after heal on ... (psql rc=N): ...` | The heal itself succeeded, but the bounded re-read afterward couldn't even connect. | Check the service is still up; rc 124/126/127 are timeout/exec-failure, not a settings problem. |
 | `still not durability-off 5s after heal` | The re-read connected and returned rows, but a setting is still not `off`. | Check `pg_file_settings` and the server log first (a parse error means the reload applied nothing); then remove the override — an `ImagePath -c` flag, or `ALTER ROLE`/`ALTER DATABASE ... RESET`. |
-| `per-agent Postgres ... failed 'psql SELECT 1' ... (psql rc=N...)` | The manifest-vouched probe (agent 0/base or any further agent) failed after retries. `psql rc=126/127` means psql itself failed to execute (MSYS2/DLL/permissions), not a database fault. | Check the service / orphaned backends on that port; rc 126/127 points at the psql binary or its DLLs, not Postgres. |
+| `durability settings unreadable ... after heal (...)` | The post-heal re-read connected (rc 0) but its own output wasn't 3 clean rows. | Same as the read-arm row above, run the query above by hand once the heal has settled. |
+| `per-agent Postgres ... failed 'psql SELECT 1' ... (psql rc=N...)` | The manifest-vouched probe (agent 0/base or any further agent) failed after retries. `psql rc=126/127` means psql itself failed to execute (MSYS2/DLL/permissions), not a database fault. | Check the service / orphaned backends on that port (`pg_stat_activity` vs `max_connections`); rc 126/127 points at the psql binary or its DLLs, not Postgres. |
 | `durability conformance UNVERIFIED` | No psql at all (`YUZU_CI_PSQL` unset and none on PATH). | Ensure `-ExportCiEnv` is passed to `Assert-Toolchain.ps1`, or install psql on PATH. |
 | `YUZU_CI_PSQL is set but not executable` | The exported manifest path doesn't resolve/exec. | Re-provision (`deploy/windows/Provision-Windows-Runner.ps1`) or re-run `Assert-Toolchain.ps1 -ExportCiEnv`. |
 

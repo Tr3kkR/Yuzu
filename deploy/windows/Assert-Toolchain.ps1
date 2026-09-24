@@ -6,9 +6,10 @@
   per-agent PostgreSQL service points at its private binary tree and serves.
   It also prints a read-only, per-cluster durability-settings fingerprint
   (fsync/synchronous_commit/full_page_writes/data_directory/databases/
-  active_backends) for all four Wee Tam clusters on every run, so a drift is
-  visible in seconds instead of as a 700 s [pg]-shard TIMEOUT (#2167 follow-
-  up) — this never affects $fail; SELECT 1 remains the health gate.
+  active_backends) for every Wee Tam cluster that passes its SELECT 1
+  health probe (ordinarily all four), so a drift is visible in seconds
+  instead of as a 700 s [pg]-shard TIMEOUT (#2167 follow-up) — this never
+  affects $fail; SELECT 1 remains the health gate.
 
   Run it (a) at the end of provisioning, (b) as a registration / preflight
   gate, and (c) by Start-PinnedRunner.ps1 at runner start (where the
@@ -151,11 +152,12 @@ if(-not $hasClusterContract){
     $fail++
   }
   # Read-only, per-cluster durability-settings fingerprint (#2167 follow-up):
-  # printed for every cluster on every run (this step, and therefore this
-  # query, runs before ensure-postgres.sh on every Windows job), so a drift
-  # is visible from ANY job's log in seconds. data_directory and
-  # active_backends discriminate a wrong-data-directory or foreign-load
-  # hypothesis if a cluster's settings ever look wrong. Never touches $fail.
+  # printed for every cluster that passes its SELECT 1 probe above (this
+  # step, and therefore this query, runs before ensure-postgres.sh on every
+  # Windows job), so a drift is visible from ANY job's log in seconds.
+  # data_directory and active_backends discriminate a wrong-data-directory
+  # or foreign-load hypothesis if a cluster's settings ever look wrong.
+  # Never touches $fail.
   $fingerprintSql = "SELECT format('fsync=%s synchronous_commit=%s full_page_writes=%s data_directory=%s databases=%s active_backends=%s', current_setting('fsync'), current_setting('synchronous_commit'), current_setting('full_page_writes'), current_setting('data_directory'), (SELECT count(*) FROM pg_database), (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND state <> 'idle' AND pid <> pg_backend_pid()))"
 
   $oldPassword = $env:PGPASSWORD
@@ -222,8 +224,8 @@ if(-not $hasClusterContract){
           $fail++
         } else {
           # Read-only — a failure here never affects $fail or $clusterOk;
-          # SELECT 1 above remains the health gate. ER-3: Yellow [warn] (not
-          # Cyan [info]) when any of the three settings is not 'off', so a
+          # SELECT 1 above remains the health gate. Yellow [warn] (not Cyan
+          # [info]) when any of the three settings is not 'off', so a
           # drift is visible at a glance without reading the full line —
           # still never touches $fail/$clusterOk. Expected values: all
           # three settings 'off'; data_directory is D:\ci\pg\agent-<n> for
@@ -234,12 +236,8 @@ if(-not $hasClusterContract){
             $fp = (Invoke-YuzuContractProbe -Executable $c.psql `
               -Arguments @('-X','-w','-U','yuzu','-d','yuzu_test','-h','127.0.0.1','-p',[string]$c.port,'-tAc',$fingerprintSql) `
               -TimeoutSeconds ([int]$contract.probe_timeout_seconds))
-            $fpLine = $fp.Trim()
-            if($fpLine -match 'fsync=off synchronous_commit=off full_page_writes=off'){
-              Write-Host ("  [info] agent {0} :{1} {2}" -f $c.agent, $c.port, $fpLine) -ForegroundColor Cyan
-            } else {
-              Write-Host ("  [warn] agent {0} :{1} drifted: {2}" -f $c.agent, $c.port, $fpLine) -ForegroundColor Yellow
-            }
+            $fmt = Format-YuzuDurabilityFingerprint -Agent ([int]$c.agent) -Port ([int]$c.port) -FingerprintLine $fp
+            Write-Host ("  {0}" -f $fmt.Text) -ForegroundColor $fmt.Color
           } catch {
             Write-Host ("  [warn] agent {0}: settings fingerprint unavailable ({1})" -f $c.agent, $_.Exception.Message) -ForegroundColor Yellow
           }
@@ -255,16 +253,23 @@ if(-not $hasClusterContract){
   }
 
   if($ExportCiEnv){
-    # S-5/CA-5: TryParse rather than a direct [int] cast — a runner-name
-    # suffix of 10+ digits (an unexpected naming scheme, not a pool agent
-    # index) would otherwise throw under $ErrorActionPreference='Stop' and
-    # kill this whole Assert step, which every Windows job (incl. release
-    # builds) runs first. The -and short-circuit means TryParse only runs
-    # after the -match, so $Matches is still the match just made.
+    # TryParse rather than a direct [int] cast — a runner-name suffix of
+    # 10+ digits (an unexpected naming scheme, not a pool agent index)
+    # would otherwise throw under $ErrorActionPreference='Stop' and kill
+    # this whole Assert step. This block only runs under -ExportCiEnv,
+    # which only ci.yml's Windows job passes — nightly.yml (windows-asan)
+    # and release.yml invoke this script without it, so a throw here would
+    # only ever hit the ci.yml Windows PR/push job, never a release build.
+    # The -and short-circuit means TryParse only runs after the -match, so
+    # $Matches is still the match just made.
     $idx = 0
     if(-not $env:GITHUB_ENV){
       Write-Host "  [warn] -ExportCiEnv but GITHUB_ENV is unset — YUZU_CI_PSQL not exported" -ForegroundColor Yellow
-    } elseif($env:RUNNER_NAME -match '-(\d+)$' -and [int]::TryParse($Matches[1], [ref]$idx) -and $idx -le 9){
+    } elseif($env:RUNNER_NAME -notmatch '-(\d+)$'){
+      Write-Host "  [warn] RUNNER_NAME '$($env:RUNNER_NAME)' has no -<n> suffix — YUZU_CI_PSQL not exported" -ForegroundColor Yellow
+    } elseif(-not ([int]::TryParse($Matches[1], [ref]$idx) -and $idx -le 9)){
+      Write-Host "  [warn] RUNNER_NAME '$($env:RUNNER_NAME)' suffix '-$($Matches[1])' is out of the 0-9 pool-agent-index range — YUZU_CI_PSQL not exported" -ForegroundColor Yellow
+    } else {
       $own = @($m.postgres_clusters) | Where-Object { [int]$_.agent -eq $idx } | Select-Object -First 1
       if($own -and $own.psql -and (Test-Path -LiteralPath $own.psql)){
         Add-Content -LiteralPath $env:GITHUB_ENV -Value "YUZU_CI_PSQL=$($own.psql)"
@@ -272,8 +277,6 @@ if(-not $hasClusterContract){
       } else {
         Write-Host "  [warn] no manifest psql for agent $idx — YUZU_CI_PSQL not exported; ensure-postgres.sh will report durability UNVERIFIED" -ForegroundColor Yellow
       }
-    } else {
-      Write-Host "  [warn] RUNNER_NAME '$($env:RUNNER_NAME)' has no -<n> suffix — YUZU_CI_PSQL not exported" -ForegroundColor Yellow
     }
   }
 }

@@ -1731,12 +1731,17 @@ jobs:
       # LOCAL SYSTEM service account (Bash/WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED).
       # Same idiom as `source setup_msvc_env.sh` / `ensure-erlang.sh`.
       #
-      # timeout-minutes (S-4): PGCONNECT_TIMEOUT only bounds the initial
-      # connect, not a psql call that connects fine and then hangs (a wedged
-      # backend, a lock wait). p1_psql's own /usr/bin/timeout wrapper bounds
-      # each individual call to 60s; this is the step-level backstop.
+      # timeout-minutes: PGCONNECT_TIMEOUT only bounds the initial connect,
+      # not a psql call that connects fine and then hangs (a wedged backend,
+      # a lock wait). p1_psql's own /usr/bin/timeout wrapper bounds each
+      # individual call to 30s; this is the step-level backstop, reconciled
+      # against the script's own worst case (4x30s probe attempts + 3x2s
+      # retry sleeps, the 30s read, the 30s heal, 5x(30+1)s re-read loop —
+      # about 341s) so a hung psql is killed by the wrapper's own specific
+      # ::error:: before this step-level timeout would otherwise pre-empt it
+      # with a generic message.
       - name: Ensure Postgres (server tests)
-        timeout-minutes: 5
+        timeout-minutes: 8
         run: source scripts/ci/ensure-postgres.sh
 
       # Mirrors the Linux job's own step of the same name (#3443) — see that

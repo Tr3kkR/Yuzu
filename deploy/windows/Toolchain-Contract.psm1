@@ -206,6 +206,37 @@ function Invoke-YuzuContractProbe {
   [string]$output
 }
 
+function Format-YuzuDurabilityFingerprint {
+  # Pure formatter/classifier for the per-cluster durability-settings
+  # fingerprint Assert-Toolchain.ps1 prints (#2167 follow-up). Never runs a
+  # process and never touches $fail — the classification (all three
+  # settings 'off' vs anything else) is read-only diagnostics, exactly like
+  # the caller's own SELECT 1 health gate stays the true pass/fail signal.
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param(
+    [Parameter(Mandatory)]
+    [int]$Agent,
+    [Parameter(Mandatory)]
+    [int]$Port,
+    [Parameter(Mandatory)]
+    [AllowEmptyString()]
+    [string]$FingerprintLine
+  )
+  $line = $FingerprintLine.Trim()
+  if($line -match 'fsync=off synchronous_commit=off full_page_writes=off'){
+    [pscustomobject]@{
+      Text  = ("[info] agent {0} :{1} {2}" -f $Agent, $Port, $line)
+      Color = 'Cyan'
+    }
+  } else {
+    [pscustomobject]@{
+      Text  = ("[warn] agent {0} :{1} drifted: {2}" -f $Agent, $Port, $line)
+      Color = 'Yellow'
+    }
+  }
+}
+
 function Resolve-YuzuEffectiveCommand {
   [CmdletBinding()]
   param(
@@ -803,4 +834,4 @@ function Test-YuzuVcpkgCheckout {
   }
 }
 
-Export-ModuleMember -Function Get-YuzuInstallerDisposition,Install-YuzuToolchainManifestCandidate,Invoke-YuzuContractProbe,Invoke-YuzuInstallerExitPolicy,New-YuzuToolchainManifestDocument,Read-YuzuToolchainContract,Resolve-YuzuEffectiveCommand,Resolve-YuzuPinnedPython,Test-YuzuRequiredToolPaths,Test-YuzuToolchainManifest,Test-YuzuVcpkgCheckout
+Export-ModuleMember -Function Format-YuzuDurabilityFingerprint,Get-YuzuInstallerDisposition,Install-YuzuToolchainManifestCandidate,Invoke-YuzuContractProbe,Invoke-YuzuInstallerExitPolicy,New-YuzuToolchainManifestDocument,Read-YuzuToolchainContract,Resolve-YuzuEffectiveCommand,Resolve-YuzuPinnedPython,Test-YuzuRequiredToolPaths,Test-YuzuToolchainManifest,Test-YuzuVcpkgCheckout
