@@ -169,9 +169,8 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 
 | Component | Why Untested | Priority |
 |-----------|-------------|----------|
-| **AgentRegistry** | Depends on gRPC protobuf types | Medium |
-| **AgentServiceImpl** (Register/Subscribe) | Requires mock gRPC streams | Low |
-| **GatewayUpstreamServiceImpl** | Requires mock gRPC streams | Low |
+| **EventBus** (`detail::EventBus`, legacy `/events` SSE, `event_bus.hpp`) | Exercised only as a fixture; `test_legacy_events_routes.cpp` checks single-threaded subscribe/unsubscribe via `listener_count()`. No concurrent subscribe/publish/unsubscribe test (distinct from `ExecutionEventBus`, covered by `test_execution_event_bus.cpp`) | Medium |
+| **AgentRegistry** | Direct unit coverage of the JSON renderers (`to_json`/`to_json_obj`) — `to_json_obj` is exercised indirectly through a real registry in `test_device_api.cpp` (`LocalDeviceApi::list_devices`); `evaluate_scope`/presence covered by `test_agent_registry_presence.cpp`, `register_agent` token revocation by `test_agent_registry_token_revocation.cpp`; `help_json` is exercised only indirectly via `test_discovery_routes.cpp` | Medium |
 | **HTML fragment renderers** | Output is fragile HTML strings | Very Low |
 | **Web route handlers** | Requires full httplib mock | Low |
 | **TLS credential loading** | Requires filesystem + certs | Low |
@@ -210,8 +209,9 @@ If a plugin has pure functions worth testing:
 
 ## Future Test Priorities
 
-1. **AgentRegistry** — to_json, help_json, evaluate_scope (once protobuf dep is available to tests)
-2. **Netstat parsing** — extract Linux parse_ipv4/ipv6/hex_port to a header for testing
-3. **Firewall parsing** — extract Windows parse_firewall_state/rules to a header for testing
-4. **NvdClient JSON parsing** — mock HTTP responses and test parse_response
-5. **Integration tests** — full Register/Subscribe flow with mock gRPC
+1. **EventBus** (`detail::EventBus`) — concurrent subscribe/publish/unsubscribe under TSan
+2. **AgentRegistry** — to_json, help_json (direct tests)
+3. **Netstat parsing** — extract Linux parse_ipv4/ipv6/hex_port to a header for testing
+4. **Firewall parsing** — extract Windows parse_firewall_state/rules to a header for testing
+5. **NvdClient JSON parsing** — mock HTTP responses and test parse_response
+6. **Integration tests** — full Register/Subscribe flow with mock gRPC

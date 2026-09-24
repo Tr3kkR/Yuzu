@@ -8661,7 +8661,7 @@ write a `command.dispatch` audit row with `result=denied` and `detail=reason=<re
 must be a JSON object; anything else is `400`.
 
 **Destructive-class capabilities require explicit, non-empty `agent_ids` — broadcast and `scope`
-fan-out are refused (#3685).** The command catalogue currently classifies 17 `plugin.action` pairs
+fan-out are refused (#3685).** The command catalogue currently classifies 19 `plugin.action` pairs
 `Destructive` (e.g. `tar.purge_source`, `filesystem.delete_lines`, `registry.delete_key`); dispatching
 any of them with `agent_ids` omitted or empty, or with `scope` present at all — including
 `"__all__"` — is refused **before** the command reaches an agent. This is a narrower carve-out
@@ -8747,7 +8747,7 @@ A plain RBAC denial (the caller holds no grant for the pair's classified securab
 {"error": {"code": 403, "message": "permission denied: Execution:Execute"}, "meta": {"api_version": "v1"}}
 ```
 
-A caller who *does* hold the grant but is dispatching one of the ~42 `plugin.action` pairs a
+A caller who *does* hold the grant but is dispatching one of the ~50 `plugin.action` pairs a
 compiled `ExecuteGate` marks `AdminOrApproval`/`AlwaysApproval` (e.g. `script_exec.exec`,
 `filesystem.delete`, `registry.set_value`), with no approval provenance and no admin role:
 
