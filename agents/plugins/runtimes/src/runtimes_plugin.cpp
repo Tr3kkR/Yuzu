@@ -48,7 +48,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "/usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version> "
-         "and sdk/<version> directory walk",
+         "and sdk/<version> directory walk; network mounts skipped via /proc/self/mountinfo",
          nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_PLANNED, 1, "/usr/local/share/dotnet/shared walk", kPlannedNote},
@@ -59,7 +59,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "jvm",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "/usr/lib/jvm/*/release + /opt/java/*/release file reads",
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "<home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java "
+         "(bin/java probe when a home has no release); network mounts skipped via "
+         "/proc/self/mountinfo",
          nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_PLANNED, 1,
@@ -127,7 +130,7 @@ public:
                 "internal_error"));
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "internal_error");
-            return 0;
+            return 1; // a genuine internal failure is a failed command (siblings; agent.cpp maps rc != 0 to FAILURE)
         }
         return 1; // unreachable on a supported build; avoids falling off a non-void function.
     }

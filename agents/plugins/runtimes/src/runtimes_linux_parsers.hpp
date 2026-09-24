@@ -12,7 +12,13 @@
  * WHAT IS READ (<root> + a literal, rung 1, zero subprocess):
  *   dotnet  usr/share/dotnet, usr/lib/dotnet, usr/lib64/dotnet:
  *           shared/<framework>/<version> and sdk/<version> directory names.
- *   jvm     usr/lib/jvm/<d>/release and opt/java/<d>/release (parse_release_file).
+ *   jvm     usr/lib/jvm/<d>, opt/java/<d>, usr/lib64/jvm/<d> (openSUSE/SLES) and
+ *           var/opt/java/<d> (rpm-ostree hosts, where /opt is a symlink to var/opt):
+ *           <d>/release (parse_release_file). A home with no `release` file but a
+ *           bin/java or jre/bin/java (distro OpenJDK 8 ships none) is reported with
+ *           an unknown version and `release_missing`, never dropped.
+ *   NOT walked: any other location (an Oracle-RPM /usr/java, tarball installs under
+ *   /usr/local or a home directory). "None found" covers the roots above only.
  *
  * SYMLINK SAFETY. Every directory is opened O_RDONLY|O_DIRECTORY|O_NOFOLLOW
  * (private copy of autoruns_macos.cpp's open_dir_no_follow_checked /
@@ -41,17 +47,33 @@
  * entry. Documented gap: a runtime reachable ONLY through such an entry
  * symlink is not inventoried.
  *
- * FAILURE NEVER READS AS ABSENT. A genuinely absent directory (ENOENT) is
- * `supported` + zero rows; any other failed open/stat/read records a
- * `linux:runtimes:<reason>` token in the caller's ConstraintAccumulator, shared
- * across every root of an action, so a later successful root never erases an
- * earlier failure. Work is bounded: kMaxDirEntries per directory (`truncated`),
- * kMaxReleaseBytes per `release` (`release_oversize`).
+ * FAILURE NEVER READS AS ABSENT. An absent candidate (ENOENT) is silent: with no
+ * failure recorded the answer is `supported` + zero rows, meaning none found at
+ * THESE roots. Any other failed open/stat/read, and every skip (a network mount,
+ * a cap), records a `linux:runtimes:<reason>` token in the caller's
+ * ConstraintAccumulator, shared across every root of an action, so a later
+ * successful root never erases an earlier failure.
+ *
+ * BOUNDED WORK AND MEMORY. kMaxDirEntries per directory; kMaxReleaseBytes per
+ * `release` file and kMaxReleaseValueBytes per recognised value; and, across ALL
+ * roots and nesting levels of one action, WalkLimits (rows, row bytes, entries
+ * visited) -- the per-directory cap alone multiplies with nesting. Exhausting any
+ * of them stops the walk with `row_cap`.
+ *
+ * NETWORK MOUNTS ARE NOT WALKED. An open/getdents on a hard NFS/CIFS/FUSE mount
+ * whose server is down blocks in the kernel with no deadline and pins one of the
+ * agent's shared command workers. The production leg reads /proc/self/mountinfo
+ * (scan_mounts); a candidate root that is on, under or contains a network mount
+ * (yuzu::shared::is_network_fstype) is skipped BEFORE any syscall touches it and
+ * records `network_fs_skipped`. Residual: a hang on a local-disk-backed path, and
+ * a network filesystem type the deny-list does not name.
  */
 #pragma once
 
 #include "runtimes_legs.hpp"
 #include "runtimes_parsers.hpp"
+
+#include <network_fstype.hpp> // yuzu::shared::is_network_fstype (agents/shared)
 
 #include <algorithm>
 #include <array>
@@ -80,23 +102,57 @@ namespace yuzu::runtimes::lnx {
 
 // -- failure tokens ------------------------------------------------------------
 //
-// All match ^linux:[a-z0-9_]+(:[a-z0-9_]+)*$ (the plugin-wide leg-token grammar).
+// All match ^linux:[a-z0-9_]+(:[a-z0-9_]+)*$ (the plugin-wide leg-token grammar). The
+// cause names shared with the sibling plugins (`oversized`, `not_regular`, `row_cap`,
+// `open_failed`; see constraint_accumulator.hpp) keep those spellings so a consumer keys on
+// one vocabulary.
 
 inline constexpr std::string_view kTokPermissionDenied = "linux:runtimes:permission_denied";
 inline constexpr std::string_view kTokSymlinkRefused = "linux:runtimes:symlink_refused";
 inline constexpr std::string_view kTokNotADirectory = "linux:runtimes:not_a_directory";
-inline constexpr std::string_view kTokDirOpenFailed = "linux:runtimes:dir_open_failed";
+inline constexpr std::string_view kTokOpenFailed = "linux:runtimes:open_failed";
 inline constexpr std::string_view kTokStatFailed = "linux:runtimes:stat_failed";
 inline constexpr std::string_view kTokReadFailed = "linux:runtimes:read_failed";
-inline constexpr std::string_view kTokTruncated = "linux:runtimes:truncated";
-inline constexpr std::string_view kTokNotARegularFile = "linux:runtimes:not_a_regular_file";
-inline constexpr std::string_view kTokReleaseOversize = "linux:runtimes:release_oversize";
+inline constexpr std::string_view kTokRowCap = "linux:runtimes:row_cap";
+inline constexpr std::string_view kTokNotRegular = "linux:runtimes:not_regular";
+inline constexpr std::string_view kTokOversized = "linux:runtimes:oversized";
+inline constexpr std::string_view kTokFieldOversized = "linux:runtimes:field_oversized";
 inline constexpr std::string_view kTokReleaseUnparsable = "linux:runtimes:release_unparsable";
+inline constexpr std::string_view kTokReleaseMissing = "linux:runtimes:release_missing";
+inline constexpr std::string_view kTokNetworkFsSkipped = "linux:runtimes:network_fs_skipped";
+inline constexpr std::string_view kTokMountinfoUnreadable = "linux:runtimes:mountinfo_unreadable";
 
-/// Per-directory entry cap (`truncated` when more real entries remain).
+/// Per-directory entry cap (`row_cap` when more real entries remain).
 inline constexpr std::size_t kMaxDirEntries = 16384;
 /// `release` read bound.
 inline constexpr std::size_t kMaxReleaseBytes = 64 * 1024;
+/// `/proc/self/mountinfo` read bound (a container host lists thousands of mounts).
+inline constexpr std::size_t kMaxMountinfoBytes = 4 * 1024 * 1024;
+
+/// Aggregate bounds for ONE action's walk, shared by every root and nesting level. A real host
+/// holds tens of runtimes; these leave two orders of magnitude of headroom while capping what a
+/// tree planted under a writable root (a user-owned /opt/java) can make the agent hold or scan.
+inline constexpr std::size_t kMaxRows = 4096;
+inline constexpr std::size_t kMaxRowBytes = 1024 * 1024;
+inline constexpr std::size_t kMaxEntriesVisited = 65536;
+
+/// The bounds one walk runs under (production: the defaults; a parameter so every bound and its
+/// `row_cap` propagation is testable without tens of thousands of files).
+struct WalkLimits {
+    std::size_t dir_entries = kMaxDirEntries;
+    std::size_t rows = kMaxRows;
+    std::size_t row_bytes = kMaxRowBytes;
+    std::size_t entries_visited = kMaxEntriesVisited;
+};
+
+/// Everything a walk needs besides the root: its bounds and the absolute mount points of the
+/// network filesystems to keep away from (empty: no guard, the unit-suite default).
+/// `mountinfo_unreadable` records that the guard could not be built (the walk still runs).
+struct WalkConfig {
+    WalkLimits limits{};
+    std::vector<std::string> network_mounts{};
+    bool mountinfo_unreadable = false;
+};
 
 // -- portable pure layer ---------------------------------------------------------
 
@@ -111,7 +167,7 @@ inline constexpr std::size_t kMaxReleaseBytes = 64 * 1024;
     case EPERM:  return kTokPermissionDenied;
     case ELOOP:  return kTokSymlinkRefused;
     case ENOTDIR: return kTokNotADirectory;
-    default:     return kTokDirOpenFailed;
+    default:     return kTokOpenFailed;
     }
 }
 
@@ -152,7 +208,12 @@ inline constexpr std::size_t kMaxReleaseBytes = 64 * 1024;
 /// symlinked candidate is an alias only of another candidate in ITS group.
 inline constexpr std::array<std::string_view, 3> kDotnetRoots{"usr/share/dotnet", "usr/lib/dotnet",
                                                               "usr/lib64/dotnet"};
-inline constexpr std::array<std::string_view, 2> kJvmRoots{"usr/lib/jvm", "opt/java"};
+// usr/lib64/jvm: openSUSE/SLES keep their JVMs there and have no /usr/lib/jvm (measured on
+// openSUSE Leap 15.6, provenance.txt). var/opt/java: on rpm-ostree hosts (Fedora CoreOS,
+// Silverblue, RHCOS, RHEL Edge) /opt is a symlink to var/opt, so without this candidate every
+// jvm dispatch would report `symlink_refused` for opt/java; with it the link is a covered alias.
+inline constexpr std::array<std::string_view, 4> kJvmRoots{"usr/lib/jvm", "opt/java", "usr/lib64/jvm",
+                                                           "var/opt/java"};
 
 /// Lexically normalises a root-relative path: empty and `.` components dropped,
 /// `..` pops one. nullopt when a `..` would climb above the root. Pure text --
@@ -193,6 +254,72 @@ inline constexpr std::array<std::string_view, 2> kJvmRoots{"usr/lib/jvm", "opt/j
     else joined = std::string{parent_rel} + "/" + std::string{target};
     if (!remaining.empty()) joined += "/" + std::string{remaining};
     return normalize_rel(joined);
+}
+
+// -- network-mount guard (pure) ---------------------------------------------------
+
+/// Decodes the octal escapes /proc/self/mountinfo uses inside a field (\040 space, \011 tab,
+/// \012 newline, \134 backslash). A malformed escape is kept verbatim.
+[[nodiscard]] inline std::string unescape_mountinfo(std::string_view s) {
+    std::string out;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const bool octal = s[i] == '\\' && i + 3 < s.size() && s[i + 1] >= '0' && s[i + 1] <= '3' &&
+                           s[i + 2] >= '0' && s[i + 2] <= '7' && s[i + 3] >= '0' && s[i + 3] <= '7';
+        if (!octal) {
+            out += s[i];
+            continue;
+        }
+        out += static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0'));
+        i += 3;
+    }
+    return out;
+}
+
+/// The mount points of network-backed filesystems in /proc/self/mountinfo text. A line is
+/// `id parent maj:min root mount_point options [optional...] - fstype source super_options`;
+/// the mount point is field 5 and the filesystem type follows the ` - ` separator. A malformed
+/// line is skipped (it names no mount we can avoid); a well-formed line of a local type is not
+/// reported.
+[[nodiscard]] inline std::vector<std::string> network_mount_points(std::string_view mountinfo) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (pos < mountinfo.size()) {
+        const auto nl = mountinfo.find('\n', pos);
+        const std::string_view line =
+            mountinfo.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
+        pos = nl == std::string_view::npos ? mountinfo.size() : nl + 1;
+        const auto sep = line.find(" - ");
+        if (sep == std::string_view::npos) continue;
+        const std::string_view head = line.substr(0, sep);
+        std::string_view mount_point; // the 5th space-separated field of the head
+        std::size_t start = 0;
+        for (int field = 0; field <= 4 && start <= head.size(); ++field) {
+            const auto sp = head.find(' ', start);
+            const auto end = sp == std::string_view::npos ? head.size() : sp;
+            if (field == 4) mount_point = head.substr(start, end - start);
+            start = end + 1;
+        }
+        if (mount_point.empty()) continue;
+        const auto after = line.substr(sep + 3);
+        const auto fstype = after.substr(0, after.find(' '));
+        if (!yuzu::shared::is_network_fstype(fstype)) continue;
+        out.push_back(unescape_mountinfo(mount_point));
+    }
+    return out;
+}
+
+/// True iff `path` (absolute, normalised) is on or under a listed mount point, or contains one:
+/// a walk of `path` then touches that mount. The root mount "/" contains everything.
+[[nodiscard]] inline bool touches_network_mount(std::string_view path,
+                                                std::span<const std::string> mounts) {
+    const auto under = [](std::string_view inner, std::string_view outer) {
+        if (outer == "/") return true;
+        if (outer.size() > inner.size() || inner.substr(0, outer.size()) != outer) return false;
+        return inner.size() == outer.size() || inner[outer.size()] == '/';
+    };
+    for (const auto& m : mounts)
+        if (under(path, m) || under(m, path)) return true;
+    return false;
 }
 
 // -- POSIX walk shell ------------------------------------------------------------
@@ -241,13 +368,14 @@ struct Opened {
     std::string_view token{}; // set iff status == failed
 };
 
-constexpr int kDirFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+inline constexpr int kDirFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 
 /// Completes an already-attempted open (`fd`, errno current if fd < 0) of
 /// `name` relative to `stat_dirfd`: fdopendir on success; on failure ENOENT =
-/// absent, a symlink at that exact component = alias (classified by fstatat,
-/// not by errno: Linux returns ENOTDIR and BSD/macOS ELOOP for
-/// O_DIRECTORY|O_NOFOLLOW on a symlink), anything else = a constraint.
+/// absent, a symlink at that exact component = alias (classified by fstatat
+/// rather than by errno: O_DIRECTORY|O_NOFOLLOW on a symlink measured ENOTDIR on
+/// Darwin 25.6 and on Linux 7.0 (glibc and musl); the ELOOP arms elsewhere are
+/// kept for libcs that report it), anything else = a constraint.
 inline Opened finish_dir_open(int fd, int stat_dirfd, const char* name) {
     Opened o;
     if (fd < 0) {
@@ -259,7 +387,7 @@ inline Opened finish_dir_open(int fd, int stat_dirfd, const char* name) {
             return o;
         }
         o.status = OpenStatus::failed;
-        o.token = dir_open_errno_token(err).value_or(kTokDirOpenFailed);
+        o.token = dir_open_errno_token(err).value_or(kTokOpenFailed);
         return o;
     }
     yuzu::agent::ScopedFd owned{fd}; // closed on the failure path below
@@ -267,7 +395,7 @@ inline Opened finish_dir_open(int fd, int stat_dirfd, const char* name) {
     if (d == nullptr) {
         const int err = errno; // read before ScopedFd's close can disturb it
         o.status = OpenStatus::failed;
-        o.token = dir_open_errno_token(err).value_or(kTokDirOpenFailed);
+        o.token = dir_open_errno_token(err).value_or(kTokOpenFailed);
         return o;
     }
     (void)owned.release(); // fdopendir() succeeded: the DIR* owns the fd now
@@ -351,7 +479,8 @@ inline PathWalk walk_path(const std::string& root, std::string_view rel) {
 /// /usr/lib64 -> lib with no .NET installed -- into a false `constrained`; the
 /// dangling-alias case in test_runtimes_linux_parsers.cpp pins this.
 inline bool alias_is_covered(const std::string& root, const PathWalk& w, std::string_view rel,
-                             std::span<const std::string_view> candidates) {
+                             std::span<const std::string_view> candidates,
+                             const WalkConfig& cfg) {
     if (!w.parent || w.comp.empty()) return false; // a symlinked injected root is never an alias
     char buf[4096];
     const ssize_t n = ::readlinkat(::dirfd(w.parent.get()), w.comp.c_str(), buf, sizeof buf);
@@ -361,24 +490,59 @@ inline bool alias_is_covered(const std::string& root, const PathWalk& w, std::st
     if (!target || *target == rel) return false;
     if (std::find(candidates.begin(), candidates.end(), std::string_view{*target}) == candidates.end())
         return false;
+    // The target is a candidate whose own walk records `network_fs_skipped`; do not touch it here.
+    if (touches_network_mount("/" + *target, cfg.network_mounts)) return true;
     return walk_path(root, *target).status != OpenStatus::alias;
 }
 
 /// Opens candidate root <root>/<rel> (a member of `candidates`). Absent and a
-/// covered alias are silent; every other refusal is recorded in `acc`.
+/// covered alias are silent; a candidate on, under or containing a network mount
+/// is skipped before any syscall touches it (`network_fs_skipped`); every other
+/// refusal is recorded in `acc`.
 inline DirHandle open_path(const std::string& root, std::string_view rel,
-                           std::span<const std::string_view> candidates,
+                           std::span<const std::string_view> candidates, const WalkConfig& cfg,
                            ConstraintAccumulator& acc) {
+    if (touches_network_mount("/" + std::string{rel}, cfg.network_mounts)) {
+        acc.add_failure(kTokNetworkFsSkipped);
+        return DirHandle{};
+    }
     PathWalk w = walk_path(root, rel);
     switch (w.status) {
     case OpenStatus::opened: return std::move(w.dir);
     case OpenStatus::absent: break;
     case OpenStatus::failed: acc.add_failure(w.token); break;
     case OpenStatus::alias:
-        if (!alias_is_covered(root, w, rel, candidates)) acc.add_failure(kTokSymlinkRefused);
+        if (!alias_is_covered(root, w, rel, candidates, cfg)) acc.add_failure(kTokSymlinkRefused);
         break;
     }
     return DirHandle{};
+}
+
+/// Running account of ONE action's walk against its WalkLimits: rows and row bytes admitted, and
+/// directory entries visited, across every root and nesting level. `exhausted` is sticky and tells
+/// every loop to stop.
+struct WalkBudget {
+    explicit WalkBudget(const WalkLimits& l) noexcept
+        : limits(l), rows_left(l.rows), bytes_left(l.row_bytes), entries_left(l.entries_visited) {}
+    WalkLimits limits;
+    std::size_t rows_left;
+    std::size_t bytes_left;
+    std::size_t entries_left;
+    bool exhausted = false;
+};
+
+/// Appends `row` unless the row or byte budget is spent (then `row_cap`, and the walk stops).
+inline bool push_row(std::vector<std::string>& rows, std::string&& row, WalkBudget& b,
+                     ConstraintAccumulator& acc) {
+    if (b.rows_left == 0 || row.size() > b.bytes_left) {
+        b.exhausted = true;
+        acc.add_failure(kTokRowCap);
+        return false;
+    }
+    --b.rows_left;
+    b.bytes_left -= row.size();
+    rows.push_back(std::move(row));
+    return true;
 }
 
 enum class EntryType { directory, symlink, other };
@@ -389,16 +553,20 @@ struct EntryInfo {
 };
 
 /// The real entries of an open directory, sorted by name (readdir order is
-/// unspecified, and rows must be deterministic), reading at most `max_entries`
-/// real entries (production: kMaxDirEntries; a parameter so the cap and its
-/// `truncated` propagation are testable without 16k files). A vanished entry
-/// (ENOENT) is skipped; any other stat failure, a hit cap and a readdir I/O
-/// error are recorded.
-inline std::vector<EntryInfo> list_entries(DIR* d, ConstraintAccumulator& acc,
-                                           std::size_t max_entries) {
+/// unspecified, and rows must be deterministic), reading at most the smaller of
+/// the per-directory cap and what is left of the action's entries-visited
+/// budget; every entry read is charged to that budget. A vanished entry
+/// (ENOENT) is skipped; any other stat failure, a hit cap (`row_cap`) and a
+/// readdir I/O error are recorded, and a cap that was the aggregate budget
+/// exhausts the walk.
+inline std::vector<EntryInfo> list_entries(DIR* d, ConstraintAccumulator& acc, WalkBudget& budget) {
     std::vector<EntryInfo> out;
+    if (budget.exhausted) return out;
+    const std::size_t cap = std::min(budget.limits.dir_entries, budget.entries_left);
+    std::size_t seen = 0;
     const int fd = ::dirfd(d);
-    const auto res = yuzu::shared::walk_dir_capped(d, max_entries, [&](const struct dirent* e) {
+    const auto res = yuzu::shared::walk_dir_capped(d, cap, [&](const struct dirent* e) {
+        ++seen;
         struct stat st{};
         if (::fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             if (const auto tok = stat_errno_token(errno)) acc.add_failure(*tok);
@@ -412,7 +580,11 @@ inline std::vector<EntryInfo> list_entries(DIR* d, ConstraintAccumulator& acc,
         out.push_back(std::move(info));
         return true;
     });
-    if (res.truncated) acc.add_failure(kTokTruncated);
+    budget.entries_left -= seen; // seen <= cap <= entries_left
+    if (res.truncated) {
+        acc.add_failure(kTokRowCap);
+        if (budget.entries_left == 0) budget.exhausted = true;
+    }
     if (res.enumeration_error) acc.add_failure(kTokReadFailed);
     std::sort(out.begin(), out.end(),
               [](const EntryInfo& a, const EntryInfo& b) { return a.name < b.name; });
@@ -450,12 +622,12 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
     }
     if (!S_ISREG(st.st_mode)) {
         r.status = ReadStatus::failed;
-        r.token = kTokNotARegularFile;
+        r.token = kTokNotRegular;
         return r;
     }
     if (static_cast<unsigned long long>(st.st_size) > max_bytes) {
         r.status = ReadStatus::failed;
-        r.token = kTokReleaseOversize;
+        r.token = kTokOversized;
         return r;
     }
     char buf[4096];
@@ -472,7 +644,7 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
         r.text.append(buf, static_cast<std::size_t>(n));
         if (r.text.size() > max_bytes) { // grew past the fstat size
             r.status = ReadStatus::failed;
-            r.token = kTokReleaseOversize;
+            r.token = kTokOversized;
             r.text.clear();
             return r;
         }
@@ -481,82 +653,131 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
     return r;
 }
 
+/// True iff <home>/bin/java or <home>/jre/bin/java exists (any type, never followed): the
+/// footprint of a JVM home whose installer wrote no `release` file (distro OpenJDK 8 ships none;
+/// RHEL's has only jre/bin/java). Each hop is opened O_NOFOLLOW; an unreadable `bin` or `jre` is
+/// recorded, a symlinked or missing one is not a JVM home's layout and reads as "no".
+inline bool home_has_java_binary(DIR* home, ConstraintAccumulator& acc) {
+    const auto java_in_bin = [&acc](DIR* dir) {
+        const DirHandle bin = take_or_record(open_child(dir, "bin"), acc);
+        if (!bin) return false;
+        struct stat st{};
+        return ::fstatat(::dirfd(bin.get()), "java", &st, AT_SYMLINK_NOFOLLOW) == 0;
+    };
+    if (java_in_bin(home)) return true;
+    const DirHandle jre = take_or_record(open_child(home, "jre"), acc);
+    return jre && java_in_bin(jre.get());
+}
+
+/// The mount table at `path` (production: /proc/self/mountinfo) reduced to its network mount
+/// points. `ok` is false when it cannot be read (absent, refused, oversized): the caller then
+/// walks unguarded and records `mountinfo_unreadable`.
+struct MountScan {
+    std::vector<std::string> network_mounts;
+    bool ok = false;
+};
+
+inline MountScan scan_mounts(const char* path) {
+    MountScan s;
+    const auto r = read_file_bounded_at(AT_FDCWD, path, kMaxMountinfoBytes);
+    if (r.status != ReadStatus::ok) return s;
+    s.network_mounts = network_mount_points(r.text);
+    s.ok = true;
+    return s;
+}
+
 } // namespace walk
 
 // -- the three action walks ----------------------------------------------------------
 //
-// `max_entries` is the per-directory cap (production default kMaxDirEntries).
+// `cfg` carries the bounds and the network-mount guard (default: production bounds, no guard).
 
 /// dotnet: <root>/{usr/share,usr/lib,usr/lib64}/dotnet -> shared/<fw>/<ver> and
 /// sdk/<ver>. Row order: candidate-root order, then framework name, then
 /// version (sorted).
 [[nodiscard]] inline std::vector<std::string> dotnet_rows_at(
     const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
-    std::size_t max_entries = kMaxDirEntries) {
+    const WalkConfig& cfg = {}) {
     using namespace walk;
     std::vector<std::string> rows;
+    WalkBudget budget{cfg.limits};
     const std::string root_s = root.string();
     for (const std::string_view rel : kDotnetRoots) {
-        const DirHandle dotnet = open_path(root_s, rel, kDotnetRoots, acc);
+        if (budget.exhausted) break;
+        const DirHandle dotnet = open_path(root_s, rel, kDotnetRoots, cfg, acc);
         if (!dotnet) continue;
         const std::string logical = "/" + std::string{rel};
 
         if (const DirHandle shared =
                 take_or_record(open_child(dotnet.get(), "shared"), acc, /*refuse_alias=*/true)) {
-            for (const auto& fw : list_entries(shared.get(), acc, max_entries)) {
+            for (const auto& fw : list_entries(shared.get(), acc, budget)) {
+                if (budget.exhausted) break;
                 if (fw.type != EntryType::directory) continue;
                 const DirHandle fwh = take_or_record(open_child(shared.get(), fw.name), acc);
                 if (!fwh) continue;
-                for (const auto& ver : list_entries(fwh.get(), acc, max_entries)) {
+                for (const auto& ver : list_entries(fwh.get(), acc, budget)) {
                     if (ver.type != EntryType::directory) continue;
-                    if (auto row = dotnet_row(fw.name, ver.name,
-                                              join_logical(join_logical(logical + "/shared", fw.name),
-                                                           ver.name)))
-                        rows.push_back(std::move(*row));
+                    auto row = dotnet_row(fw.name, ver.name,
+                                          join_logical(join_logical(logical + "/shared", fw.name),
+                                                       ver.name));
+                    if (row && !push_row(rows, std::move(*row), budget, acc)) break;
                 }
             }
         }
+        if (budget.exhausted) break;
         if (const DirHandle sdk =
                 take_or_record(open_child(dotnet.get(), "sdk"), acc, /*refuse_alias=*/true)) {
-            for (const auto& ver : list_entries(sdk.get(), acc, max_entries)) {
+            for (const auto& ver : list_entries(sdk.get(), acc, budget)) {
                 if (ver.type != EntryType::directory) continue;
-                if (auto row = dotnet_row("sdk", ver.name, join_logical(logical + "/sdk", ver.name)))
-                    rows.push_back(std::move(*row));
+                auto row = dotnet_row("sdk", ver.name, join_logical(logical + "/sdk", ver.name));
+                if (row && !push_row(rows, std::move(*row), budget, acc)) break;
             }
         }
     }
     return rows;
 }
 
-/// jvm: <root>/{usr/lib/jvm,opt/java}/<d>/release. A directory without a
-/// `release` file is not a JVM home (silent); an unreadable / oversized /
-/// version-less one is a recorded constraint. Symlinked homes are aliases.
+/// jvm: <root>/{usr/lib/jvm,opt/java,usr/lib64/jvm,var/opt/java}/<d>/release. A directory with
+/// neither a `release` file nor a bin/java or jre/bin/java is not a JVM home (silent); one with a
+/// java binary but no `release` (distro OpenJDK 8) is a row with an unknown version plus
+/// `release_missing`; an unreadable / oversized / version-less `release` is a recorded constraint.
+/// Symlinked homes are aliases.
 [[nodiscard]] inline std::vector<std::string> jvm_rows_at(
     const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
-    std::size_t max_entries = kMaxDirEntries) {
+    const WalkConfig& cfg = {}) {
     using namespace walk;
     std::vector<std::string> rows;
+    WalkBudget budget{cfg.limits};
     const std::string root_s = root.string();
     for (const std::string_view rel : kJvmRoots) {
-        const DirHandle jvm_dir = open_path(root_s, rel, kJvmRoots, acc);
+        if (budget.exhausted) break;
+        const DirHandle jvm_dir = open_path(root_s, rel, kJvmRoots, cfg, acc);
         if (!jvm_dir) continue;
         const std::string logical = "/" + std::string{rel};
-        for (const auto& home : list_entries(jvm_dir.get(), acc, max_entries)) {
+        for (const auto& home : list_entries(jvm_dir.get(), acc, budget)) {
             if (home.type != EntryType::directory) continue;
             const DirHandle hh = take_or_record(open_child(jvm_dir.get(), home.name), acc);
             if (!hh) continue;
+            const std::string path = join_logical(logical, home.name);
             const auto rr = read_file_bounded_at(::dirfd(hh.get()), "release", kMaxReleaseBytes);
-            if (rr.status == ReadStatus::absent) continue;
+            if (rr.status == ReadStatus::absent) {
+                if (!home_has_java_binary(hh.get(), acc)) continue;
+                acc.add_failure(kTokReleaseMissing);
+                if (!push_row(rows, jvm_row_release_missing(path), budget, acc)) break;
+                continue;
+            }
             if (rr.status == ReadStatus::failed) {
                 acc.add_failure(rr.token);
                 continue;
             }
-            const auto row = jvm_row(parse_release_file(rr.text), join_logical(logical, home.name));
+            const auto fields = parse_release_file(rr.text);
+            if (fields.oversized) acc.add_failure(kTokFieldOversized);
+            auto row = jvm_row(fields, path);
             if (!row) {
                 acc.add_failure(kTokReleaseUnparsable);
                 continue;
             }
-            rows.push_back(*row);
+            if (!push_row(rows, std::move(*row), budget, acc)) break;
         }
     }
     return rows;
@@ -565,25 +786,40 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
 /// The Linux leg's dispatch: the rows for action `a` under `root`, failures
 /// recorded in `acc`. run_linux_at is this plus emit_read; both live here so the
 /// action -> walk -> emit wiring is unit-testable without linking the plugin TU.
+/// An action with no arm here (a future one) is a visible failure, never `supported` + 0 rows.
 [[nodiscard]] inline std::vector<std::string> action_rows_at(
-    Action a, const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc) {
+    Action a, const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
+    const WalkConfig& cfg = {}) {
     switch (a) {
-    case Action::dotnet: return dotnet_rows_at(root, acc);
-    case Action::jvm:    return jvm_rows_at(root, acc);
+    case Action::dotnet: return dotnet_rows_at(root, acc, cfg);
+    case Action::jvm:    return jvm_rows_at(root, acc, cfg);
     }
+    acc.add_failure("internal_error");
     return {};
+}
+
+/// Production's WalkConfig: the default bounds plus the network mount points read from
+/// /proc/self/mountinfo (`mountinfo_unreadable` when it cannot be read).
+[[nodiscard]] inline WalkConfig production_config() {
+    auto scan = walk::scan_mounts("/proc/self/mountinfo");
+    WalkConfig cfg;
+    cfg.network_mounts = std::move(scan.network_mounts);
+    cfg.mountinfo_unreadable = !scan.ok;
+    return cfg;
 }
 
 /// The Linux leg body with the filesystem root injected: `action_rows_at` plus
 /// `emit_read` (status row first, then every data row, then the typed result
-/// status). runtimes_linux.cpp's `run_linux` calls it with "/"; the unit suite
-/// drives it over a materialized fixture tree through a real CommandContext
-/// (LocalDispatcher), so what is asserted is the rows AND the status the command
-/// actually reports. Returns 0 unconditionally: a degraded read is not a failed
+/// status). runtimes_linux.cpp's `run_linux` calls it with "/" and
+/// production_config(); the unit suite drives it over a materialized fixture tree through
+/// a real CommandContext (LocalDispatcher), so what is asserted is the rows AND the status the
+/// command actually reports. Returns 0 unconditionally: a degraded read is not a failed
 /// command; the degradation rides the status row and set_result_status.
-inline int run_linux_at(yuzu::CommandContext& ctx, Action a, const std::filesystem::path& root) {
+inline int run_linux_at(yuzu::CommandContext& ctx, Action a, const std::filesystem::path& root,
+                        const WalkConfig& cfg = {}) {
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = action_rows_at(a, root, acc);
+    if (cfg.mountinfo_unreadable) acc.add_failure(kTokMountinfoUnreadable);
+    const auto rows = action_rows_at(a, root, acc, cfg);
     emit_read(ctx, a, rows, acc);
     return 0;
 }

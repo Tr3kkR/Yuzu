@@ -135,14 +135,13 @@ TEST_CASE("runtimes: parse_release_file tolerates CRLF, unquoted values, whitesp
 
 // -- jvm flavour + row ----------------------------------------------------------
 
-TEST_CASE("runtimes: jvm_flavour_from maps IMAGE_TYPE, path hint, and unmodelled", "[runtimes]") {
-    CHECK(rt::jvm_flavour_from("JDK", "/opt/java/openjdk") == rt::JvmFlavour::jdk);
-    CHECK(rt::jvm_flavour_from("jre", "/x") == rt::JvmFlavour::jre);
-    CHECK(rt::jvm_flavour_from("", "/usr/lib/jvm/java-8-openjdk-amd64/jre") == rt::JvmFlavour::jre);
-    // No IMAGE_TYPE and no hint: unmodelled, not guessed.
-    CHECK(rt::jvm_flavour_from("", "/usr/lib/jvm/java-17-openjdk-arm64") ==
-          rt::JvmFlavour::unmodelled);
-    CHECK(rt::jvm_flavour_from("SOMETHING", "/x") == rt::JvmFlavour::unmodelled);
+TEST_CASE("runtimes: jvm_flavour_from maps IMAGE_TYPE and otherwise says unmodelled", "[runtimes]") {
+    CHECK(rt::jvm_flavour_from("JDK") == rt::JvmFlavour::jdk);
+    CHECK(rt::jvm_flavour_from("jre") == rt::JvmFlavour::jre);
+    CHECK(rt::jvm_flavour_from(" Jdk ") == rt::JvmFlavour::jdk); // case-insensitive, trimmed
+    // No IMAGE_TYPE (Debian, SUSE): unmodelled, never guessed from the path or the module list.
+    CHECK(rt::jvm_flavour_from("") == rt::JvmFlavour::unmodelled);
+    CHECK(rt::jvm_flavour_from("SOMETHING") == rt::JvmFlavour::unmodelled);
     CHECK(rt::flavour_token(rt::JvmFlavour::unmodelled) == "unmodelled");
 }
 
@@ -257,19 +256,19 @@ TEST_CASE("runtimes: the status row precedes every data row", "[runtimes]") {
 TEST_CASE("runtimes: permission-denied is constrained with its token; success never hides it",
           "[runtimes]") {
     yuzu::shared::ConstraintAccumulator acc;
-    acc.add_failure("linux:dotnet:permission_denied"); // first root unreadable
+    acc.add_failure("linux:runtimes:permission_denied"); // first root unreadable
     // A later root read cleanly and contributed a row: that must not erase the failure.
     const auto out = rt::compose_output(
         "dotnet", {"dotnet|core|8.0.31|/usr/lib/dotnet/shared/Microsoft.NETCore.App/8.0.31|-"}, acc);
     REQUIRE(out.size() == 2);
-    CHECK(out[0] == "status|dotnet|constrained|linux:dotnet:permission_denied");
+    CHECK(out[0] == "status|dotnet|constrained|linux:runtimes:permission_denied");
     CHECK(out[1].rfind("dotnet|core|8.0.31|", 0) == 0);
 
-    acc.add_failure("linux:dotnet:permission_denied"); // exact-duplicate token dedupes
-    acc.add_failure("linux:dotnet:release_unreadable");
+    acc.add_failure("linux:runtimes:permission_denied"); // exact-duplicate token dedupes
+    acc.add_failure("linux:runtimes:release_unparsable");
     const auto st = rt::status_from_accumulator(acc);
     CHECK(st.level == rt::StatusLevel::constrained);
-    CHECK(st.reason == "linux:dotnet:permission_denied,linux:dotnet:release_unreadable");
+    CHECK(st.reason == "linux:runtimes:permission_denied,linux:runtimes:release_unparsable");
 }
 
 TEST_CASE("runtimes: planned placeholder rows are exact", "[runtimes]") {
@@ -315,4 +314,65 @@ TEST_CASE("runtimes: action names round-trip and unknown names are rejected", "[
     CHECK_FALSE(rt::parse_action("java").has_value());
     CHECK_FALSE(rt::parse_action("").has_value());
     CHECK_FALSE(rt::parse_action("DOTNET").has_value());
+}
+
+// -- version directories ---------------------------------------------------------------------
+
+TEST_CASE("runtimes: only major.minor.patch (+prerelease/build) names are .NET version dirs",
+          "[runtimes]") {
+    for (const char* ok : {"8.0.31", "10.0.100", "9.0.100-preview.1.24101.2", "10.0.0-rc.1.25451.107",
+                           "8.0.100+abc.1", "6.0.0-alpha+build-5"}) {
+        INFO("version: " << ok);
+        CHECK(rt::dotnet_entry_from_dir("sdk", ok).has_value());
+    }
+    // A backup or disabled copy, a date, a bare integer, a two-part version and stray characters
+    // are not runtimes: the .NET host would not load them, so reporting them is a false inventory.
+    for (const char* bad : {"8.0.31.bak", "6.0.0.disabled", "2024-01-01", "8", "8.0", "8.0.31~",
+                            "8.0.31-", "8.0.31+", ".8.0.31", "8..31", "8.0.31 x", "v8.0.31",
+                            "8.0.31_1", "NuGetFallbackFolder"}) {
+        INFO("name: " << bad);
+        CHECK_FALSE(rt::dotnet_entry_from_dir("sdk", bad).has_value());
+    }
+}
+
+// -- release value bound ---------------------------------------------------------------------
+
+TEST_CASE("runtimes: a recognised release value over the value cap is dropped and flagged",
+          "[runtimes]") {
+    // MUTATION: raising the cap or dropping the check keeps the 257-byte value and clears the flag.
+    static_assert(rt::kMaxReleaseValueBytes == 256);
+    const std::string edge(256, 'v');
+    const std::string over(257, 'v');
+    const auto at = rt::parse_release_file("IMPLEMENTOR=\"" + edge + "\"\nJAVA_VERSION=\"17\"\n");
+    CHECK(at.implementor == edge); // exactly 256 bytes is kept
+    CHECK_FALSE(at.oversized);
+    const auto past = rt::parse_release_file("IMPLEMENTOR=\"" + over + "\"\nJAVA_VERSION=\"17\"\n");
+    CHECK(past.implementor.empty());
+    CHECK(past.oversized);
+    CHECK(past.java_version == "17"); // the other keys are unaffected
+    // An unrecognised key's long value is never read, so it is not a defect.
+    CHECK_FALSE(rt::parse_release_file("MODULES=\"" + over + "\"\nJAVA_VERSION=\"17\"\n").oversized);
+    // A dropped JAVA_VERSION leaves no version: no row (the leg records release_unparsable).
+    const auto no_version = rt::parse_release_file("JAVA_VERSION=\"" + over + "\"\n");
+    CHECK(no_version.oversized);
+    CHECK_FALSE(rt::jvm_row(no_version, "/opt/j").has_value());
+}
+
+// -- release-less home and untrusted bytes ---------------------------------------------------
+
+TEST_CASE("runtimes: a release-less home is a row with an unknown version, not silence",
+          "[runtimes]") {
+    CHECK(rt::jvm_row_release_missing("/usr/lib/jvm/java-8-openjdk-arm64") ==
+          "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-arm64|-");
+}
+
+TEST_CASE("runtimes: invalid UTF-8 in untrusted text is replaced before it reaches the wire",
+          "[runtimes]") {
+    // One invalid byte in a proto3 string fails the parse of the whole output chunk, so a planted
+    // directory name or release value must never reach the wire raw. MUTATION: dropping
+    // sanitize_utf8 from field_or_dash leaves the 0xff / 0xe9 bytes in the row.
+    const std::string bad_path = "/usr/lib/jvm/x\xff" "y";
+    const std::string latin1_vendor = "Caf\xe9 JDK";
+    const auto row = rt::format_runtime_row("jvm", "jdk", "17", bad_path, latin1_vendor);
+    CHECK(row == "jvm|jdk|17|/usr/lib/jvm/x?y|Caf? JDK");
 }

@@ -17,12 +17,13 @@
  *   status|<action>|<supported|constrained|unsupported>|<reason tokens, comma-joined, or ->
  *   <action>|<flavour>|<version>|<install_path>|<vendor or ->      (zero or more)
  *
- * The status row ALWAYS comes first, so a consumer never has to infer "no
- * runtimes installed" from silence: `supported` + zero data rows is a
- * genuinely absent runtime family; `constrained` means some read failed
- * (unreadable directory, oversized/garbled metadata) and the rows that follow
- * may be incomplete -- failure never reads as absent. `unsupported` is the
- * planned-leg placeholder (`macos:planned`, `windows:planned`).
+ * The status row ALWAYS comes first, so a consumer never has to infer an empty
+ * inventory from silence: `supported` + zero data rows means NONE FOUND AT THE
+ * STANDARD ROOTS the leg walks (a runtime installed anywhere else is not looked
+ * for); `constrained` means some read failed or was skipped (unreadable
+ * directory, oversized/garbled metadata, a network mount, a cap) and the rows
+ * that follow may be incomplete -- failure never reads as absent. `unsupported`
+ * is the planned-leg placeholder (`macos:planned`, `windows:planned`).
  *
  * FLAVOUR VOCABULARY (fixed, emitted verbatim, never parsed text). Every
  * OS-text -> enum mapper below carries a named `unmodelled` outcome distinct
@@ -111,25 +112,50 @@ namespace detail {
     return true;
 }
 
-/// A directory-name version: starts with a digit; the rest is limited to
-/// [0-9A-Za-z.+_-] (covers "8.0.31", "9.0.100-preview.1.24101.2"). Anything
-/// else (spaces, control characters, path separators) is not a version.
+/// A .NET install-tree version directory: `major.minor.patch` (digits), then an
+/// optional `-<prerelease>` and an optional `+<build>` (each [0-9A-Za-z.-]+),
+/// e.g. "8.0.31", "9.0.100-preview.1.24101.2". A backup or disabled copy
+/// ("8.0.31.bak"), a date, a bare integer or a spaced name is not a version (the
+/// .NET host would not load it either), so it is not reported as a runtime.
 [[nodiscard]] inline bool looks_like_version_dir(std::string_view v) noexcept {
-    if (v.empty() || !is_digit(v.front())) return false;
-    for (char c : v) {
-        const bool ok = is_digit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                        c == '.' || c == '+' || c == '_' || c == '-';
-        if (!ok) return false;
+    std::size_t i = 0;
+    for (int part = 0; part < 3; ++part) {
+        const std::size_t start = i;
+        while (i < v.size() && is_digit(v[i])) ++i;
+        if (i == start) return false;
+        if (part < 2) {
+            if (i >= v.size() || v[i] != '.') return false;
+            ++i;
+        }
     }
-    return true;
+    const auto ident = [](char c) {
+        return is_digit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' ||
+               c == '-';
+    };
+    const auto consume_ident = [&]() {
+        const std::size_t start = i;
+        while (i < v.size() && ident(v[i])) ++i;
+        return i > start;
+    };
+    if (i < v.size() && v[i] == '-') {
+        ++i;
+        if (!consume_ident()) return false;
+    }
+    if (i < v.size() && v[i] == '+') {
+        ++i;
+        if (!consume_ident()) return false;
+    }
+    return i == v.size();
 }
 
 /// True when `s` carries a control character (NUL, C0, DEL). A recognised
 /// `release` value with one is malformed and its line is ignored: NUL would
 /// truncate the wire row at the C-string boundary write_output crosses.
 [[nodiscard]] inline bool has_control_char(std::string_view s) noexcept {
-    for (const unsigned char c : s)
+    for (const char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
         if (c < 0x20 || c == 0x7f) return true;
+    }
     return false;
 }
 
@@ -137,19 +163,28 @@ namespace detail {
 
 // -- JVM `release` metadata file --------------------------------------------
 
+/// A recognised `release` value longer than this is dropped and flagged: every
+/// real value is a short token, and one 64 KiB value would otherwise be copied
+/// into the row of every home that carries it.
+inline constexpr std::size_t kMaxReleaseValueBytes = 256;
+
 /// The four keys of a JDK/JRE `release` file this plugin reads. Empty string =
 /// key absent. Every other key (MODULES, OS_ARCH, SOURCE, ...) is ignored.
+/// `oversized` is set when a recognised key's value exceeded
+/// kMaxReleaseValueBytes (the value itself is dropped, so the leg can record it).
 struct ReleaseFields {
     std::string java_version;
     std::string implementor;
     std::string java_runtime_version;
     std::string image_type;
+    bool oversized = false;
 };
 
 /// Parses the text of a `release` file (`KEY="value"` lines; the quotes are
 /// stripped; unquoted values are accepted; CRLF tolerated; unknown keys, lines
 /// without '=', lines with an unbalanced quote and values carrying a control
-/// character ignored). Never throws on malformed input: garbage yields a
+/// character ignored; a recognised value over kMaxReleaseValueBytes is dropped
+/// and sets `oversized`). Never throws on malformed input: garbage yields a
 /// ReleaseFields with empty members. The
 /// caller bounds the read size (64 KiB for a real `release` file).
 [[nodiscard]] inline ReleaseFields parse_release_file(std::string_view text) {
@@ -171,6 +206,12 @@ struct ReleaseFields {
             val = val.substr(1, val.size() - 2);
         }
         if (detail::has_control_char(val)) continue; // malformed value (NUL would truncate the row)
+        const bool recognised = key == "JAVA_VERSION" || key == "IMPLEMENTOR" ||
+                                key == "JAVA_RUNTIME_VERSION" || key == "IMAGE_TYPE";
+        if (recognised && val.size() > kMaxReleaseValueBytes) {
+            out.oversized = true;
+            continue;
+        }
         if (key == "JAVA_VERSION") out.java_version = std::string{val};
         else if (key == "IMPLEMENTOR") out.implementor = std::string{val};
         else if (key == "JAVA_RUNTIME_VERSION") out.java_runtime_version = std::string{val};
@@ -180,26 +221,13 @@ struct ReleaseFields {
 }
 
 /// IMAGE_TYPE "JDK"/"JRE" (case-insensitive) decides. Distributions that omit
-/// the key (Debian's OpenJDK `release` file has no IMAGE_TYPE) fall back to a
-/// `jre` path component (the JDK 8 `<home>/jre` layout); anything else is
+/// the key (Debian's OpenJDK `release` file has no IMAGE_TYPE) read
 /// `unmodelled` -- deliberately NOT guessed from the module list, which
-/// Debian's headless JRE package fills with jdk.* modules.
-[[nodiscard]] inline JvmFlavour jvm_flavour_from(std::string_view image_type,
-                                                 std::string_view path) noexcept {
+/// Debian's headless JRE package fills with jdk.* modules, nor from the path.
+[[nodiscard]] inline JvmFlavour jvm_flavour_from(std::string_view image_type) noexcept {
     const auto t = detail::trim(image_type);
     if (detail::ieq(t, "jdk")) return JvmFlavour::jdk;
     if (detail::ieq(t, "jre")) return JvmFlavour::jre;
-    if (t.empty()) {
-        std::size_t pos = 0;
-        while (pos <= path.size()) {
-            const auto sl = path.find('/', pos);
-            const auto seg = path.substr(
-                pos, sl == std::string_view::npos ? std::string_view::npos : sl - pos);
-            if (detail::ieq(seg, "jre")) return JvmFlavour::jre;
-            if (sl == std::string_view::npos) break;
-            pos = sl + 1;
-        }
-    }
     return JvmFlavour::unmodelled;
 }
 
@@ -237,8 +265,12 @@ struct DotnetEntry {
 // the separator; a formatter-emitted '\n' yields blank rows under
 // LocalDispatcher capture).
 
+/// Untrusted OS text becomes one safe field: invalid UTF-8 bytes are replaced first (the
+/// output crosses the wire as a proto3 `string`, and one invalid byte fails the parse of
+/// the whole chunk), then the pipe-grammar escaper runs.
 [[nodiscard]] inline std::string field_or_dash(std::string_view v) {
-    return v.empty() ? std::string{"-"} : yuzu::util::safe_output_field(v);
+    return v.empty() ? std::string{"-"}
+                     : yuzu::util::safe_output_field(yuzu::util::sanitize_utf8(std::string{v}));
 }
 
 /// <action>|<flavour>|<version>|<install_path>|<vendor or ->
@@ -296,7 +328,8 @@ struct StatusOutcome {
 }
 
 /// The full ordered output of one action: the status row first, then every
-/// data row. Zero data rows + `supported` is a genuinely absent family.
+/// data row. Zero data rows + `supported` means none found at the standard
+/// roots. The rows are copied once here; the walk's row budget bounds that copy.
 [[nodiscard]] inline std::vector<std::string> compose_output(
     std::string_view action, const std::vector<std::string>& data_rows,
     const yuzu::shared::ConstraintAccumulator& acc) {
@@ -320,8 +353,15 @@ struct StatusOutcome {
         !f.java_version.empty() ? std::string_view{f.java_version}
                                 : std::string_view{f.java_runtime_version};
     if (version.empty()) return std::nullopt;
-    return format_runtime_row("jvm", flavour_token(jvm_flavour_from(f.image_type, install_path)),
-                              version, install_path, f.implementor);
+    return format_runtime_row("jvm", flavour_token(jvm_flavour_from(f.image_type)), version,
+                              install_path, f.implementor);
+}
+
+/// jvm row for a home whose installer laid down no `release` file (distro OpenJDK 8): the
+/// home is real but its version and vendor are unknown, so both read `-`. The leg records
+/// `release_missing` next to it; such a home is never left out.
+[[nodiscard]] inline std::string jvm_row_release_missing(std::string_view install_path) {
+    return format_runtime_row("jvm", flavour_token(JvmFlavour::unmodelled), "", install_path, "");
 }
 
 /// dotnet row for one shared/<fw>/<ver> or sdk/<ver> directory pair.

@@ -19,7 +19,7 @@
  * symlink) are built inline and labelled SYNTHETIC.
  *
  * MUTATION NOTES: exact-row assertions fail if a *_rows_at stops reading its
- * root or drops the vendor/flavour/version wiring or the exact-row dedupe;
+ * root or drops the vendor/flavour/version wiring;
  * resetting the accumulator per root turns the "later root never hides an
  * earlier failure" case red; dropping O_NOFOLLOW on `release` surfaces the
  * planted target as a row; following symlinked entries duplicates rows; dropping
@@ -27,7 +27,13 @@
  * discarding the rows before emit_read in run_linux_at turns the clean
  * CommandContext case red; reporting OK/FULL regardless of the accumulator turns
  * the forced-constraint CommandContext case red; requiring an alias target to
- * OPEN turns the dangling-alias case red. The two chmod-000 cases SKIP at euid 0;
+ * OPEN turns the dangling-alias case red; each budget, the release-less-home probe, the extra
+ * jvm roots, the network-mount guard and the FIFO/fd cases carry their mutation in their own
+ * comment. Four mutants are OUTPUT-EQUIVALENT by design and survive: the sticky `exhausted` flag
+ * (rows and tokens are identical without it; it only stops further opens/listings once a budget is
+ * spent) and the two "guard before any syscall" orderings (skipping the guard's position changes
+ * which syscalls run, not the rows or tokens); the real NFS hang check covers those.
+ * The two chmod-000 cases SKIP at euid 0;
  * the constrained path stays covered there by the symlink, cap and oversize
  * cases and by the forced-constraint CommandContext case, none of which needs
  * permission bits.
@@ -43,6 +49,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -55,6 +62,7 @@
 
 #include <yuzu/plugin.h>
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -215,7 +223,7 @@ TEST_CASE("runtimes linux: errno maps separate absent from failure",
     CHECK(lnx::dir_open_errno_token(EACCES) == lnx::kTokPermissionDenied);
     CHECK(lnx::dir_open_errno_token(ELOOP) == lnx::kTokSymlinkRefused);
     CHECK(lnx::dir_open_errno_token(ENOTDIR) == lnx::kTokNotADirectory);
-    CHECK(lnx::dir_open_errno_token(EIO) == lnx::kTokDirOpenFailed);
+    CHECK(lnx::dir_open_errno_token(EIO) == lnx::kTokOpenFailed);
     CHECK(lnx::stat_errno_token(EACCES) == lnx::kTokPermissionDenied);
     CHECK(lnx::stat_errno_token(EIO) == lnx::kTokStatFailed);
     CHECK(lnx::file_open_errno_token(EACCES) == lnx::kTokPermissionDenied);
@@ -227,11 +235,41 @@ TEST_CASE("runtimes linux: every failure token matches the leg-token grammar",
           "[runtimes][linux][parsers]") {
     for (const auto tok :
          {lnx::kTokPermissionDenied, lnx::kTokSymlinkRefused, lnx::kTokNotADirectory,
-          lnx::kTokDirOpenFailed, lnx::kTokStatFailed, lnx::kTokReadFailed, lnx::kTokTruncated,
-          lnx::kTokNotARegularFile, lnx::kTokReleaseOversize, lnx::kTokReleaseUnparsable}) {
+          lnx::kTokOpenFailed, lnx::kTokStatFailed, lnx::kTokReadFailed, lnx::kTokRowCap,
+          lnx::kTokNotRegular, lnx::kTokOversized, lnx::kTokFieldOversized,
+          lnx::kTokReleaseUnparsable, lnx::kTokReleaseMissing, lnx::kTokNetworkFsSkipped,
+          lnx::kTokMountinfoUnreadable}) {
         INFO("token: " << tok);
         CHECK(token_matches_leg_grammar(tok));
     }
+}
+
+TEST_CASE("runtimes linux: the failure token spellings and the bounds are a contract",
+          "[runtimes][linux][parsers]") {
+    // Consumers key on these strings (README, plugin JSON); a rename must be deliberate. The shared
+    // cause names (oversized, not_regular, row_cap, open_failed) match the sibling plugins.
+    CHECK(lnx::kTokPermissionDenied == "linux:runtimes:permission_denied");
+    CHECK(lnx::kTokSymlinkRefused == "linux:runtimes:symlink_refused");
+    CHECK(lnx::kTokNotADirectory == "linux:runtimes:not_a_directory");
+    CHECK(lnx::kTokOpenFailed == "linux:runtimes:open_failed");
+    CHECK(lnx::kTokStatFailed == "linux:runtimes:stat_failed");
+    CHECK(lnx::kTokReadFailed == "linux:runtimes:read_failed");
+    CHECK(lnx::kTokRowCap == "linux:runtimes:row_cap");
+    CHECK(lnx::kTokNotRegular == "linux:runtimes:not_regular");
+    CHECK(lnx::kTokOversized == "linux:runtimes:oversized");
+    CHECK(lnx::kTokFieldOversized == "linux:runtimes:field_oversized");
+    CHECK(lnx::kTokReleaseUnparsable == "linux:runtimes:release_unparsable");
+    CHECK(lnx::kTokReleaseMissing == "linux:runtimes:release_missing");
+    CHECK(lnx::kTokNetworkFsSkipped == "linux:runtimes:network_fs_skipped");
+    CHECK(lnx::kTokMountinfoUnreadable == "linux:runtimes:mountinfo_unreadable");
+    // The production bounds, pinned by literal (a test that derived them from the constants would
+    // follow a mutation of the constants).
+    static_assert(lnx::kMaxDirEntries == 16384);
+    static_assert(lnx::kMaxReleaseBytes == 65536);
+    static_assert(lnx::kMaxRows == 4096);
+    static_assert(lnx::kMaxRowBytes == 1048576);
+    static_assert(lnx::kMaxEntriesVisited == 65536);
+    static_assert(lnx::kMaxMountinfoBytes == 4194304);
 }
 
 TEST_CASE("runtimes linux: join_logical avoids a doubled slash",
@@ -256,8 +294,9 @@ fs::path fixture_dir() {
 
 /// Materializes tree.manifest under `root`. Returns false with `error` set on any
 /// failure so the caller can REQUIRE with a useful message.
-bool materialize_manifest(const fs::path& root, std::string& error) {
-    const auto manifest_file = fixture_dir() / "tree.manifest";
+bool materialize_manifest(const fs::path& root, std::string& error,
+                          const char* manifest_name = "tree.manifest") {
+    const auto manifest_file = fixture_dir() / manifest_name;
     std::ifstream in(manifest_file, std::ios::binary);
     if (!in) {
         error = "could not open " + manifest_file.string();
@@ -330,6 +369,12 @@ bool running_privileged() { return ::geteuid() == 0; }
 
 using Acc = yuzu::shared::ConstraintAccumulator;
 
+lnx::WalkConfig dir_cap(std::size_t n) {
+    lnx::WalkConfig c;
+    c.limits.dir_entries = n;
+    return c;
+}
+
 const char* kTemurinRow = "jvm|jdk|17.0.20|/opt/java/openjdk|Eclipse Adoptium";
 const char* kDebianRow = "jvm|unmodelled|17.0.20.1|/usr/lib/jvm/java-17-openjdk-arm64|Debian";
 const char* kDotnetRow =
@@ -351,13 +396,15 @@ struct LegRun {
 };
 
 const fs::path* g_leg_root = nullptr;
+const lnx::WalkConfig* g_leg_cfg = nullptr;
 
 int leg_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*params*/,
                 std::size_t /*param_count*/) {
     yuzu::CommandContext ctx{raw};
     const auto a = rt::parse_action(action);
     if (!a) return 1;
-    return lnx::run_linux_at(ctx, *a, *g_leg_root);
+    return g_leg_cfg ? lnx::run_linux_at(ctx, *a, *g_leg_root, *g_leg_cfg)
+                     : lnx::run_linux_at(ctx, *a, *g_leg_root);
 }
 
 LegRun run_leg(rt::Action action, const fs::path& root) {
@@ -672,12 +719,12 @@ TEST_CASE("runtimes linux: a symlinked jvm root with no alternative is refused (
     CHECK(jvm_acc.reason() == std::string{lnx::kTokSymlinkRefused});
 }
 
-TEST_CASE("runtimes linux: the per-directory cap bounds the rows and becomes `truncated` "
+TEST_CASE("runtimes linux: the per-directory cap bounds the rows and becomes `row_cap` "
           "(SYNTHETIC)",
           "[runtimes][linux][walk][cap]") {
     // The cap is a parameter (production: kMaxDirEntries = 16384) so this needs 5 directories,
-    // not 16k. Mutations: dropping the `max_entries` argument in a walk enumerates all 5 rows;
-    // dropping the `res.truncated` record leaves the accumulator clean.
+    // not 16k. Mutations: dropping the cap argument in a walk enumerates all 5 rows; dropping
+    // the `res.truncated` record leaves the accumulator clean.
     constexpr std::size_t kCap = 3;
     yuzu::test::TempDir dir{"yuzu_test_runtimes_cap_"};
     for (const char* v : {"8.0.100", "8.0.101", "8.0.102", "8.0.103", "8.0.104"})
@@ -688,42 +735,53 @@ TEST_CASE("runtimes linux: the per-directory cap bounds the rows and becomes `tr
     const auto check_truncated = [](const std::vector<std::string>& rows, const Acc& acc) {
         CHECK(rows.size() == kCap); // bounded, not all 5
         REQUIRE(acc.any_failure());
-        CHECK(acc.reason() == std::string{lnx::kTokTruncated});
+        CHECK(acc.reason() == std::string{lnx::kTokRowCap});
     };
     {
         Acc acc;
-        check_truncated(lnx::dotnet_rows_at(dir.path, acc, kCap), acc);
+        check_truncated(lnx::dotnet_rows_at(dir.path, acc, dir_cap(kCap)), acc);
     }
     {
         Acc acc;
-        check_truncated(lnx::jvm_rows_at(dir.path, acc, kCap), acc);
+        check_truncated(lnx::jvm_rows_at(dir.path, acc, dir_cap(kCap)), acc);
     }
     // Boundary: a directory holding exactly `cap` entries is complete, not truncated.
     {
         Acc acc;
-        CHECK(lnx::dotnet_rows_at(dir.path, acc, 5).size() == 5);
+        CHECK(lnx::dotnet_rows_at(dir.path, acc, dir_cap(5)).size() == 5);
         CHECK_FALSE(acc.any_failure());
     }
     // The truncated output is constrained, never a bare full-looking inventory.
     {
         Acc acc;
-        const auto rows = lnx::dotnet_rows_at(dir.path, acc, kCap);
+        const auto rows = lnx::dotnet_rows_at(dir.path, acc, dir_cap(kCap));
         const auto out = rt::compose_output("dotnet", rows, acc);
         REQUIRE(out.size() == kCap + 1);
-        CHECK(out[0] == "status|dotnet|constrained|linux:runtimes:truncated");
+        CHECK(out[0] == "status|dotnet|constrained|linux:runtimes:row_cap");
     }
 }
 
-TEST_CASE("runtimes linux: an oversized release file is constrained, never a row (SYNTHETIC)",
+TEST_CASE("runtimes linux: a release over 64 KiB is constrained, exactly 64 KiB is read (SYNTHETIC)",
           "[runtimes][linux][walk]") {
-    yuzu::test::TempDir dir{"yuzu_test_runtimes_oversize_"};
-    write_text(dir.path / "opt/java/big/release",
-               "JAVA_VERSION=\"17.0.1\"\nPAD=\"" + std::string(lnx::kMaxReleaseBytes, 'A') + "\"\n");
-    Acc acc;
-    const auto rows = lnx::jvm_rows_at(dir.path, acc);
-    CHECK(rows.empty());
-    REQUIRE(acc.any_failure());
-    CHECK(acc.reason() == std::string{lnx::kTokReleaseOversize});
+    // The edge is pinned by LITERAL size (65536 ok, 65537 refused) so a mutated kMaxReleaseBytes
+    // cannot follow the test. A comment line pads: it is not a `KEY=value` line, so it is ignored.
+    const auto release_of_size = [](std::size_t total) {
+        std::string body = "JAVA_VERSION=\"17.0.1\"\n#";
+        body += std::string(total - body.size() - 1, 'A');
+        body += '\n';
+        return body;
+    };
+    for (const auto& [size, expect_row] :
+         {std::pair{std::size_t{65536}, true}, std::pair{std::size_t{65537}, false}}) {
+        INFO("release bytes: " << size);
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_oversize_"};
+        write_text(dir.path / "opt/java/big/release", release_of_size(size));
+        Acc acc;
+        const auto rows = lnx::jvm_rows_at(dir.path, acc);
+        CHECK(rows.size() == (expect_row ? 1u : 0u));
+        CHECK(acc.any_failure() == !expect_row);
+        if (!expect_row) CHECK(acc.reason() == std::string{lnx::kTokOversized});
+    }
 }
 
 TEST_CASE("runtimes linux: a version-less release is constrained; a home without one is silent "
@@ -858,6 +916,344 @@ TEST_CASE("runtimes linux: run_linux_at reports a forced constraint through BOTH
     CHECK(dn.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(dn.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(dn.provenance == std::string{lnx::kTokSymlinkRefused});
+}
+
+// == budgets, release-less homes, extra roots, network guard, hostile inputs =================
+
+namespace {
+
+lnx::WalkConfig limits_cfg(const lnx::WalkLimits& l) {
+    lnx::WalkConfig c;
+    c.limits = l;
+    return c;
+}
+
+std::string release_with(std::string_view version) {
+    return "JAVA_VERSION=\"" + std::string{version} + "\"\n";
+}
+
+std::string read_text_fixture(const char* name) {
+    std::ifstream in(fixture_dir() / name, std::ios::binary);
+    REQUIRE(in.good());
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+int open_fd_count() {
+    int n = 0;
+    for (int fd = 0; fd < 1024; ++fd)
+        if (::fcntl(fd, F_GETFD) != -1) ++n;
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("runtimes linux: the row and row-byte budgets bound the rows and report row_cap (SYNTHETIC)",
+          "[runtimes][linux][walk][cap]") {
+    // Six homes, one row each. MUTATION: dropping push_row's row or byte check returns all six.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_rowcap_"};
+    for (const char* h : {"a", "b", "c", "d", "e", "f"})
+        write_text(dir.path / "usr/lib/jvm" / h / "release", release_with("17.0.1"));
+    const std::size_t row_len = std::string{"jvm|unmodelled|17.0.1|/usr/lib/jvm/a|-"}.size();
+    struct Case { std::size_t rows, bytes, expect; bool capped; };
+    for (const Case& c : {Case{3, 1 << 20, 3, true}, Case{6, 1 << 20, 6, false},   // rows: n+? and exactly n
+                          Case{99, 2 * row_len, 2, true}, Case{99, 2 * row_len - 1, 1, true},
+                          Case{99, 6 * row_len, 6, false}}) {                        // bytes: edge both sides
+        INFO("rows=" << c.rows << " bytes=" << c.bytes);
+        lnx::WalkLimits l;
+        l.rows = c.rows;
+        l.row_bytes = c.bytes;
+        Acc acc;
+        CHECK(lnx::jvm_rows_at(dir.path, acc, limits_cfg(l)).size() == c.expect);
+        CHECK(acc.any_failure() == c.capped);
+        if (c.capped) CHECK(acc.reason() == std::string{lnx::kTokRowCap});
+    }
+}
+
+TEST_CASE("runtimes linux: the entries-visited budget spans nesting levels and roots (SYNTHETIC)",
+          "[runtimes][linux][walk][cap]") {
+    // usr/share/dotnet: 2 frameworks x 3 versions = 2 + 3 + 3 = 8 entries visited; usr/lib/dotnet
+    // (the second root) holds one sdk. MUTATION: charging nothing to the budget walks both roots
+    // in full whatever the limit.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_entries_"};
+    for (const char* fw : {"Microsoft.AspNetCore.App", "Microsoft.NETCore.App"})
+        for (const char* v : {"8.0.1", "8.0.2", "8.0.3"})
+            make_dir(dir.path / "usr/share/dotnet/shared" / fw / v);
+    make_dir(dir.path / "usr/lib/dotnet/sdk/9.0.100");
+    struct Case { std::size_t entries, expect; bool capped; };
+    for (const Case& c : {Case{100, 7, false}, Case{8, 6, true}, Case{5, 3, true}}) {
+        INFO("entries_visited=" << c.entries);
+        lnx::WalkLimits l;
+        l.entries_visited = c.entries;
+        Acc acc;
+        CHECK(lnx::dotnet_rows_at(dir.path, acc, limits_cfg(l)).size() == c.expect);
+        CHECK(acc.any_failure() == c.capped);
+        if (c.capped) CHECK(acc.reason() == std::string{lnx::kTokRowCap});
+    }
+}
+
+TEST_CASE("runtimes linux: the per-directory cap applies at every listing site (SYNTHETIC)",
+          "[runtimes][linux][walk][cap]") {
+    // dotnet shared/ (frameworks), shared/<fw>/ (versions), sdk/, and the jvm root (homes): each
+    // tree has ONE directory of 3 entries against a cap of 2; the control has none over the cap.
+    const auto build = [](const fs::path& r, int site) {
+        const auto dn = r / "usr/share/dotnet";
+        if (site == 0) for (const char* f : {"F1", "F2", "F3"}) make_dir(dn / "shared" / f / "8.0.1");
+        if (site == 1) for (const char* v : {"8.0.1", "8.0.2", "8.0.3"}) make_dir(dn / "shared/F1" / v);
+        if (site == 2) for (const char* v : {"8.0.100", "8.0.101", "8.0.102"}) make_dir(dn / "sdk" / v);
+        if (site == 3) for (const char* h : {"a", "b", "c"}) write_text(r / "usr/lib/jvm" / h / "release", release_with("17"));
+        if (site == 4) { make_dir(dn / "shared/F1/8.0.1"); make_dir(dn / "shared/F2/8.0.1"); }
+    };
+    for (int site = 0; site <= 4; ++site) {
+        INFO("site: " << site << (site == 4 ? " (control)" : ""));
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_sites_"};
+        build(dir.path, site);
+        Acc acc;
+        (void)lnx::dotnet_rows_at(dir.path, acc, dir_cap(2));
+        (void)lnx::jvm_rows_at(dir.path, acc, dir_cap(2));
+        CHECK(acc.any_failure() == (site != 4));
+        if (site != 4) CHECK(acc.reason() == std::string{lnx::kTokRowCap});
+    }
+}
+
+TEST_CASE("runtimes linux: an oversized release VALUE is field_oversized and the row survives (SYNTHETIC)",
+          "[runtimes][linux][walk]") {
+    // A JAVA_VERSION of 257 bytes is dropped (no version -> release_unparsable too); an oversized
+    // IMPLEMENTOR is dropped but the version still yields a row.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_value_"};
+    write_text(dir.path / "usr/lib/jvm/vendor/release",
+               "JAVA_VERSION=\"17.0.1\"\nIMPLEMENTOR=\"" + std::string(257, 'v') + "\"\n");
+    write_text(dir.path / "usr/lib/jvm/version/release",
+               "JAVA_VERSION=\"" + std::string(257, '1') + "\"\nIMPLEMENTOR=\"x\"\n");
+    Acc acc;
+    const auto rows = lnx::jvm_rows_at(dir.path, acc);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "jvm|unmodelled|17.0.1|/usr/lib/jvm/vendor|-");
+    CHECK(acc.reason() == std::string{lnx::kTokFieldOversized} + "," + std::string{lnx::kTokReleaseUnparsable});
+}
+
+TEST_CASE("runtimes linux: a distro OpenJDK 8 home has no release file and is still a row (REAL CAPTURE)",
+          "[runtimes][linux][walk][jdk8]") {
+    // Ubuntu, Rocky and Alpine OpenJDK 8 packages ship NO `release` file (jdk_layouts.manifest).
+    // MUTATION: dropping the java-binary probe leaves zero rows and `supported`; probing only
+    // bin/java fails Rocky (jre/bin/java only). The bin/java-only branch has no real capture, so the
+    // last case is SYNTHETIC.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_jdk8_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err, "jdk_layouts.manifest"));
+    struct Layout { const char* root; const char* row; };
+    for (const Layout& l :
+         {Layout{"ubuntu2204-openjdk8", "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-arm64|-"},
+          Layout{"rocky9-openjdk8", "jvm|unmodelled|-|/usr/lib/jvm/java-1.8.0-openjdk-1.8.0.504.b01-1.2.el9_8.aarch64|-"},
+          Layout{"alpine320-openjdk8", "jvm|unmodelled|-|/usr/lib/jvm/java-1.8-openjdk|-"}}) {
+        INFO("layout: " << l.root);
+        Acc acc;
+        const auto rows = lnx::jvm_rows_at(dir.path / "roots" / l.root, acc); // aliases and .jinfo: no rows
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == l.row);
+        CHECK(acc.reason() == std::string{lnx::kTokReleaseMissing});
+        CHECK(rt::compose_output("jvm", rows, acc)[0] == "status|jvm|constrained|linux:runtimes:release_missing");
+    }
+    yuzu::test::TempDir syn{"yuzu_test_runtimes_jdk8_syn_"};
+    write_text(syn.path / "opt/java/only-bin/bin/java", "");
+    make_dir(syn.path / "opt/java/no-java/bin"); // a bin/ without java: not a JVM home
+    Acc acc;
+    const auto rows = lnx::jvm_rows_at(syn.path, acc);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "jvm|unmodelled|-|/opt/java/only-bin|-");
+}
+
+TEST_CASE("runtimes linux: openSUSE keeps JVMs under /usr/lib64/jvm (REAL CAPTURE layout)",
+          "[runtimes][linux][walk][roots]") {
+    // SUSE has no /usr/lib/jvm; the verbatim release file is the manifest payload. MUTATION:
+    // dropping usr/lib64/jvm from kJvmRoots yields zero rows and `supported` on a host with Java.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_suse_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err, "jdk_layouts.manifest"));
+    Acc acc;
+    const auto rows = lnx::jvm_rows_at(dir.path / "roots/opensuse156-openjdk17", acc);
+    CHECK_FALSE(acc.any_failure());
+    REQUIRE(rows.size() == 1); // the four jre* alias symlinks are no rows
+    CHECK(rows[0] == "jvm|unmodelled|17.0.18|/usr/lib64/jvm/java-17-openjdk-17|N/A");
+}
+
+TEST_CASE("runtimes linux: /opt -> var/opt (rpm-ostree) is a covered alias, not a refusal (SYNTHETIC)",
+          "[runtimes][linux][walk][roots]") {
+    // Fedora CoreOS/Silverblue/RHCOS/RHEL Edge link /opt to var/opt. MUTATION: dropping var/opt/java
+    // from kJvmRoots reports symlink_refused on EVERY jvm dispatch of such a host, Java or not.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_ostree_"};
+    make_dir(dir.path / "var/opt");
+    std::error_code ec;
+    fs::create_symlink("var/opt", dir.path / "opt", ec);
+    REQUIRE_FALSE(ec);
+    {
+        Acc acc;
+        CHECK(lnx::jvm_rows_at(dir.path, acc).empty());
+        CHECK_FALSE(acc.any_failure()); // no Java installed: silent, not constrained
+    }
+    write_text(dir.path / "var/opt/java/temurin-17/release",
+               "JAVA_VERSION=\"17.0.20\"\nIMPLEMENTOR=\"Eclipse Adoptium\"\nIMAGE_TYPE=\"JDK\"\n");
+    Acc acc;
+    const auto rows = lnx::jvm_rows_at(dir.path, acc);
+    CHECK_FALSE(acc.any_failure());
+    REQUIRE(rows.size() == 1); // once, through its own candidate
+    CHECK(rows[0] == "jvm|jdk|17.0.20|/var/opt/java/temurin-17|Eclipse Adoptium");
+}
+
+TEST_CASE("runtimes linux: mountinfo parsing reports the network mounts and nothing local",
+          "[runtimes][linux][mounts]") {
+    // The real capture (an overlay root, proc/sysfs/tmpfs/devpts/cgroup2/ext4 bind mounts and one
+    // nfs4 mount): exactly the nfs4 mount point comes back.
+    CHECK(lnx::network_mount_points(read_text_fixture("mountinfo_docker_nfs4.txt")) ==
+          std::vector<std::string>{"/mnt/nfs"});
+    // SYNTHETIC lines modelled on the real ones: octal escapes decode, optional fields before the
+    // separator are skipped, fuse.overlayfs is local, a malformed line names nothing.
+    const std::string text =
+        "10 1 0:5 / /srv/a\\040b rw shared:1 master:2 - cifs //srv/share rw\n"
+        "11 1 0:6 / /mnt/s rw - fuse.sshfs u@h:/ rw\n"
+        "12 1 0:7 / /mnt/local rw - fuse.overlayfs overlay rw\n"
+        "13 1 0:8 / /mnt/tmp rw - tmpfs nfs:/looks-remote rw\n"
+        "no separator here\n"
+        "14 1 0:9 /only - nfs4 h:/x rw\n"
+        "15 1 0:10 / /mnt/n rw - nfs4 h:/x rw\n";
+    CHECK(lnx::network_mount_points(text) ==
+          std::vector<std::string>{"/srv/a b", "/mnt/s", "/mnt/n"});
+    CHECK(lnx::network_mount_points("").empty());
+    CHECK(lnx::unescape_mountinfo("a\\040b\\011c\\134d\\12") == "a b\tc\\d\\12"); // short escape kept verbatim
+}
+
+TEST_CASE("runtimes linux: a path touches a network mount when on, under or containing it",
+          "[runtimes][linux][mounts]") {
+    const std::vector<std::string> mounts{"/opt/java"};
+    CHECK(lnx::touches_network_mount("/opt/java", mounts));
+    CHECK(lnx::touches_network_mount("/opt/java/jdk-17", mounts)); // under
+    CHECK(lnx::touches_network_mount("/opt", mounts));             // contains
+    CHECK_FALSE(lnx::touches_network_mount("/opt/javax", mounts)); // segment boundary
+    CHECK_FALSE(lnx::touches_network_mount("/usr/lib/jvm", mounts));
+    CHECK(lnx::touches_network_mount("/usr/lib/jvm", std::vector<std::string>{"/"})); // NFS root
+    CHECK_FALSE(lnx::touches_network_mount("/usr/lib/jvm", std::vector<std::string>{}));
+}
+
+TEST_CASE("runtimes linux: a candidate on a network mount is skipped before any syscall touches it "
+          "(SYNTHETIC)",
+          "[runtimes][linux][walk][mounts]") {
+    // opt/java is a regular FILE here: had the walk opened it, `not_a_directory` would join the
+    // token. Only network_fs_skipped is allowed, and the other roots are still read.
+    // MUTATION: moving the guard after walk_path (or dropping it) adds not_a_directory / hangs.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_guard_"};
+    write_text(dir.path / "opt/java", "a file where a mount would be");
+    write_text(dir.path / "usr/lib/jvm/deb/release", release_with("17.0.20.1"));
+    lnx::WalkConfig cfg;
+    cfg.network_mounts = {"/opt/java"};
+    Acc acc;
+    const auto rows = lnx::jvm_rows_at(dir.path, acc, cfg);
+    REQUIRE(rows.size() == 1);
+    CHECK(acc.reason() == std::string{lnx::kTokNetworkFsSkipped});
+    // An ancestor mount (/usr/lib) and a mount below the candidate both skip it.
+    yuzu::test::TempDir only{"yuzu_test_runtimes_guard2_"};
+    write_text(only.path / "usr/lib/jvm/deb/release", release_with("17.0.20.1"));
+    for (const char* mount : {"/usr/lib", "/usr/lib/jvm/deb"}) {
+        INFO("mount: " << mount);
+        cfg.network_mounts = {mount};
+        Acc a2;
+        CHECK(lnx::jvm_rows_at(only.path, a2, cfg).empty());
+        CHECK(a2.reason() == std::string{lnx::kTokNetworkFsSkipped});
+    }
+    // An alias whose target is a network-mounted candidate is not opened either: the target
+    // records the skip, the alias adds nothing (no symlink_refused).
+    yuzu::test::TempDir al{"yuzu_test_runtimes_guard_alias_"};
+    make_dir(al.path / "usr/lib/dotnet/sdk/8.0.100");
+    make_dir(al.path / "usr/share");
+    std::error_code ec;
+    fs::create_symlink("../lib/dotnet", al.path / "usr/share/dotnet", ec);
+    REQUIRE_FALSE(ec);
+    cfg.network_mounts = {"/usr/lib/dotnet"};
+    Acc a3;
+    CHECK(lnx::dotnet_rows_at(al.path, a3, cfg).empty());
+    CHECK(a3.reason() == std::string{lnx::kTokNetworkFsSkipped});
+}
+
+TEST_CASE("runtimes linux: the mount table is scanned, an unreadable one is reported and the tree still read",
+          "[runtimes][linux][walk][mounts]") {
+    const auto scan = lnx::walk::scan_mounts((fixture_dir() / "mountinfo_docker_nfs4.txt").c_str());
+    CHECK(scan.ok);
+    CHECK(scan.network_mounts == std::vector<std::string>{"/mnt/nfs"});
+    CHECK_FALSE(lnx::walk::scan_mounts((fixture_dir() / "no_such_mountinfo").c_str()).ok);
+    CHECK_FALSE(lnx::walk::scan_mounts(fixture_dir().c_str()).ok); // a directory is not a mount table
+
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_mi_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err));
+    lnx::WalkConfig cfg;
+    cfg.mountinfo_unreadable = true;
+    g_leg_cfg = &cfg;
+    const auto run = run_leg(rt::Action::jvm, dir.path);
+    g_leg_cfg = nullptr;
+    CHECK(run.rows == std::vector<std::string>{
+              "status|jvm|constrained|linux:runtimes:mountinfo_unreadable", kDebianRow, kTemurinRow});
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+}
+
+TEST_CASE("runtimes linux: a FIFO or directory named release is refused without blocking (SYNTHETIC)",
+          "[runtimes][linux][walk]") {
+    // MUTATION: dropping O_NONBLOCK from the release open makes the FIFO case hang forever; dropping
+    // the S_ISREG check reads the directory (EISDIR -> read_failed) instead of not_regular.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_fifo_"};
+    make_dir(dir.path / "usr/lib/jvm/fifo");
+    REQUIRE(::mkfifo((dir.path / "usr/lib/jvm/fifo/release").c_str(), 0644) == 0);
+    make_dir(dir.path / "usr/lib/jvm/dir/release");
+    Acc acc;
+    CHECK(lnx::jvm_rows_at(dir.path, acc).empty());
+    CHECK(acc.reason() == std::string{lnx::kTokNotRegular});
+}
+
+TEST_CASE("runtimes linux: a plain file where a directory is expected is constrained, not absent "
+          "(SYNTHETIC)",
+          "[runtimes][linux][walk]") {
+    yuzu::test::TempDir jvm{"yuzu_test_runtimes_notdir_jvm_"};
+    write_text(jvm.path / "usr/lib/jvm", "a file, not a directory");
+    Acc a1;
+    CHECK(lnx::jvm_rows_at(jvm.path, a1).empty());
+    CHECK(a1.reason() == std::string{lnx::kTokNotADirectory});
+
+    yuzu::test::TempDir dn{"yuzu_test_runtimes_notdir_dn_"};
+    write_text(dn.path / "usr/lib/dotnet/shared", "a file, not a directory");
+    make_dir(dn.path / "usr/lib/dotnet/sdk/8.0.100");
+    Acc a2;
+    const auto rows = lnx::dotnet_rows_at(dn.path, a2);
+    CHECK(rows == std::vector<std::string>{"dotnet|sdk|8.0.100|/usr/lib/dotnet/sdk/8.0.100|-"});
+    CHECK(a2.reason() == std::string{lnx::kTokNotADirectory});
+}
+
+TEST_CASE("runtimes linux: every descriptor a walk opens is closed on success and failure paths",
+          "[runtimes][linux][walk]") {
+    // MUTATION: dropping closedir (DirHandle) or the release ScopedFd leaves descriptors open, so
+    // the count after the walks exceeds the count before them.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_fds_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err));
+    REQUIRE(materialize_manifest(dir.path, err, "jdk_layouts.manifest"));
+    make_dir(dir.path / "usr/lib/jvm/fifo");
+    REQUIRE(::mkfifo((dir.path / "usr/lib/jvm/fifo/release").c_str(), 0644) == 0);
+    write_text(dir.path / "opt/java/big/release", std::string(70000, 'x')); // oversize refusal
+    const int before = open_fd_count();
+    for (int i = 0; i < 3; ++i) {
+        for (const auto a : {rt::Action::jvm, rt::Action::dotnet}) {
+            Acc acc;
+            (void)lnx::action_rows_at(a, dir.path, acc);
+            Acc capped;
+            (void)lnx::action_rows_at(a, dir.path, capped, dir_cap(1)); // the row_cap path
+        }
+        Acc acc;
+        (void)lnx::jvm_rows_at(dir.path / "roots/rocky9-openjdk8", acc); // the java-binary probe
+    }
+    CHECK(open_fd_count() == before);
+}
+
+TEST_CASE("runtimes linux: an action with no walk arm is a visible failure, never supported + 0 rows",
+          "[runtimes][linux][walk]") {
+    Acc acc;
+    CHECK(lnx::action_rows_at(static_cast<rt::Action>(99), "/nonexistent", acc).empty());
+    CHECK(acc.reason() == "internal_error");
 }
 
 #endif // !defined(_WIN32)
