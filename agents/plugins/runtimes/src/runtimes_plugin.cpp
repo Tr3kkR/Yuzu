@@ -1,7 +1,7 @@
 /**
  * runtimes_plugin.cpp -- installed language-runtime inventory for Yuzu:
  * .NET and JVM. A software-inventory fact read from the runtime's own install
- * tree, so it also sees runtimes no package manager owns; installed_apps
+ * tree, so under its roots it also sees runtimes no package manager owns; installed_apps
  * lists the packaged-application view.
  *
  * Actions:

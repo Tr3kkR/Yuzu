@@ -11,8 +11,8 @@
 //
 // This is a DENY-list by name and is inherently incomplete -- the durable fix is a known-local
 // allowlist, which needs its own review. It covers the network, cluster and paravirtualised types
-// whose backing store is remote: nfs*, cifs, smb3, smbfs, afs, ceph, glusterfs, 9p, virtiofs,
-// lustre, beegfs, gfs2, ocfs2, gpfs, panfs, vboxsf, prl_fs, autofs (a direct-map trigger point
+// whose backing store is remote: nfs, nfs3, nfs4, cifs, smb3, smbfs, afs, ceph, glusterfs, 9p,
+// virtiofs, lustre, beegfs, gfs2, ocfs2, gpfs, panfs, vboxsf, vmhgfs, prl_fs, autofs (a direct-map trigger point
 // blocks on traversal), and the "fuse.<suffix>" types that are network-backed. It does NOT see a
 // STACKED filesystem (an overlay/ecryptfs/loop over a dead network mount reports its own local
 // type): that needs a bounded-call seam in agent core, not a longer list. TAR's
@@ -30,7 +30,7 @@ namespace yuzu::shared {
     constexpr std::string_view kExact[] = {"nfs",   "nfs3",      "nfs4",   "cifs",   "smb3",
                                            "smbfs", "afs",       "ceph",   "glusterfs", "9p",
                                            "virtiofs", "lustre", "beegfs", "gfs2",   "ocfs2",
-                                           "gpfs",  "panfs",     "vboxsf", "prl_fs", "autofs"};
+                                           "gpfs",  "panfs",     "vboxsf", "vmhgfs", "prl_fs", "autofs"};
     for (const auto s : kExact) {
         if (fstype == s) return true;
     }
@@ -39,7 +39,7 @@ namespace yuzu::shared {
         const auto suffix = fstype.substr(kFusePrefix.size());
         constexpr std::string_view kFuseSuffixes[] = {"sshfs",  "s3fs",      "davfs", "rclone",
                                                       "cephfs", "glusterfs", "nfs",   "smb",
-                                                      "ceph-fuse", "vmhgfs-fuse"};
+                                                      "ceph-fuse", "vmhgfs-fuse", "prl_fsd"};
         for (const auto s : kFuseSuffixes) {
             if (suffix == s) return true;
         }

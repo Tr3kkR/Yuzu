@@ -15,8 +15,8 @@
  *   jvm     usr/lib/jvm/<d>, opt/java/<d>, usr/lib64/jvm/<d> (openSUSE/SLES) and
  *           var/opt/java/<d> (rpm-ostree hosts, where /opt is a symlink to var/opt):
  *           <d>/release (parse_release_file). A home with no `release` file but a
- *           bin/java or jre/bin/java (Debian/Ubuntu and RHEL-family OpenJDK 8 packages
- *           ship none) is reported with an unknown version and `release_missing`.
+ *           bin/java or jre/bin/java (some distro OpenJDK 8 packages, e.g. Ubuntu and
+ *           Rocky, ship none) is reported with an unknown version and `release_missing`.
  *   NOT walked: any other location (an Oracle-RPM /usr/java, tarball installs under
  *   /usr/local or a home directory). "None found" covers the roots above only.
  *
@@ -58,8 +58,8 @@
  * on); kMaxReleaseBytes per `release` file and kMaxReleaseValueBytes per recognised
  * value (`oversized`, `field_oversized`); and, across ALL roots and nesting levels
  * of one action, WalkLimits (rows, row bytes, entries visited) -- the per-directory
- * cap alone multiplies with nesting. Exhausting a WalkLimit stops the walk with
- * `row_cap`.
+ * cap alone multiplies with nesting. Exhausting the row, row-byte or entries-visited
+ * budget stops the walk with `row_cap`.
  *
  * NETWORK MOUNTS ARE NOT WALKED. An open/getdents on a hard NFS/CIFS/FUSE mount
  * whose server is down blocks in the kernel with no deadline and pins one of the
@@ -134,8 +134,9 @@ inline constexpr std::size_t kMaxReleaseBytes = 64 * 1024;
 /// `/proc/self/mountinfo` is STREAMED, not slurped: procfs reports st_size 0 and a container host's
 /// table runs to tens of megabytes (16k mounts measured at 24.7 MB), so a whole-file cap fails the
 /// guard OPEN on exactly the busiest hosts and a larger one multiplies memory by the command pool.
-/// Bounds: kMountinfoChunk bytes per read, at most kMaxMountinfoLine bytes of one unfinished line
-/// carried between reads (a real line is a few KiB), and a runaway bound on the whole read.
+/// Bounds: kMountinfoChunk bytes per read; an unfinished line longer than kMaxMountinfoLine (a real
+/// line is a few KiB, an overlay with hundreds of layers reaches ~100 KiB) is dropped, not kept, and
+/// scanning resumes at its newline; and a runaway bound on the whole read.
 inline constexpr std::size_t kMountinfoChunk = 64 * 1024;
 inline constexpr std::size_t kMaxMountinfoLine = 64 * 1024;
 inline constexpr std::size_t kMaxMountinfoBytes = 256 * 1024 * 1024;
@@ -158,7 +159,7 @@ struct WalkLimits {
 
 /// Everything a walk needs besides the root: its bounds and the absolute mount points of the
 /// network filesystems to keep away from (empty: no guard, the unit-suite default).
-/// `mountinfo_unreadable` records that the guard could not be built (the walk still runs).
+/// `mountinfo_unreadable`: the mount table could not be read in full (the walk still runs, guarded by what was read).
 struct WalkConfig {
     WalkLimits limits{};
     std::vector<std::string> network_mounts{};
@@ -665,8 +666,8 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
 }
 
 /// True iff <home>/bin/java or <home>/jre/bin/java is a regular file or a symlink (never followed):
-/// the footprint of a JVM home whose installer wrote no `release` file (Debian/Ubuntu and
-/// RHEL-family OpenJDK 8; RHEL's has only jre/bin/java). Each hop is opened O_NOFOLLOW. A failed open of `bin`/`jre`
+/// the footprint of a JVM home whose installer wrote no `release` file (some distro OpenJDK 8
+/// packages; Rocky's has only jre/bin/java). Each hop is opened O_NOFOLLOW. A failed open of `bin`/`jre`
 /// or a failed stat of `java` (other than ENOENT) is recorded, never read as "no java"; a symlinked
 /// `bin`/`jre` is refused visibly (`symlink_refused`) when no binary was found through the other
 /// route; a directory or other special file named `java` is not a JVM.
@@ -696,9 +697,9 @@ inline bool home_has_java_binary(DIR* home, ConstraintAccumulator& acc) {
 
 /// The mount table at `path` (production: /proc/self/mountinfo) reduced to its network mount
 /// points, streamed line-wise (see kMountinfoChunk). `ok` is false when it cannot be read in full
-/// (absent, refused, not a regular file, an I/O error, a line over kMaxMountinfoLine, more than
-/// `max_total` bytes): the caller then records `mountinfo_unreadable`, and the walk runs guarded
-/// only by the mounts found before the failure.
+/// (absent, refused, not a regular file, an I/O error, more than `max_total` bytes, or a line too
+/// long to keep, which is skipped and the scan goes on): the caller then records
+/// `mountinfo_unreadable`, and the walk runs guarded only by the mounts read.
 struct MountScan {
     std::vector<std::string> network_mounts;
     bool ok = false;
@@ -717,6 +718,8 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
     std::string chunk(kMountinfoChunk, '\0');
     std::string pending; // the unfinished last line of what has been read so far
     std::size_t total = 0;
+    bool whole = true;     // false once a line was too long to keep
+    bool skipping = false; // inside such a line: drop bytes up to its newline
     for (;;) {
         const ssize_t n = ::read(fd, chunk.data(), chunk.size());
         if (n < 0) {
@@ -726,15 +729,26 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
         if (n == 0) break;
         total += static_cast<std::size_t>(n);
         if (total > max_total) return s;
-        pending.append(chunk.data(), static_cast<std::size_t>(n));
+        std::string_view in{chunk.data(), static_cast<std::size_t>(n)};
+        if (skipping) {
+            const auto nl = in.find('\n');
+            if (nl == std::string_view::npos) continue; // still inside the long line
+            in.remove_prefix(nl + 1);
+            skipping = false;
+        }
+        pending.append(in);
         if (const auto nl = pending.rfind('\n'); nl != std::string::npos) {
             take(std::string_view{pending}.substr(0, nl + 1));
             pending.erase(0, nl + 1);
         }
-        if (pending.size() > kMaxMountinfoLine) return s;
+        if (pending.size() > kMaxMountinfoLine) {
+            pending.clear();
+            skipping = true;
+            whole = false;
+        }
     }
-    take(pending);
-    s.ok = true;
+    if (!skipping) take(pending);
+    s.ok = whole;
     return s;
 }
 
@@ -791,7 +805,7 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
 
 /// jvm: <root>/{usr/lib/jvm,opt/java,usr/lib64/jvm,var/opt/java}/<d>/release. A directory with
 /// neither a `release` file nor a bin/java or jre/bin/java is not a JVM home (silent); one with a
-/// java binary but no `release` (e.g. Debian/Ubuntu OpenJDK 8) is a row with an unknown version plus
+/// java binary but no `release` (e.g. Ubuntu OpenJDK 8) is a row with an unknown version plus
 /// `release_missing`; an unreadable / oversized / version-less `release` is a recorded constraint.
 /// Symlinked homes are aliases.
 [[nodiscard]] inline std::vector<std::string> jvm_rows_at(

@@ -267,7 +267,8 @@ struct DotnetEntry {
 
 /// Untrusted OS text becomes one safe field: invalid UTF-8 bytes are replaced first (the
 /// output crosses the wire as a proto3 `string`, and one invalid byte fails the parse of
-/// the whole chunk), then the pipe-grammar escaper runs.
+/// the whole chunk; overlong, surrogate and out-of-range sequences still pass, #4864), then the
+/// pipe-grammar escaper runs.
 [[nodiscard]] inline std::string field_or_dash(std::string_view v) {
     return v.empty() ? std::string{"-"}
                      : yuzu::util::safe_output_field(yuzu::util::sanitize_utf8(std::string{v}));
@@ -357,9 +358,8 @@ struct StatusOutcome {
                               install_path, f.implementor);
 }
 
-/// jvm row for a home whose installer laid down no `release` file (Debian/Ubuntu and RHEL-family
-/// OpenJDK 8 packages): the
-/// home is real but its version and vendor are unknown, so both read `-`. The leg records
+/// jvm row for a home whose installer laid down no `release` file (some distro OpenJDK 8
+/// packages): the home is real but its version and vendor are unknown, so both read `-`. The leg records
 /// `release_missing` next to it; such a home is never left out.
 [[nodiscard]] inline std::string jvm_row_release_missing(std::string_view install_path) {
     return format_runtime_row("jvm", flavour_token(JvmFlavour::unmodelled), "", install_path, "");

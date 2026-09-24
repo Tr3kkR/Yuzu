@@ -301,13 +301,13 @@ TEST_CASE("filesystem_posture: is_network_fstype -- fixed network fstype set",
     // or misspelling one name silently re-exposes a hang-prone mount type.
     for (const char* t : {"nfs", "nfs3", "nfs4", "cifs", "smb3", "smbfs", "afs", "ceph", "glusterfs",
                           "9p", "virtiofs", "lustre", "beegfs", "gfs2", "ocfs2", "gpfs", "panfs",
-                          "vboxsf", "prl_fs", "autofs", "fuse.sshfs", "fuse.s3fs", "fuse.davfs",
+                          "vboxsf", "vmhgfs", "prl_fs", "autofs", "fuse.sshfs", "fuse.s3fs", "fuse.davfs",
                           "fuse.rclone", "fuse.cephfs", "fuse.glusterfs", "fuse.nfs", "fuse.smb",
-                          "fuse.ceph-fuse", "fuse.vmhgfs-fuse"}) {
+                          "fuse.ceph-fuse", "fuse.vmhgfs-fuse", "fuse.prl_fsd"}) {
         INFO("fstype: " << t);
         CHECK(is_network_fstype(t));
     }
-    // Real VM-native capture row -- a FUSE mount, but not in the network suffix set.
+    // Negatives; fuse.rosetta-mount is a real VM-native capture row (a FUSE mount, not a network one).
     for (const char* t : {"", "fuse.rosetta-mount", "ext4", "xfs", "tmpfs", "overlay", "nfsd", "fuse",
                           "fuse.", "fuse.overlayfs", "fuse.sshfsx", "cifsx", "NFS"}) {
         INFO("fstype: " << t);

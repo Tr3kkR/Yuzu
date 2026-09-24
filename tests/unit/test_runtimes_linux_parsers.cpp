@@ -29,10 +29,11 @@
  * the forced-constraint CommandContext case red; requiring an alias target to
  * OPEN turns the dangling-alias case red; each budget, the release-less-home probe, the extra
  * jvm roots, the network-mount guard, the mount-table stream and the FIFO/fd cases carry their
- * mutation in their own comment. Only the ENTRIES-budget `exhausted` flag is output-equivalent
- * (it changes which directories are opened, not the rows or tokens); the guard-before-any-syscall
- * orderings are pinned on Linux by watching IN_OPEN with inotify, and push_row's sticky flag by the
- * cross-root byte-budget case. The chmod cases SKIP at euid 0;
+ * mutation in their own comment. The guard-before-any-syscall orderings change which directories
+ * are OPENED, not the rows or tokens, so on Linux the "never opened" case watches IN_OPEN with
+ * inotify; the `exhausted` check inside dotnet_rows_at's per-framework loop is equivalent the same
+ * way and is not pinned. push_row's sticky flag is pinned by the cross-root byte-budget case.
+ * The chmod cases SKIP at euid 0;
  * the constrained path stays covered there by the symlink, cap and oversize
  * cases and by the forced-constraint CommandContext case, none of which needs
  * permission bits.
@@ -1147,7 +1148,8 @@ TEST_CASE("runtimes linux: a release-less home's java probe records what it cann
               REQUIRE(::mkfifo((j / "f/bin/java").c_str(), 0644) == 0);
           },
           {}, ""); // a directory or FIFO named java is no JVM
-    if (running_privileged()) return; // bin/ readable but not searchable: fstatat(java) is EACCES
+    // bin/ readable but not searchable: fstatat(java) is EACCES
+    if (running_privileged()) SKIP("euid 0: permission bits are bypassed, the unsearchable-bin case is not run");
     yuzu::test::TempDir dir{"yuzu_test_runtimes_binstat_"};
     write_text(dir.path / "opt/java/h/bin/java", "");
     REQUIRE(::chmod((dir.path / "opt/java/h/bin").c_str(), 0644) == 0);
@@ -1199,7 +1201,8 @@ TEST_CASE("runtimes linux: a candidate on a network mount is skipped and the oth
           "[runtimes][linux][walk][mounts]") {
     // opt/java is a regular FILE here: had the walk opened it, `not_a_directory` would join the
     // token. Only network_fs_skipped is allowed, and the other roots are still read.
-    // MUTATION: moving the guard after walk_path (or dropping it) adds not_a_directory / hangs.
+    // MUTATION: dropping the guard adds not_a_directory (the file is opened as a directory); moving it
+    // after walk_path is pinned by the inotify case below.
     yuzu::test::TempDir dir{"yuzu_test_runtimes_guard_"};
     write_text(dir.path / "opt/java", "a file where a mount would be");
     write_text(dir.path / "usr/lib/jvm/deb/release", release_with("17.0.20.1"));
@@ -1233,6 +1236,25 @@ TEST_CASE("runtimes linux: a candidate on a network mount is skipped and the oth
     CHECK(a3.reason() == std::string{lnx::kTokNetworkFsSkipped});
 }
 
+TEST_CASE("runtimes linux: run_linux_at hands the guard to both walks (SYNTHETIC)",
+          "[runtimes][linux][walk][mounts]") {
+    // MUTATION: dropping cfg in run_linux_at, or in an action_rows_at arm, leaves that action
+    // unguarded: the file at the mount point is opened and adds not_a_directory.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_wiring_"};
+    write_text(dir.path / "opt/java", "a file where a mount would be");
+    write_text(dir.path / "usr/lib/dotnet", "a file where a mount would be");
+    lnx::WalkConfig cfg;
+    cfg.network_mounts = {"/opt/java", "/usr/lib/dotnet"};
+    g_leg_cfg = &cfg;
+    for (const auto a : {rt::Action::jvm, rt::Action::dotnet}) {
+        const auto run = run_leg(a, dir.path);
+        CHECK(run.rows == std::vector<std::string>{"status|" + std::string{rt::action_name(a)} +
+                                                    "|constrained|linux:runtimes:network_fs_skipped"});
+        CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    }
+    g_leg_cfg = nullptr;
+}
+
 #if defined(__linux__)
 
 namespace {
@@ -1240,17 +1262,13 @@ namespace {
 /// IN_OPEN watch: the only way to observe that a walk NEVER touched a directory (skipping the
 /// guard's position changes which syscalls run, not the rows or tokens).
 struct OpenWatch {
-    int fd = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    explicit OpenWatch(const fs::path& p) {
-        REQUIRE(fd >= 0);
-        REQUIRE(::inotify_add_watch(fd, p.c_str(), IN_OPEN) >= 0);
-    }
-    ~OpenWatch() { ::close(fd); }
-    OpenWatch(const OpenWatch&) = delete;
-    OpenWatch& operator=(const OpenWatch&) = delete;
+    yuzu::agent::ScopedFd fd{::inotify_init1(IN_NONBLOCK | IN_CLOEXEC)};
+    const bool armed; // false when inotify is unavailable (instance or watch limit): the caller SKIPs
+    explicit OpenWatch(const fs::path& p)
+        : armed(fd.valid() && ::inotify_add_watch(fd.get(), p.c_str(), IN_OPEN) >= 0) {}
     [[nodiscard]] bool opened() const {
         char buf[512];
-        return ::read(fd, buf, sizeof buf) > 0;
+        return ::read(fd.get(), buf, sizeof buf) > 0;
     }
 };
 
@@ -1267,6 +1285,7 @@ TEST_CASE("runtimes linux: a network-mounted candidate is never opened, directly
     make_dir(dir.path / "usr/share");
     fs::create_symlink("../lib/dotnet", dir.path / "usr/share/dotnet");
     const OpenWatch jvm{dir.path / "opt/java"}, dotnet{dir.path / "usr/lib/dotnet"};
+    if (!jvm.armed || !dotnet.armed) SKIP("inotify unavailable (instance or watch limit)");
     lnx::WalkConfig cfg;
     cfg.network_mounts = {"/opt/java", "/usr/lib/dotnet"};
     Acc a, b;
@@ -1326,17 +1345,22 @@ TEST_CASE("runtimes linux: the mount table is streamed: a line split across read
     // boundary; a whole-table size cap fails the guard OPEN on the busiest hosts.
     yuzu::test::TempDir dir{"yuzu_test_runtimes_stream_"};
     const std::string local = "20 1 0:20 / /mnt/l rw - ext4 /dev/sda1 rw\n";
+    const std::string nfs = "21 1 0:21 / /mnt/straddle rw - nfs4 h:/x rw\n";
     std::string text(lnx::kMountinfoChunk - 21, 'x'); // a filler line that ends 20 bytes before the boundary
-    text += "\n21 1 0:21 / /mnt/straddle rw - nfs4 h:/x rw\n";
+    text += "\n" + nfs;
     while (text.size() < 3 * lnx::kMountinfoChunk) text += local;
     text += "22 1 0:22 / /mnt/last rw - cifs //h/s rw"; // no trailing newline
     write_text(dir.path / "mountinfo", text);
     const auto scan = lnx::walk::scan_mounts((dir.path / "mountinfo").c_str());
     CHECK(scan.ok);
     CHECK(scan.network_mounts == std::vector<std::string>{"/mnt/straddle", "/mnt/last"});
-    // The two bounds: a line over kMaxMountinfoLine, and more bytes than the runaway cap.
-    write_text(dir.path / "longline", std::string(lnx::kMaxMountinfoLine + lnx::kMountinfoChunk, 'x'));
-    CHECK_FALSE(lnx::walk::scan_mounts((dir.path / "longline").c_str()).ok);
+    // A line too long to keep is skipped, not fatal: a mount that starts exactly at a read boundary
+    // after it is still armed, and `ok` is false. MUTATION: never leaving the skip drops that line.
+    write_text(dir.path / "longline", std::string(3 * lnx::kMountinfoChunk, 'x') + "\n" +
+                                          std::string(lnx::kMountinfoChunk - 2, 'y') + "\n" + nfs);
+    const auto longscan = lnx::walk::scan_mounts((dir.path / "longline").c_str());
+    CHECK_FALSE(longscan.ok);
+    CHECK(longscan.network_mounts == std::vector<std::string>{"/mnt/straddle"});
     const auto size = fs::file_size(dir.path / "mountinfo");
     CHECK(lnx::walk::scan_mounts((dir.path / "mountinfo").c_str(), size).ok);
     CHECK_FALSE(lnx::walk::scan_mounts((dir.path / "mountinfo").c_str(), size - 1).ok);
@@ -1413,6 +1437,8 @@ TEST_CASE("runtimes linux: every descriptor a walk opens is closed on success an
         }
         Acc acc;
         (void)lnx::jvm_rows_at(dir.path / "roots/rocky9-openjdk8", acc); // the java-binary probe
+        (void)lnx::walk::scan_mounts((fixture_dir() / "mountinfo_docker_nfs4.txt").c_str());
+        (void)lnx::walk::scan_mounts(fixture_dir().c_str()); // refused: a directory
     }
     CHECK(open_fd_count() == before);
 }
