@@ -174,8 +174,9 @@ configure OIDC.
 ## ⚠️ Breaking: a multi-host `--postgres-dsn` now needs `target_session_attrs=read-write`, and `load_balance_hosts` is refused (HA WS-8)
 
 Affects you only if the server's Postgres connection names **more than one host** — `host=n1,n2,n3`,
-`postgresql://n1,n2/yuzu`, a `PGHOST`/`PGHOSTADDR` list in the server's environment — or sets
-`load_balance_hosts` (in the DSN or `PGLOADBALANCEHOSTS`). A single host without `load_balance_hosts`,
+`postgresql://n1,n2/yuzu`, a `PGHOST`/`PGHOSTADDR` list in the server's environment, or a host list in
+the `pg_service.conf` entry a `service=` DSN or `PGSERVICE` names — or sets `load_balance_hosts` (in
+the DSN, `PGLOADBALANCEHOSTS` or that service entry). A single host without `load_balance_hosts`,
 including a proxy or managed endpoint (RDS, Azure Flexible Server, Cloud SQL, the shipped HAProxy
 compose), is unaffected.
 
@@ -185,6 +186,10 @@ Check before upgrading — look for a host list or load balancing in the DSN and
 grep -rnE 'YUZU_POSTGRES_DSN|postgres-dsn|PGHOST|PGHOSTADDR|PGLOADBALANCEHOSTS|PGSERVICE' \
   /etc/yuzu/ /etc/systemd/system/yuzu-server.service* <your compose/env files> 2>/dev/null
 ```
+
+If that shows `service=` or `PGSERVICE`, also read the named entry in the service file libpq uses
+(`PGSERVICEFILE`, else `~/.pg_service.conf` of the server's user, else `pg_service.conf` in
+`PGSYSCONFDIR`) for `host`, `hostaddr`, `load_balance_hosts` and `target_session_attrs`.
 
 - **No `target_session_attrs` set:** the server adds `target_session_attrs=read-write` and logs a
   warning at startup (`... using target_session_attrs=read-write ...`). It will no longer connect to a
@@ -201,9 +206,11 @@ grep -rnE 'YUZU_POSTGRES_DSN|postgres-dsn|PGHOST|PGHOSTADDR|PGLOADBALANCEHOSTS|P
   one connection, so it cannot see a host that fails only some of the pool's shuffled connections.
 - **A `service=` entry or `PGSERVICE`:** libpq applies the service file only when it connects, so
   the server checks what libpq resolved on its first Postgres connection at startup, and refuses to
-  start if the resolved settings set `load_balance_hosts`, or list several hosts without
-  `target_session_attrs=read-write` (or `primary`) — it cannot add the attribute to a service file,
-  so set it there yourself.
+  start (`Invalid Postgres connection settings: ...`) if the resolved settings set
+  `load_balance_hosts`, or list several hosts without `target_session_attrs=read-write` (or
+  `primary`) — it cannot add the attribute to a service file, so set it there yourself. The readiness
+  probe repeats the check on each new connection, so a later edit that breaks these rules turns
+  `/readyz` red until it is fixed.
 - **Not checked — set `target_session_attrs=read-write` yourself:** one host *name* that resolves to
   several servers (DNS round-robin, a Kubernetes headless service).
 

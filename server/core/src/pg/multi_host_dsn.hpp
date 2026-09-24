@@ -73,7 +73,9 @@ std::expected<MultiHostDsn, std::string> enforce_multi_host_read_write(const std
 /// `disable` is refused, and a host list of two or more needs
 /// `target_session_attrs` of `read-write` or `primary` (nothing can be added
 /// here — it came from outside the DSN). main.cpp runs it on the auth
-/// bootstrap pool's first connection and refuses to start on an error.
+/// bootstrap pool's first connection and refuses to start on an error; the
+/// readiness probe runs it on every new connection of its own (libpq re-reads a
+/// service file on each connect) and reports not-ready on an error.
 std::expected<void, std::string> check_effective_connection(PGconn* conn);
 
 /// `value` as a single-quoted libpq keyword/value conninfo value (`'` and `\`

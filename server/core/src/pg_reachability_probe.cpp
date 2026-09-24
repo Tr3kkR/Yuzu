@@ -158,7 +158,7 @@ ProbeConnInfo probe_conninfo(const std::string& dsn, int pool_connect_timeout_s)
 /// libpq's per-host connect timeout for `c` (seconds; 0 = none, wait for ever),
 /// read back from the connection so the DSN, PGCONNECT_TIMEOUT and the pool's
 /// default resolve exactly as libpq resolved them. libpq treats <=0 as no
-/// timeout and raises 1 to 2.
+/// timeout; before libpq 17 it also raises 1 to 2.
 int effective_connect_timeout_s(PGconn* c) {
     std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> ci(PQconninfo(c),
                                                                     &PQconninfoFree);
@@ -169,8 +169,10 @@ int effective_connect_timeout_s(PGconn* c) {
         const long v = std::strtol(o->val, &end, 10);
         if (end == o->val || v <= 0)
             return 0;
-        return v < 2 ? 2
-                     : static_cast<int>(std::min<long>(v, std::numeric_limits<int>::max()));
+        // libpq < 17 raises 1 to 2; libpq 17+ takes the value as given.
+        if (v < 2 && PQlibVersion() < 170000)
+            return 2;
+        return static_cast<int>(std::min<long>(v, std::numeric_limits<int>::max()));
     }
     return 0;
 }
@@ -270,9 +272,11 @@ private:
     /// The ONE thing added: libpq's non-blocking connect never moves past a host
     /// that accepts TCP and then goes silent (its blocking connect, which the
     /// pool uses, moves on after `connect_timeout`). So in a host list each host
-    /// address gets exactly the effective `connect_timeout` libpq resolved for
-    /// this connection — the pool's wait, neither shorter nor longer (a single
-    /// host is capped at kConnectDeadline: nothing to move on to) — measured from
+    /// address gets the effective `connect_timeout` libpq resolved for this
+    /// connection, timed as the linked libpq's blocking connect times it (whole
+    /// wall-clock seconds before libpq 17) — the pool's wait, neither shorter nor
+    /// longer (a single host: at most kConnectDeadline, nothing to move on to) —
+    /// measured from
     /// when libpq starts on it (PQhost/PQport/PQhostaddr); on expiry the attempt
     /// is restarted over the hosts libpq has not yet tried, at most once per
     /// listed host. With no `connect_timeout` (<= 0; the pool's own default
@@ -316,7 +320,7 @@ private:
                 tried.assign(hosts.size(), false);
                 timeout_s = effective_connect_timeout_s(c);
             }
-            // The pool's blocking connect gives up on each host ADDRESS after exactly
+            // The pool's blocking connect gives up on each host ADDRESS after its
             // connect_timeout, and so does the probe — not sooner (a probe that moved
             // on early would pass a host that fails the pool's connects a little
             // later, and report ready: Gate 8 round 6), not later (it would reach a
@@ -354,6 +358,13 @@ private:
             bool restart = false;
             while (!restart) {
                 if (st == PGRES_POLLING_OK) {
+                    // libpq re-reads a service file (service= / PGSERVICE) on every
+                    // connect, so settings the boot check accepted can change under
+                    // a running server: re-check what THIS connection resolved, and
+                    // report red rather than measure a pool that now shuffles hosts
+                    // or may land on a standby (Gate 8 round 8).
+                    if (auto ok = pg::check_effective_connection(c); !ok)
+                        return "connection settings not supported: " + ok.error();
                     if (PQsetnonblocking(c, 1) != 0)
                         return pq_error(c, "could not set non-blocking mode");
                     return std::nullopt;

@@ -94,19 +94,20 @@ std::expected<void, std::string> check_effective_connection(PGconn* conn) {
     if (!lbh.empty() && lbh != "disable")
         return std::unexpected(
             std::string("load_balance_hosts") + (lbh == "random" ? "=random" : "") +
-            " is set in the Postgres connection settings (a service file or the environment) "
-            "and is not supported for the server: remove it, or set load_balance_hosts=disable.");
+            " is set in the Postgres connection settings and is not supported for the server: "
+            "remove it (check the service file and environment too), or set "
+            "load_balance_hosts=disable.");
     const std::size_t hosts =
         std::max<std::size_t>({list_len(get(v, "host")), list_len(get(v, "hostaddr")), 1});
     const std::string_view tsa = get(v, kTsa);
     if (hosts >= 2 && tsa != "read-write" && tsa != "primary") {
         const bool known = std::ranges::find(kKnownTsaValues, tsa) != std::end(kKnownTsaValues);
         return std::unexpected(
-            "the Postgres connection settings list " + std::to_string(hosts) +
-            " hosts (from a service file or the environment) with " +
-            (tsa.empty() ? std::string("no target_session_attrs")
-                         : "target_session_attrs=" +
-                               (known ? std::string(tsa) : std::string("<unrecognised>"))) +
+            "the Postgres connection settings list " + std::to_string(hosts) + " hosts with " +
+            (tsa.empty() || tsa == "any"
+                 ? std::string("target_session_attrs=any (the default when none is set)")
+                 : "target_session_attrs=" +
+                       (known ? std::string(tsa) : std::string("<unrecognised>"))) +
             ": set target_session_attrs=read-write where the host list is defined, so the "
             "server only connects to a writable primary.");
     }

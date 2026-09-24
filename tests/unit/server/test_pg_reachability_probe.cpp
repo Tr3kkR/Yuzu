@@ -590,7 +590,9 @@ std::string multi_host_dsn(const std::string& dsn, const std::string& hosts,
             continue;
         out += " " + k + "=" + quote(o->val);
     }
-    return out;
+    // What production's multi-host guard adds to every DSN host list (the
+    // probe's own per-connection settings check refuses a list without it).
+    return out + " target_session_attrs=read-write";
 }
 } // namespace
 
@@ -657,10 +659,15 @@ struct FakePostgres {
     std::unique_ptr<UniqueFd> fd;
     int port{0};
     std::string sqlstate;
+    /// Delay before answering the FIRST SSL/GSSENC request (a slow handshake).
+    std::chrono::milliseconds negotiate_delay{0};
     std::atomic<bool> stop{false};
     std::thread thread; // declared last: started only once everything above exists
 
-    explicit FakePostgres(std::string code) : sqlstate(std::move(code)) {
+    /// `code`: the SQLSTATE of the FATAL reply to the startup packet; "close" =
+    /// hang up without a reply; "silent" = keep the connection open, say nothing.
+    explicit FakePostgres(std::string code, std::chrono::milliseconds delay = {})
+        : sqlstate(std::move(code)), negotiate_delay(delay) {
         std::tie(fd, port) = loopback_listener();
         if (port > 0)
             thread = std::thread([this] { serve(); });
@@ -697,12 +704,17 @@ struct FakePostgres {
                (std::uint32_t{p[2]} << 8) | std::uint32_t{p[3]};
     }
     void handle(int c) {
+        bool delayed = false;
         for (;;) {
             unsigned char hdr[8];
             if (!read_all(c, hdr, sizeof(hdr)))
                 return;
             const std::uint32_t len = be32(hdr), code = be32(hdr + 4);
             if (code == 80877103 || code == 80877104) { // SSLRequest / GSSENCRequest
+                if (negotiate_delay.count() > 0 && !delayed) {
+                    delayed = true;
+                    std::this_thread::sleep_for(negotiate_delay);
+                }
                 const char n = 'N';
                 send_all(c, &n, 1);
                 continue;
@@ -712,6 +724,12 @@ struct FakePostgres {
                 return;
             if (sqlstate == "close")
                 return; // accept, read the startup packet, hang up without a word
+            if (sqlstate == "silent") { // hold the connection open, say nothing
+                unsigned char b;
+                while (!stop.load() && ::read(c, &b, 1) != 0) {
+                }
+                return;
+            }
             std::string body;
             for (const auto& [f, v] : {std::pair<char, std::string>{'S', "FATAL"},
                                        {'V', "FATAL"},
@@ -1065,7 +1083,24 @@ TEST_CASE("check_effective_connection: a service file's load_balance_hosts or re
     SECTION("a service-file host list without target_session_attrs is refused") {
         const auto r = check_with(hosts);
         REQUIRE_FALSE(r.has_value());
-        CHECK(r.error().find("target_session_attrs") != std::string::npos);
+        // PQconninfo reports libpq's default "any" for an unset attribute; the
+        // message says so rather than implying the operator set it.
+        CHECK(r.error().find("the default when none is set") != std::string::npos);
+    }
+    SECTION("the readiness probe re-checks on every connection: a service file edited to set "
+            "load_balance_hosts turns it red") {
+        // Gate 8 round 8 (consistency-auditor, unhappy-path, cpp-expert): libpq
+        // re-reads the service file on each connect, so the boot check alone is
+        // not enough.
+        REQUIRE(check_with(hosts + "target_session_attrs=read-write\n").has_value());
+        {
+            std::ofstream f(svc_file, std::ios::trunc);
+            f << "[yzsvc]\n"
+              << hosts << "target_session_attrs=read-write\nload_balance_hosts=random\n";
+        }
+        auto probe = make_host_list_probe(no_hosts + "service=yzsvc");
+        probe->probe_once();
+        CHECK(probe->verdict() == pr::Verdict::Unreachable);
     }
     SECTION("a service-file host list with read-write is accepted") {
         CHECK(check_with(hosts + "target_session_attrs=read-write\n").has_value());
@@ -1073,6 +1108,43 @@ TEST_CASE("check_effective_connection: a service file's load_balance_hosts or re
     SECTION("a single host from the service file is accepted") {
         CHECK(check_with("host=" + pg_host + "\nport=" + pg_port + "\n").has_value());
     }
+}
+
+TEST_CASE("PgReachabilityProbe (libpq, pg): before libpq 17 a host-list wait follows libpq's "
+          "whole-second connect_timeout arithmetic",
+          "[server][readyz][pg_reachability][pg]") {
+    // Gate 8 round 8 (quality-engineer): the ±1s bounds elsewhere accept a probe
+    // that never emulates libpq 16 at all. This case discriminates. libpq < 17's
+    // blocking connect sets finish = time(NULL) + connect_timeout and derives
+    // each wait in whole seconds; a host that answers the SSL request 0.4 s
+    // after a start 0.75 s into a wall-clock second (so the answer lands just
+    // past the boundary) and then goes silent is given up about 1.4 s in —
+    // not after the full 2 s an exact deadline would wait.
+    if (PQlibVersion() >= 170000)
+        SKIP("libpq 17+ times connect_timeout exactly");
+    YUZU_REQUIRE_PG_DB(db);
+    FakePostgres slow{"silent", 400ms};
+    REQUIRE(slow.port > 0);
+    const auto [pg_host, pg_port] = pg_host_port(db.dsn());
+    const std::string dsn = multi_host_dsn(db.dsn(), "127.0.0.1," + pg_host,
+                                           std::to_string(slow.port) + "," + pg_port) +
+                            " connect_timeout=2 sslmode=prefer gssencmode=disable";
+    auto probe = make_host_list_probe(dsn);
+    // Start 0.75 s into a wall-clock second.
+    const auto frac = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count() %
+               1000;
+    };
+    while (frac() < 700 || frac() > 760)
+        std::this_thread::sleep_for(5ms);
+    const auto t = std::chrono::steady_clock::now();
+    probe->probe_once();
+    const auto took = std::chrono::steady_clock::now() - t;
+    CHECK(probe->verdict() == pr::Verdict::Ready); // moved on to the real server
+    CHECK(took >= 1100ms);
+    CHECK(took < 1800ms); // an exact 2 s deadline would take >= 2 s
 }
 
 TEST_CASE("PgReachabilityProbe (libpq, pg): a failure libpq treats as final ends the host walk "
@@ -1103,32 +1175,22 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a failure libpq treats as final ends
     }
 }
 
-TEST_CASE("PgReachabilityProbe (libpq, pg): load_balance_hosts=random walks hosts in a random "
-          "order, as libpq's pool connections do",
+TEST_CASE("PgReachabilityProbe (libpq, pg): load_balance_hosts=random is refused by the probe's "
+          "own per-connection settings check",
           "[server][readyz][pg_reachability][pg]") {
-    // The server now REFUSES load_balance_hosts at boot (pg/multi_host_dsn.hpp,
-    // round 6); this pins that libpq, not the probe, owns the host order.
-    // Gate 8 round 5 (CA-R5-1): with load_balance_hosts=random libpq shuffles the
-    // host list per connection, so a host that ends the walk (here a 28P01
-    // refusal) fails SOME new pool connections. A probe walking in DSN order
-    // would never meet it behind the real primary, or always meet it ahead.
+    // Boot refuses load_balance_hosts (pg/multi_host_dsn.hpp); the probe
+    // re-checks every connection it makes, so the setting cannot reach /readyz
+    // green by any route (a service file edited after boot included).
     YUZU_REQUIRE_PG_DB(db);
-    FakePostgres refuses{"28P01"};
-    REQUIRE(refuses.port > 0);
     const auto [pg_host, pg_port] = pg_host_port(db.dsn());
-    const std::string dsn =
-        multi_host_dsn(db.dsn(), "127.0.0.1," + pg_host,
-                       std::to_string(refuses.port) + "," + pg_port) +
-        " load_balance_hosts=random";
-    bool saw_ready = false, saw_unreachable = false;
-    for (int i = 0; i < 40 && !(saw_ready && saw_unreachable); ++i) {
-        auto probe = PgReachabilityProbe::make_libpq(dsn); // fresh: a new connection
+    const std::string dsn = multi_host_dsn(db.dsn(), pg_host + "," + pg_host,
+                                           pg_port + "," + pg_port) +
+                            " load_balance_hosts=random";
+    for (int i = 0; i < 3; ++i) {
+        auto probe = PgReachabilityProbe::make_libpq(dsn);
         probe->probe_once();
-        saw_ready = saw_ready || probe->verdict() == pr::Verdict::Ready;
-        saw_unreachable = saw_unreachable || probe->verdict() == pr::Verdict::Unreachable;
+        CHECK(probe->verdict() == pr::Verdict::Unreachable);
     }
-    CHECK(saw_ready);       // P(miss) = 2^-40 if the order is really random
-    CHECK(saw_unreachable); // a fixed DSN-order walk always hits the refusal first
 }
 
 TEST_CASE("PgReachabilityProbe (libpq, pg): 57P03 (cannot connect now) moves on to the next "

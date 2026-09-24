@@ -43,10 +43,11 @@ namespace yuzu::server::pg_reachability {
 
 /// Pause between the end of one probe and the start of the next.
 inline constexpr std::chrono::milliseconds kProbeInterval{2000};
-/// Client-side deadline on establishing the probe connection to a single host,
-/// or to any host when no `connect_timeout` applies. In a host list each host
-/// address instead gets exactly the pool's effective `connect_timeout` (10s by
-/// default), so the probe moves on no sooner and no later than the pool.
+/// Client-side cap on establishing the probe connection to a single host (the
+/// `connect_timeout`, when shorter, applies instead), and the whole wait when no
+/// `connect_timeout` applies. In a host list each host address instead gets the
+/// pool's effective `connect_timeout` (10s by default), timed as libpq's
+/// blocking connect times it, so the probe moves on when the pool does.
 /// Enforced by the probe's own poll loop — libpq's `connect_timeout` does not
 /// apply to `PQconnectStart`/`PQconnectPoll`.
 inline constexpr std::chrono::milliseconds kConnectDeadline{5000};
@@ -66,7 +67,7 @@ inline constexpr std::chrono::milliseconds kStaleAfter{15000};
 /// libpq < 17's blocking connect keeps `connect_timeout` as a whole-second
 /// wall-clock finish time and re-derives each socket wait from it in whole
 /// seconds (`pqSocketPoll`: (finish - time(NULL)) * 1000 ms, 0 once due). The
-/// probe waits the same way so it gives up on a host address exactly when the
+/// probe waits the same way so it gives up on a host address when the
 /// pool's connect does (Gate 8 round 7).
 constexpr std::int64_t libpq_wall_wait_seconds(std::int64_t finish_wall_s,
                                                std::int64_t now_wall_s) noexcept {
