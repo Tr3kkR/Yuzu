@@ -106,8 +106,8 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
     {"yuzu.guardian_legacy_sink_events_lost", "yuzu_fleet_guardian_legacy_sink_events_lost",
      "Fleet sum of legacy Guardian sink events an agent could not deliver (#4783) - refused "
      "at the detached sender's queue capacity, an admission failure, a failed Write(), or a "
-     "throwing send. Two OTHER legacy-sink drop modes are excluded from this counter and "
-     "counted separately: the pre-network-arm drop (no sink wired yet, before "
+     "throwing send. Three OTHER legacy-sink drop modes are excluded from this counter: "
+     "the pre-network-arm drop (no sink wired yet, before "
      "agent.cpp's post-Subscribe set_event_sink call) is now its OWN fleet gauge, "
      "yuzu_fleet_guardian_legacy_sink_dropped_unwired below (a governance follow-up) - it "
      "can BE loss of already-committed guard state, since a legacy guard only re-reports "
