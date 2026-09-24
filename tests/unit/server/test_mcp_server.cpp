@@ -760,7 +760,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
 #include "pg/pg_raii.hpp"               // PgResult
-#include "dex_app_perf_model.hpp"      // AppPerfProviders + the app-perf read types
+#include "dex_app_perf_model.hpp"      // the app-perf read types
 #include "software_inventory_store.hpp"  // typed daily-sync store (ADR-0016)
 #include "software_licensing_store.hpp"  // SLE discovery store (query_software_licenses, ADR-0024)
 #include "app_usage_store.hpp"           // app-usage projection (get_agent_app_usage, wave 7 PR7.2)
@@ -1219,15 +1219,18 @@ struct McpTestServer {
     /// query_software_licenses.
     yuzu::server::AppUsageStore* app_usage_store_for_test{nullptr};
 
-    /// DEX app-perf-over-time (slice 2): optionally wire the AppPerfProviders so the
-    /// app-perf tools (list_dex_perf_apps / get_dex_app_perf / get_dex_group_app_perf)
-    /// can be exercised. Default empty keeps existing tests on the unavailable path.
+    /// DEX app-perf-over-time (slice 2): optionally wire this FnDexPerfApi::Providers
+    /// test double (NOT the retired production `AppPerfProviders`, #4626 Concern C —
+    /// see this field's own type) so the app-perf tools (list_dex_perf_apps /
+    /// get_dex_app_perf / get_dex_group_app_perf) can be exercised. Default empty
+    /// keeps existing tests on the unavailable path.
     /// `.cohort` (ADR-0031 WS-A4 #4250) is no longer read by production
     /// compare_app_perf_versions directly — the harness below wraps it in a
     /// FnVerifyApi at build time so every EXISTING test setting `.cohort`
-    /// keeps its meaning unchanged; the field stays on `AppPerfProviders`
-    /// purely as this test-only adapter's input shape.
-    yuzu::server::AppPerfProviders app_perf_providers_for_test{};
+    /// keeps its meaning unchanged; the field stays on this test-only
+    /// `FnDexPerfApi::Providers` adapter shape (decoupled from the retired
+    /// production `AppPerfProviders`, #4626 Concern C) purely as its input.
+    yuzu::server::test::FnDexPerfApi::Providers app_perf_providers_for_test{};
 
     /// ADR-0031 WS-A4: optionally wire a driven FnComplianceApi so the six
     /// Policy:Read compliance tools (list_policy_fragments / list_policies /
@@ -1701,7 +1704,6 @@ private:
             /*response_scope_fn=*/response_scope_fn_for_test,
             /*software_inventory_store=*/software_inventory_store_for_test,
             /*metrics=*/metrics_for_test,
-            /*app_perf_providers=*/app_perf_providers_for_test,
             /*quarantine_store=*/quarantine_store_for_test,
             /*tag_push_fn=*/
             [this](const std::string& agent_id, const std::string& key) {
@@ -20384,7 +20386,7 @@ TEST_CASE("MCP get_agent_app_usage: RBAC-off — ordinary session denied, admin 
         /*dispatch_fn=*/nullptr, /*ca_store=*/nullptr, /*publish_crl_fn=*/{},
         /*guaranteed_state_store=*/nullptr, /*dex_perf_fn=*/{}, /*network_api=*/{},
         /*response_scope_fn=*/{}, /*software_inventory_store=*/nullptr,
-        /*metrics=*/nullptr, /*app_perf_providers=*/{},
+        /*metrics=*/nullptr,
         /*quarantine_store=*/nullptr, /*tag_push_fn=*/{}, /*agent_registry=*/nullptr,
         /*scoped_perm_fn=*/
         [&](const httplib::Request& rq, httplib::Response& rs, const std::string& type,
@@ -23904,7 +23906,7 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
         /*dispatch_fn=*/nullptr, /*ca_store=*/nullptr, /*publish_crl_fn=*/{},
         /*guaranteed_state_store=*/nullptr, /*dex_perf_fn=*/{}, /*network_api=*/{},
         /*response_scope_fn=*/{}, /*software_inventory_store=*/nullptr,
-        /*metrics=*/nullptr, /*app_perf_providers=*/{},
+        /*metrics=*/nullptr,
         /*quarantine_store=*/nullptr, /*tag_push_fn=*/{}, /*agent_registry=*/nullptr,
         // K-06/CDX-R4-09: delete_tag now FAILS CLOSED when the per-device scope
         // gate is unwired, so this integration test must wire it exactly as

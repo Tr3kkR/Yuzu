@@ -24,6 +24,8 @@
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
+#include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
 #include "compliance_model.hpp"         // shared REST/MCP/fragment builders (#4034)
 #include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -5260,7 +5262,7 @@ McpServer::HandlerFn McpServer::build_handler(
     DexPerfFn dex_perf_fn, std::shared_ptr<const NetworkApi> network_api,
     ResponseScopeFn response_scope_fn,
     SoftwareInventoryStore* software_inventory_store,
-    yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
+    yuzu::MetricsRegistry* metrics,
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
     yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn,
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
@@ -14445,8 +14447,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // Behavioral-PII access audit BEFORE the read (provider-null already
-                // checked, matching the REST twin's ordering) — same verb/target as
-                // the REST twin and the dashboard's app-perf-over-time drill.
+                // checked, matching the REST twin's ordering) — same audit verb/target
+                // as the REST twin and the dashboard's app-perf-over-time drill (the
+                // dashboard's own ordering differs — it audits BEFORE its null-seam
+                // check, over-auditing on an unwired provider — see dex_routes.cpp's
+                // "#4626 Concern A" comment; only the verb/target match here, not the
+                // ordering).
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.device.app_perf.view", "success", "Agent", agent_id,
                     "device app-perf-over-time drill (B1 retained) via MCP "
@@ -15350,7 +15356,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (member resolution then B1 aggregate), membership via
                     // TagStore::agents_with_tag instead of
                     // ManagementGroupStore::get_members — see
-                    // AppPerfTagCohortFn's doc comment (dex_app_perf_model.hpp)
+                    // DexPerfApi::tag_trend's doc comment (dex_perf_api.hpp)
                     // for why the SAME kDexCohortFloor suppression applies. No
                     // interim deny_fleet_wide_service_scoped() call is needed
                     // here for the reason the sibling branch's own comment
@@ -24345,7 +24351,6 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 yuzu::MetricsRegistry* metrics,
-                                AppPerfProviders app_perf_providers,
                                 QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
                                 yuzu::server::detail::AgentRegistry* agent_registry,
                                 ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
@@ -24383,7 +24388,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     std::move(dispatch_fn), ca_store, std::move(publish_crl_fn),
                     guaranteed_state_store, std::move(dex_perf_fn), std::move(network_api),
                     std::move(response_scope_fn), software_inventory_store, metrics,
-                    std::move(app_perf_providers), quarantine_store, std::move(tag_push_fn),
+                    quarantine_store, std::move(tag_push_fn),
                     agent_registry, std::move(scoped_perm_fn), sessions, mcp_streaming_disabled,
                     mcp_streamed_post_enabled, std::move(allowed_origins),
                     software_licensing_store, engine_principal_store,
@@ -24414,7 +24419,6 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 yuzu::MetricsRegistry* metrics,
-                                AppPerfProviders app_perf_providers,
                                 QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
                                 yuzu::server::detail::AgentRegistry* agent_registry,
                                 ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
@@ -24463,7 +24467,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             std::move(publish_crl_fn), guaranteed_state_store,
                             std::move(dex_perf_fn), std::move(network_api),
                             std::move(response_scope_fn), software_inventory_store, metrics,
-                            std::move(app_perf_providers), quarantine_store,
+                            quarantine_store,
                             std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
                             sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
                             std::move(allowed_origins),
