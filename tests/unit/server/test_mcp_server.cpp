@@ -1530,7 +1530,6 @@ private:
         if (dex_perf_fn_for_test || app_perf_providers_for_test.fleet ||
             app_perf_providers_for_test.apps || app_perf_providers_for_test.device ||
             app_perf_providers_for_test.group || app_perf_providers_for_test.tag_cohort ||
-            app_perf_providers_for_test.tag_values ||
             app_perf_providers_for_test.version_devices)
             mcp.set_dex_perf_api(std::make_shared<yuzu::server::test::FnDexPerfApi>(
                 dex_perf_fn_for_test, app_perf_providers_for_test));
