@@ -795,6 +795,13 @@ $vcpkgParseErrors = $null
 Check 'the job-scoped vcpkg assertion script remains syntactically valid' {
   $vcpkgParseErrors.Count -eq 0
 }
+$assertParseTokens = $null
+$assertParseErrorsTop = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile(
+  (Resolve-Path -LiteralPath $AssertPath).Path, [ref]$assertParseTokens, [ref]$assertParseErrorsTop)
+Check 'the standalone toolchain assertion script remains syntactically valid' {
+  $assertParseErrorsTop.Count -eq 0
+}
 $vcpkgAssertText = Get-Content -LiteralPath $AssertVcpkgPath -Raw
 Check 'the vcpkg wrapper uses the shared first-match command resolver' {
   $vcpkgAssertText -match '(?m)^\s*\$git\s*=\s*Resolve-YuzuEffectiveCommand\s+-Name\s+git\s*$'
@@ -879,7 +886,9 @@ Check 'the CI psql export is opt-in and agent-guarded' {
 Check 'ci.yml passes the CI psql export switch to the Windows manifest assertion' {
   $ciText = Get-Content -LiteralPath $CiWorkflowPath -Raw
   $windowsJobAt = $ciText.IndexOf("`n  windows:")
+  if($windowsJobAt -lt 0){ return $false }
   $manifestAt = $ciText.IndexOf('- name: Assert toolchain manifest', $windowsJobAt)
+  if($manifestAt -lt 0){ return $false }
   $nextManifestStepAt = $ciText.IndexOf("`n      - name:", $manifestAt + 1)
   $manifestStep = if($nextManifestStepAt -gt $manifestAt){ $ciText.Substring($manifestAt, $nextManifestStepAt - $manifestAt) } else { '' }
   $manifestStep -match 'Assert-Toolchain\.ps1[^\r\n]*-ExportCiEnv'

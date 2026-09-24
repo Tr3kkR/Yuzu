@@ -66,12 +66,9 @@ pg_durability_decide() {
       # error line with no '|' at all leaves setting empty).
       continue
     fi
-    # A line with exactly 2 '|' has $rest empty even when it IS 3 fields
-    # (the common case) — but also when there are only 2 fields and no
-    # third '|' at all (setting would then hold everything after the first
-    # '|', so a genuine 2-field line "name|value" is a 2-field line, which
-    # pg_settings.source never legitimately omits). Require a non-empty
-    # source_col to accept the row as well-formed.
+    # A 2-field line "name|value" leaves source_col empty (setting takes the
+    # rest), and pg_settings.source is never empty for a real row — so
+    # require a non-empty source_col to accept the row.
     [[ -z "$source_col" ]] && continue
     saw_any_row=1
     case "$name" in
@@ -141,14 +138,17 @@ pg_dsn_host_port() {
 # pg_dsn_redact <dsn> — strips userinfo (user[:password]) from a URI-form
 # DSN's authority, e.g. postgresql://yuzu:yuzu@127.0.0.1:5433/db ->
 # postgresql://***@127.0.0.1:5433/db, AND redacts a keyword-form `password=`
-# value (path 1 accepts both forms). The URI-authority strip is greedy
-# (`://.*@`, taking the LAST '@' in the string) so a raw '@' inside the
-# password itself does not leak a fragment after it — this can over-redact
-# a literal '@' in a query string, which is an acceptable trade-off next to
-# a leaked credential. Unchanged when there is no '@' and no `password=`.
+# value (path 1 accepts both forms, including whitespace around `=` and a
+# single-quoted value that may itself contain whitespace or an escaped
+# quote — libpq's conninfo_parse accepts all of these). The URI-authority
+# strip is greedy (`://.*@`, taking the LAST '@' in the string) so a raw '@'
+# inside the password itself does not leak a fragment after it — this can
+# over-redact a literal '@' in a query string, which is an acceptable
+# trade-off next to a leaked credential. Unchanged when there is no '@' and
+# no `password=`.
 pg_dsn_redact() {
   local dsn="$1"
-  printf '%s' "$dsn" | sed -E 's#://.*@#://***@#; s/password=[^[:space:]]*/password=***/g'
+  printf '%s' "$dsn" | sed -E 's#://.*@#://***@#; s/password[[:space:]]*=[[:space:]]*('"'"'([^'"'"'\\]|\\.)*'"'"'|[^[:space:]]*)/password=***/g'
 }
 
 # pg_psql_path_from_env <value> — backslash -> forward-slash (Windows-form
@@ -242,6 +242,20 @@ pg_durability_selftest() {
   case "$out" in
     *s3cret*) echo "  FAIL: dsn_redact leaked a keyword-form password: $out" >&2; PGD_FAILURES=$((PGD_FAILURES + 1)) ;;
     *) echo "  ok: dsn_redact does not leak a keyword-form password" ;;
+  esac
+
+  out="$(pg_dsn_redact 'host=127.0.0.1 password = s3cret dbname=x')"
+  pg_durability_check "dsn_redact keyword-form spaced =" "host=127.0.0.1 password=*** dbname=x" "$out"
+  case "$out" in
+    *s3*|*cret*) echo "  FAIL: dsn_redact leaked a spaced keyword-form password: $out" >&2; PGD_FAILURES=$((PGD_FAILURES + 1)) ;;
+    *) echo "  ok: dsn_redact does not leak a spaced keyword-form password" ;;
+  esac
+
+  out="$(pg_dsn_redact "password='s3 cret' dbname=x")"
+  pg_durability_check "dsn_redact keyword-form quoted value" "password=*** dbname=x" "$out"
+  case "$out" in
+    *s3*|*cret*) echo "  FAIL: dsn_redact leaked a quoted keyword-form password: $out" >&2; PGD_FAILURES=$((PGD_FAILURES + 1)) ;;
+    *) echo "  ok: dsn_redact does not leak a quoted keyword-form password" ;;
   esac
 
   out="$(pg_psql_path_from_env 'D:\ci\pgbin\agent-1\bin\psql.exe')"; pg_durability_check "psql_path_from_env backslash" "D:/ci/pgbin/agent-1/bin/psql.exe" "$out"

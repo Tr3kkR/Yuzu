@@ -31,6 +31,9 @@
 #      manifest-vouched per-agent probe failure is retried then fails the
 #      job — it never falls back to the shared agent-0 cluster. Without any
 #      psql, conformance is UNVERIFIED (a warning, not a failure).
+#      Test seam: YUZU_CI_PG_SLEEP_SCALE scales the two bounded sleeps
+#      (defaults to 1; the docs-suite selftest sets 0 so every scenario
+#      runs in milliseconds).
 #   2. Docker available -> idempotent `yuzu-ci-postgres` container on
 #      127.0.0.1:15432 (self-hosted Linux — the same boxes run the
 #      docker-publish jobs, so docker is a given). Port 15432 deliberately
@@ -91,9 +94,13 @@ fi
 # DATABASE WITH (FORCE) per case (~72 cases) — both fsync-heavy — so full
 # durability makes the [pg] shard the slowest-scaling part of the suite,
 # ~20x worse on Windows where fsync is dominant (the 2026-07-14 600s Windows
-# TIMEOUTs). The DBs are throwaway; a crash just re-runs the job. All three
-# are sighup-context settings — server-level (postgresql.conf / ALTER SYSTEM
-# + pg_reload_conf(), or the -c flags here), never settable per connection.
+# TIMEOUTs). The DBs are throwaway; a crash just re-runs the job. fsync and
+# full_page_writes are sighup-context (server-level only); synchronous_commit
+# is user-context (also settable per session/role/database — why the
+# post-heal re-read in p1_conform points at pg_settings.source). All three
+# are applied server-side here — postgresql.conf / ALTER SYSTEM +
+# pg_reload_conf(), or the -c flags — never via the DSN (see the options=
+# NOTE below).
 DOCKER_PG_ARGS=(-c fsync=off -c synchronous_commit=off -c full_page_writes=off)
 if [[ -n "$AGENT_IDX" ]]; then
   # Container-per-agent on 15440+<n>: base deliberately OFF 15432/15433 so
@@ -246,8 +253,14 @@ fi
 if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   # Test seam for the two bounded sleeps below (per-agent probe retry,
   # post-heal re-read) — 1 in production, 0 in the docs-suite selftest so
-  # every scenario there runs in milliseconds instead of real seconds.
+  # every scenario there runs in milliseconds instead of real seconds. Not a
+  # production knob: a non-integer value (a typo in a workflow env) falls
+  # back to 1 rather than aborting the step shell on the arithmetic below.
   P1_SLEEP_SCALE="${YUZU_CI_PG_SLEEP_SCALE:-1}"
+  if ! [[ "$P1_SLEEP_SCALE" =~ ^[0-9]+$ ]]; then
+    echo "ensure-postgres: note — YUZU_CI_PG_SLEEP_SCALE='${P1_SLEEP_SCALE}' is not a non-negative integer; using 1" >&2
+    P1_SLEEP_SCALE=1
+  fi
 
   # PgPool (pg_pool.cpp) only injects its statement_timeout/lock_timeout
   # safety-bound GUCs when PQconninfoParse finds no `options` keyword (the

@@ -1233,7 +1233,9 @@ Resolution order inside the script:
    (`fsync=… synchronous_commit=… full_page_writes=… data_directory=…
    databases=… active_backends=…`) for **all four** Wee Tam clusters on
    every Windows job, so a drift is visible in seconds from any job's log
-   instead of surfacing as a 700s `[pg]`-shard `TIMEOUT`.
+   instead of surfacing as a 700s `[pg]`-shard `TIMEOUT`. (Test seam:
+   `YUZU_CI_PG_SLEEP_SCALE` scales the guard's two bounded sleeps — 1 in
+   production, 0 in the docs-suite selftest.)
 2. **Docker** (self-hosted Linux) — idempotent persistent container
    (`docker start` || `docker run --restart unless-stopped`, image pinned
    to the same digest as `deploy/docker/Dockerfile.postgres`'s base;
@@ -1298,8 +1300,11 @@ produces a `::warning` and still exports the conventional DSN —
 credential **unverified**, wrong credentials then surface as downstream
 `[pg]` test failures; install `psql` on the runner's PATH to get the
 authenticated gate instead); path 1 without any `psql` at all
-(conformance is **UNVERIFIED** — a warning, not a failure); and path-1
-drift outside the heal bound — a developer's pre-set DSN, a bespoke
+(conformance is **UNVERIFIED** — a warning, not a failure); a path-1
+`YUZU_CI_PSQL` that is set but not executable, which is ignored with a
+`::warning` and the PATH/none ladder continues — with the heal and the
+manifest no-fallback rule OFF for that job; and path-1 drift outside the
+heal bound — a developer's pre-set DSN, a bespoke
 remote DB, or any other self-hosted box the guard cannot prove is
 disposable CI infrastructure — which is only **reported**, never healed
 or failed. Locally the tests still skip when `YUZU_TEST_POSTGRES_DSN` is

@@ -219,7 +219,10 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   and, when invoked with `-ExportCiEnv` (the CI job only), exports
   `YUZU_CI_PSQL` — this runner's own agent's manifest `psql` — so
   `scripts/ci/ensure-postgres.sh`'s per-job durability conformance guard
-  resolves a proven `psql.exe` instead of an unauthenticated TCP probe.
+  resolves a proven `psql.exe` instead of an unauthenticated TCP probe. A
+  `YUZU_CI_PSQL` that is set but not executable is ignored with a
+  `::warning`, and the guard's heal and manifest no-fallback rule are OFF
+  for that job.
 - **Shared vcpkg binary cache.** `RUNNER_TOOL_CACHE=D:\ci\tool_cache` points
   `${{ runner.tool_cache }}` (hence `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml`) at
   **one** machine-level dir, so the 4 CCD-pinned runners share one warm vcpkg
