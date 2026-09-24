@@ -2510,9 +2510,13 @@ TEST_CASE("#4606 criterion-10: format_arm_committed_line keeps the #3990 driver'
           "cannot be forged through the rule id",
           "[spark][runtime]") {
     // Formatter-only: the runtime's own spdlog output is not reliably capturable from a test (it
-    // lives in libyuzu_agent_core, see test_log_capture.hpp), so nothing here pins that the call
-    // sites in guardian_spark_runtime.cpp actually go through log_id_token. Those are checked by
-    // reading.
+    // lives in libyuzu_agent_core, see test_log_capture.hpp), so nothing HERE pins that the call
+    // sites in guardian_spark_runtime.cpp actually go through log_id_token/log_key_token. That gap
+    // is now closed by a real, position-aware lexical scanner instead of "checked by reading" --
+    // tests/test_guardian_spark_log_injection_tripwire.py (suite 'docs') fails the moment a NEW
+    // spdlog:: call across the Guardian/Spark subsystem prints a rule-id/Spark-key-shaped argument
+    // unwrapped, and it also recognises a direct call to format_arm_committed_line() itself as a
+    // safe formatter (the wrap happens inside it, confirmed by reading the implementation).
     // A plain id renders byte-for-byte as it did before the id was neutralised: the #3990 driver's
     // T2_RE (docs/spark-rebuild-baselines/fullsync_blackout_diag.py) parses exactly this shape.
     // #4665: fixture-driven (tests/unit/fixtures/spark/arm_committed_line.json) so this assertion

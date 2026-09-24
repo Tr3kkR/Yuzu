@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""#4665 tripwire: no NEW spdlog:: call prints a rule-id/Spark-key-shaped value unwrapped.
+
+#4665 closed CWE-117 log-injection on operator-authored Guardian `rule_id` /
+Spark `key` (and the path/hive/service/unit-name values a Spark mechanism embeds
+in a log line): every raw print site across the agent's guard_*/spark_*/
+guardian_* sources and the server's guardian_push_builder.cpp/
+guaranteed_state_store.cpp now goes through yuzu::log_id_token / yuzu::
+log_key_token (common/include/yuzu/log_token.hpp). This test is the regression
+net: it fails the moment a NEW spdlog:: call in the Guardian/Spark subsystem
+prints one of these fields unwrapped.
+
+WHY POSITION-AWARE, NOT "does log_id_token/log_key_token appear ANYWHERE in the
+statement". A whole-statement substring check passes a multi-argument call
+where only ONE of several sensitive arguments is wrapped -- e.g.
+`spdlog::warn("rule '{}' key '{}'", log_id_token(rule_id), key)` would pass
+with `key` still raw. This is not hypothetical: it is the exact shape fixed at
+guardian_spark_runtime.cpp's "key '{}' still has {} queued claim(s) ... for
+rule '{}'" site during this sweep (one placeholder wrapped, the other not, in
+the SAME statement). So this scanner:
+  1. parses each spdlog::LEVEL(...) call's format-string literal (concatenating
+     adjacent string-literal tokens, which several real call sites split across
+     physical lines) and its argument list separately;
+  2. finds every `{}`-shaped placeholder in the literal, in left-to-right
+     (= positional) order;
+  3. matches SENSITIVE_PATTERNS against the literal's TEXT -- a pattern match's
+     character span marks every placeholder whose span overlaps it as sensitive;
+  4. maps placeholder i (0-indexed) to argument i (0-indexed) -- the ordinary
+     spdlog/fmt convention for bare `{}` placeholders (verified: no call site in
+     the scanned tree uses an indexed `{0}` or spec'd `{:...}` placeholder that
+     would break this mapping -- grep `spdlog::.*\\{[0-9]` / `\\{:` came back
+     empty across the scanned file set at the time this test was written; a
+     FUTURE indexed placeholder would silently defeat the positional mapping,
+     a documented limitation, not something this scanner detects);
+  5. for each sensitive placeholder, requires ITS OWN argument's text (not the
+     whole statement) to contain a call to a recognised wrapper or safe
+     formatter (WRAP_CALLS / SAFE_FORMATTER_CALLS below) -- substring-within-
+     the-argument-slot, which is what correctly flags the two-placeholder gap
+     above (only one slot's text contains the call) while still passing a
+     wrapped value hidden inside a ternary, e.g.
+     `detail.empty() ? "no reason given" : log_key_token(detail)`
+     (guardian_spark_runtime.cpp's "subscription {} lost" site) -- the call
+     appears somewhere WITHIN that specific argument's own text, not merely
+     somewhere in the statement.
+
+FILE SCOPE -- three roots, filtered to the Guardian/Spark basename glob, NOT a
+bare three-root scan. "rule" and "key" are common English words: an early,
+literal three-root sweep for a bare `key '{}'` pattern hit key_provider.cpp
+(KMS key ids), runtime_config_store.cpp (encrypted-blob keys),
+custom_properties_store.cpp (schema keys), trigger_engine.cpp (a registry-
+trigger key, a DIFFERENT feature from Guardian), server.cpp (a SAML
+signing-key path) and grpc_on_behalf_interceptor.hpp (an on-behalf-of metadata
+key) -- none are #4665's domain, and none would be caught by a human reviewer
+reading a `git grep key` dump without also reading each site. Restricting the
+walk to FILE_BASENAME_RE (guardian_*/guard_*/spark_*/guaranteed_state*, the
+same basename family the routed-concern rows in .claude/routed-concerns.md use
+as the Guardian/Spark trigger surface) removes that false-positive class
+without weakening precision inside the subsystem: every literal-substring
+pattern below was verified, by a fresh `git grep` sweep of the FILTERED file
+set at authoring time, to match ONLY genuine rule-id/Spark-key print sites
+(each match's file:line was read and classified by hand) plus, in exactly one
+case, a documented false positive that a SECOND condition (a message-prefix
+requirement, not a per-file exclusion) resolves -- see the "key '{}'" entry in
+SENSITIVE_PATTERNS below.
+
+KNOWN, ACCEPTED, PERMANENT LIMITATION (do not try to close, matching this
+repo's convention of stating a check's limits plainly -- see
+test_no_connless_pq_escape.py's own header): a format string of bare `"{}"`
+with no surrounding sensitive-pattern text is NEVER flagged, because this
+scanner decides sensitivity from the LITERAL's text, and a bare `"{}"` carries
+none. guardian_engine.cpp's `start_local()` builds `degrade_msg` (a
+std::string) by concatenating `"Guardian: rule '" + log_id_token(rule.rule_id())
++ "' failed to re-arm (" + ...` THREE LINES ABOVE its print site
+(`spdlog::error("{}", degrade_msg)`) -- the rule_id is correctly wrapped at
+the point of concatenation, but this scanner cannot see that: it has no
+data-flow analysis, only literal-text pattern matching on the format string
+actually passed to spdlog. This is a real, permanent limitation of the lexical
+approach (tracing local-variable construction is out of scope), not a scanner
+bug -- see _selfcheck()'s degrade_msg-shaped case, which asserts the scanner
+does NOT flag it and documents why that is expected.
+
+SAFE FORMATTERS. A call site that passes a raw-looking argument to a function
+in SAFE_FORMATTER_CALLS below -- not to spdlog:: directly -- is not flagged;
+the wrap happens INSIDE the formatter:
+  - format_arm_committed_line() (agents/core/src/guardian_spark_timing.cpp) --
+    wraps its rule_id parameter via log_id_token before building the returned
+    string (confirmed by reading the implementation). Its one real call site
+    (guardian_spark_runtime.cpp) passes the result through
+    `spdlog::info("{}", format_arm_committed_line(rule_id, ...))` -- a bare
+    `"{}"` literal, so it is not even reached by the sensitivity check (see the
+    known-limitation paragraph above); the exemption is still real and
+    exercised by _selfcheck() against a synthetic literal that WOULD otherwise
+    be flagged, so a future direct call shaped like
+    `spdlog::info("... for rule '{}'", format_arm_committed_line(rule_id, ...))`
+    stays correctly unflagged too.
+  - log_safe() (server/core/src/web_utils.hpp) -- PRE-DATES this sweep (#2542
+    PR-7), independent of log_id_token/log_key_token, and folds control bytes
+    (0x00-0x1F, 0x7F) to '?' with truncation -- an adequate CWE-117 mitigation
+    (no raw CR/LF can survive it) used at guardian_routes.cpp's rate-limited
+    "platform support-matrix stale" log line, which #4665 correctly left
+    untouched (a different, older call convention, not a regression this sweep
+    missed). It is WEAKER than log_token in one respect worth a future
+    harmonisation look, not a #4665 gap: it does not fold space or '=', so on a
+    space-delimited `k=v k=v` line (which this call site is) a crafted id could
+    still forge an adjacent field, though it cannot forge a NEW physical log
+    line.
+
+Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml,
+same precedent shape as test_no_connless_pq_escape.py and
+test_split_interlock_tripwire.py. Zero third-party dependencies (stdlib only).
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SELF = Path(__file__).resolve()
+
+SEARCH_ROOTS = ["agents/core/src", "server/core/src", "common/include"]
+
+# Guardian/Spark subsystem basenames -- see the module docstring's FILE SCOPE
+# paragraph for why this is not a bare three-root scan.
+FILE_BASENAME_RE = re.compile(r"^(guardian_|guard_|spark_|guaranteed_state)[A-Za-z0-9_]*\.(cpp|hpp)$")
+
+SPDLOG_CALL_RE = re.compile(r"\bspdlog::(?:trace|debug|info|warn|error|critical)\s*\(")
+
+# Recognised wrappers that fully neutralise a rule-id/Spark-key-shaped argument.
+# Checked as a substring WITHIN the specific argument's own text slot -- see the
+# module docstring's WHY POSITION-AWARE paragraph.
+WRAP_CALLS = (
+    "log_id_token(",
+    "log_key_token(",
+)
+
+# Named list of "known safe formatter" functions -- see the module docstring's
+# SAFE FORMATTERS paragraph. Extend this list deliberately, not by accretion:
+# a new entry needs the same "read the implementation, confirm it wraps before
+# returning" justification these two got.
+SAFE_FORMATTER_CALLS = (
+    "format_arm_committed_line(",
+    "log_safe(",
+)
+
+ALL_SAFE_CALLS = WRAP_CALLS + SAFE_FORMATTER_CALLS
+
+PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
+
+
+class Pattern:
+    """A sensitive-field literal pattern. `text` is matched as a literal
+    substring (case-sensitive) against the concatenated format-string
+    literal; every `{}` placeholder whose span overlaps a match is marked
+    sensitive. `requires_prefix`, if set, additionally requires the WHOLE
+    literal to start with that substring (used for exactly one pattern --
+    see its own comment). `excludes_suffix`, if set, skips a match whose
+    span is IMMEDIATELY followed by that substring (used for exactly one
+    pattern -- see its own comment)."""
+
+    __slots__ = ("name", "text", "requires_prefix", "excludes_suffix")
+
+    def __init__(
+        self,
+        name: str,
+        text: str,
+        requires_prefix: str | None = None,
+        excludes_suffix: str | None = None,
+    ) -> None:
+        self.name = name
+        self.text = text
+        self.requires_prefix = requires_prefix
+        self.excludes_suffix = excludes_suffix
+
+
+# Derived from a fresh sweep of this branch's own #4665 commits (git log
+# 2ef5b8d3c..d081b0c75) plus a fresh git grep of the filtered file set at
+# authoring time -- see the module docstring. Each entry's rationale/evidence:
+SENSITIVE_PATTERNS = [
+    # The `XxxGuard[{}]:` rule_id-bracket line prefix shared by FileGuard/
+    # RegistryGuard/ServiceGuard/SystemdServiceGuard (guard_file.cpp,
+    # guard_registry.cpp, guard_service.cpp, guard_systemd.cpp) -- the FIRST
+    # placeholder on every one of those lines is cfg_.rule_id.
+    Pattern("Guard[{}]", "Guard[{}]"),
+    # Quoted rule_id: `rule '{}'` (and `for rule '{}'`, which contains this as
+    # a substring) -- guardian_engine.cpp, guardian_arm_ack.cpp,
+    # guardian_spark_bridge.hpp, guardian_spark_runtime.cpp.
+    Pattern("rule '{}'", "rule '{}'"),
+    # Unquoted key=value rule_id forms -- guaranteed_state_store.cpp
+    # (`rule_id={}`), guardian_ingest.cpp/guardian_routes.cpp (`rule={}`).
+    Pattern("rule_id={}", "rule_id={}"),
+    Pattern("rule={}", "rule={}"),
+    # guardian_push_builder.cpp's two-placeholder id+name form: "Guardian
+    # push: rule {} ('{}') ...". Deliberately spans BOTH placeholders in one
+    # pattern (the id at bare `{}`, the name inside the quotes) -- covers the
+    # mutation shape where only one of the two got wrapped.
+    Pattern("rule {} ('{}')", "rule {} ('{}')"),
+    # Spark key, quoted: `key '{}'`. Conditioned on the literal STARTING WITH
+    # "Guardian spark:" -- a fresh sweep of the filtered file set found this
+    # exact phrase in exactly two places: guardian_spark_runtime.cpp (9 sites,
+    # all genuine Spark-key prints, all under this prefix) and
+    # guardian_lifecycle_journal.cpp's "Guardian journal: batch key '{}' is in
+    # the PRE-TIMESTAMP format" (a FALSE POSITIVE on the English word "key":
+    # that key is `journal_batch_key(ts_ms, boot_nonce, seq)` --
+    # "lc:<ts13>:<nonce>:<seq12>" -- entirely agent-minted from a timestamp, a
+    # random boot nonce and a counter, with NO operator-controlled substring,
+    # so it carries no injection risk and is not #4665's domain). The prefix
+    # condition is evidence-derived (every genuine site really does start with
+    # "Guardian spark:"), not a one-off exclusion for that one file: a NEW
+    # non-spark guardian_* file's unrelated "... key '{}' ..." line still
+    # correctly does not match, without needing its own carve-out.
+    Pattern("key '{}'", "key '{}'", requires_prefix="Guardian spark:"),
+    # SparkEngine mechanism-layer key prints, all quoted -- spark_engine.cpp.
+    Pattern("armed '{}'", "armed '{}'"),
+    Pattern("disarmed '{}'", "disarmed '{}'"),
+    Pattern("spark '{}'", "spark '{}'"),
+    Pattern("watch '{}'", "watch '{}'"),
+    Pattern("unwatch('{}')", "unwatch('{}')"),
+    # "for '{}'" -- spark_file.cpp/spark_registry.cpp's "probe for '{}'",
+    # "establishment report for '{}'", "drain worker for '{}'", "synthetic
+    # fire for '{}'", "emit for '{}'"; guard_service.cpp/guard_systemd.cpp's
+    # "FAILED for '{}'"/"failed for '{}'"/"match arm failed for '{}'"; and
+    # spark_service.cpp's "ActiveState read transient error for '{}'"/"match
+    # arm failed for '{}'" (the Linux systemd Spark MECHANISM's own unit-name
+    # prints -- see this test's own docstring-adjacent RISKS note in the
+    # senior handoff for the two sites this pattern is expected to catch as
+    # genuine, currently-unwrapped findings).
+    Pattern("for '{}'", "for '{}'"),
+    Pattern("establishing '{}'", "establishing '{}'"),
+    # systemd unit name, quoted -- guard_systemd.cpp, spark_service.cpp.
+    Pattern("LoadUnit '{}'", "LoadUnit '{}'"),
+    Pattern("unit '{}'", "unit '{}'"),
+    # Registry hive/value-name, quoted -- guard_registry.cpp.
+    Pattern("hive '{}'", "hive '{}'"),
+    # Service name, quoted -- guard_service.cpp. "service name '{}'" (the
+    # invalid-name refusal) and "service '{}'" (the armed/watching lines) are
+    # genuinely distinct substrings (the word "name" sits between "service"
+    # and the quote in the first), so both are listed rather than one
+    # subsuming the other.
+    Pattern("service name '{}'", "service name '{}'"),
+    Pattern("service '{}'", "service '{}'"),
+    # guard_registry.cpp's "{}\\{} [{}]" hive\key[value_name] triple, split
+    # into two overlapping patterns so each of the three placeholders is
+    # covered: the first spans hive+key (the "{}\\{}" shared by every
+    # hive/key print, including the ones with no value_name in the message),
+    # the second spans key+value_name (present only where value_name is also
+    # printed) -- both patterns' hits on the shared "key" placeholder are
+    # redundant-but-harmless, not a bug.
+    Pattern("hive\\key (registry)", "{}\\\\{}"),
+    # excludes_suffix: guard_registry.cpp's ONE "watching {}\\{} [{}] (expect
+    # {}={})" summary line uses this exact bracket position for value_TYPE,
+    # not value_name -- verified by reading its argument list (rule_id, hive,
+    # key, value_type, value_name, expected) against its placeholder order
+    # (rule_id, hive, key, [bracket], "expect X=", "=Y"): the bracket's
+    # argument is cfg_.value_type (a closed-set/compile-time-literal string,
+    # correctly left unwrapped per b8303f02a's own commit message), and
+    # cfg_.value_name is correctly wrapped one placeholder later, in the
+    # "expect {}=" slot. Every OTHER hive\key[...] site in this file (three of
+    # them) puts value_name in the bracket and is immediately followed by
+    # something other than " (expect " (" {} ->", " (detected=", " detected=")
+    # -- this exclusion is that one line's exact, verified shape, not a guess.
+    Pattern("key[value_name] (registry)", "\\\\{} [{}]", excludes_suffix=" (expect "),
+    # Guardian event_id, both call conventions seen in the tree --
+    # guaranteed_state_store.cpp/guardian_ingest.cpp use "event_id={}";
+    # guardian_outbox_send_executor.hpp uses "event_id {}" (a space, not '=').
+    # log_token.hpp's own header names a Guardian event id as a log_id_token
+    # case by definition ("a Guardian event id ends in `<wall_ms>-<seq>`"),
+    # and make_event_id() (guardian_spark_runtime.cpp) concatenates
+    # `agent_id + "-" + boot_nonce_ + "-" + rule_id + ...` -- rule_id is
+    # charset-valid past apply_rules()'s #4665 pre-validation, but agent_id's
+    # own neutralisation is explicitly OUT OF #4665's scope (#489, per
+    # 3784a6f21's commit message), so the composed event_id is not provably
+    # safe to print raw.
+    Pattern("event_id={}", "event_id={}"),
+    Pattern("event_id {}", "event_id {}"),
+    # Unquoted key=value path/service forms in the "guard armed" summary lines
+    # -- guardian_engine.cpp.
+    Pattern("path={}", "path={}"),
+    Pattern("service={}", "service={}"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Statement / literal / argument parsing. Pure lexical (no libclang / no AST):
+# balanced-paren statement extraction and top-level comma splitting, both
+# string/char-literal aware so a `(`, `)`, or `,` inside a quoted argument
+# never mis-counts. Adjacent string-literal tokens (a format string split
+# across physical lines, several real sites in this sweep do this) are
+# concatenated the same way the C++ compiler would.
+# ---------------------------------------------------------------------------
+
+
+def _skip_ws_and_comments(s: str, i: int) -> int:
+    n = len(s)
+    while i < n:
+        if s[i].isspace():
+            i += 1
+        elif s.startswith("//", i):
+            j = s.find("\n", i)
+            i = n if j == -1 else j + 1
+        elif s.startswith("/*", i):
+            j = s.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+        else:
+            break
+    return i
+
+
+def _skip_string_literal(s: str, i: int) -> int:
+    """s[i] == '"'. Return the index just past the closing quote."""
+    n = len(s)
+    i += 1
+    while i < n:
+        if s[i] == "\\":
+            i += 2
+            continue
+        if s[i] == '"':
+            return i + 1
+        i += 1
+    return n  # unterminated -- caller treats as "consumed the rest"
+
+
+def _skip_char_literal(s: str, i: int) -> int:
+    n = len(s)
+    i += 1
+    while i < n:
+        if s[i] == "\\":
+            i += 2
+            continue
+        if s[i] == "'":
+            return i + 1
+        i += 1
+    return n
+
+
+def find_spdlog_statements(text: str) -> list[str]:
+    """Return the full `spdlog::LEVEL(...)` statement text (including the
+    call and its balanced closing paren) for every call in `text`."""
+    out: list[str] = []
+    for m in SPDLOG_CALL_RE.finditer(text):
+        start = m.start()
+        i = m.end()  # just past the opening '('
+        depth = 1
+        n = len(text)
+        while i < n and depth > 0:
+            c = text[i]
+            if c == '"':
+                i = _skip_string_literal(text, i)
+                continue
+            if c == "'":
+                i = _skip_char_literal(text, i)
+                continue
+            if text.startswith("//", i):
+                j = text.find("\n", i)
+                i = n if j == -1 else j + 1
+                continue
+            if text.startswith("/*", i):
+                j = text.find("*/", i + 2)
+                i = n if j == -1 else j + 2
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            i += 1
+        out.append(text[start:i])
+    return out
+
+
+def parse_call(stmt: str) -> tuple[str, str] | None:
+    """Given a full `spdlog::LEVEL(...)` statement, return
+    (concatenated_format_literal, argument_list_text) or None if the first
+    argument is not a string literal (nothing this scanner can analyse --
+    a documented limitation, not an error)."""
+    open_paren = stmt.index("(")
+    i = _skip_ws_and_comments(stmt, open_paren + 1)
+    if i >= len(stmt) or stmt[i] != '"':
+        return None
+    parts: list[str] = []
+    while i < len(stmt) and stmt[i] == '"':
+        end = _skip_string_literal(stmt, i)
+        parts.append(stmt[i + 1 : end - 1])
+        i = _skip_ws_and_comments(stmt, end)
+    literal = "".join(parts)
+    # i now points just past the format string's last literal token. The
+    # statement's outer closing ')' is the LAST char (find_spdlog_statements
+    # always ends a statement on its balancing close-paren). Explicit raise,
+    # not assert: python3 -O strips asserts, and a violation here would mean
+    # find_spdlog_statements' own invariant broke silently.
+    if not stmt.endswith(")"):
+        raise ValueError(f"internal invariant violated: statement does not end with ')': {stmt!r}")
+    tail = stmt[i : len(stmt) - 1]
+    tail_stripped = tail.lstrip()
+    if tail_stripped.startswith(","):
+        args_text = tail_stripped[1:]
+    else:
+        args_text = ""  # no arguments after the format string
+    return literal, args_text
+
+
+def split_top_level_args(args_text: str) -> list[str]:
+    """Split on commas at paren/bracket/quote depth 0."""
+    args: list[str] = []
+    depth = 0
+    cur_start = 0
+    i = 0
+    n = len(args_text)
+    while i < n:
+        c = args_text[i]
+        if c == '"':
+            i = _skip_string_literal(args_text, i)
+            continue
+        if c == "'":
+            i = _skip_char_literal(args_text, i)
+            continue
+        if args_text.startswith("//", i):
+            j = args_text.find("\n", i)
+            i = n if j == -1 else j + 1
+            continue
+        if args_text.startswith("/*", i):
+            j = args_text.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            args.append(args_text[cur_start:i])
+            cur_start = i + 1
+        i += 1
+    tail = args_text[cur_start:].strip()
+    if tail:
+        args.append(args_text[cur_start:])
+    elif args:
+        pass  # trailing comma with nothing after it -- ignore
+    return [a for a in args if a.strip()]
+
+
+def find_placeholders(literal: str) -> list[tuple[int, int]]:
+    """Placeholder spans in left-to-right (positional) order. Assumes bare
+    `{}` / unindexed-spec placeholders only -- see the module docstring's
+    point 4 for why this was verified against the scanned tree, and its
+    limitation if that ever changes."""
+    return [m.span() for m in PLACEHOLDER_RE.finditer(literal)]
+
+
+def sensitive_placeholder_indices(literal: str) -> dict[int, list[str]]:
+    """Map placeholder index -> list of matching Pattern names."""
+    placeholders = find_placeholders(literal)
+    hits: dict[int, list[str]] = {}
+    for pat in SENSITIVE_PATTERNS:
+        if pat.requires_prefix is not None and not literal.startswith(pat.requires_prefix):
+            continue
+        start = 0
+        while True:
+            idx = literal.find(pat.text, start)
+            if idx == -1:
+                break
+            end = idx + len(pat.text)
+            if pat.excludes_suffix is not None and literal[end : end + len(pat.excludes_suffix)] == pat.excludes_suffix:
+                start = idx + 1
+                continue
+            for pi, (ps, pe) in enumerate(placeholders):
+                if ps < end and pe > idx:
+                    hits.setdefault(pi, []).append(pat.name)
+            start = idx + 1
+    return hits
+
+
+def argument_is_wrapped(arg_text: str) -> bool:
+    return any(call in arg_text for call in ALL_SAFE_CALLS)
+
+
+def find_violations_in_text(text: str) -> list[tuple[int, str, list[str]]]:
+    """Return (1-based line number, matched pattern names joined, statement
+    snippet) for every unwrapped sensitive placeholder found in `text`."""
+    violations: list[tuple[int, str, list[str]]] = []
+    for stmt in find_spdlog_statements(text):
+        parsed = parse_call(stmt)
+        if parsed is None:
+            continue
+        literal, args_text = parsed
+        sensitive = sensitive_placeholder_indices(literal)
+        if not sensitive:
+            continue
+        args = split_top_level_args(args_text)
+        for pi, pattern_names in sensitive.items():
+            if pi >= len(args):
+                # Fewer arguments than placeholders -- malformed call the
+                # compiler would itself reject; nothing to check.
+                continue
+            if not argument_is_wrapped(args[pi]):
+                line_no = text.count("\n", 0, text.index(stmt)) + 1
+                violations.append((line_no, ", ".join(sorted(set(pattern_names))), stmt))
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# _selfcheck()
+# ---------------------------------------------------------------------------
+
+
+def _selfcheck() -> None:
+    def flagged(src: str) -> bool:
+        return len(find_violations_in_text(src)) > 0
+
+    # 1. Must-match: a raw sensitive argument, unwrapped, in each pattern shape.
+    must_match = [
+        'spdlog::warn("Guardian FileGuard[{}]: no watch armed for {}", cfg_.rule_id, cfg_.path);',
+        'spdlog::error("Guardian: reconcile threw for rule \'{}\'", rule.rule_id());',
+        'spdlog::warn("GuaranteedStateStore: status upsert failed for rule_id={}: {}", rule_id, e);',
+        'spdlog::warn("Guardian: event ingest error (rule={}): {}", rule_id, e);',
+        'spdlog::warn("Guardian push: rule {} (\'{}\') requests enforce", row.rule_id, row.name);',
+        'spdlog::error("Guardian spark: key \'{}\' still has queued claims", key);',
+        'spdlog::info("SparkEngine: armed \'{}\'", key);',
+        'spdlog::info("SparkEngine: disarmed \'{}\' (last subscription gone)", key);',
+        'spdlog::warn("SparkEngine: consumer \'{}\' handler threw on spark \'{}\'", name, key);',
+        'spdlog::warn("SparkEngine: watch \'{}\' FAULTED", key);',
+        'spdlog::error("SparkEngine: defensive unwatch(\'{}\') after a failed watch()", key);',
+        'spdlog::warn("spark_file: probe for \'{}\' failed", w.dir);',
+        'spdlog::warn("spark_registry: establishing \'{}\' failed", w.spark_key);',
+        'spdlog::warn("Guardian SystemdServiceGuard[{}]: LoadUnit \'{}\' transient error", cfg_.rule_id, unit);',
+        'spdlog::warn("Guardian RegistryGuard[{}]: invalid hive \'{}\'", cfg_.rule_id, cfg_.hive);',
+        'spdlog::warn("Guardian ServiceGuard[{}]: invalid service name \'{}\'", cfg_.rule_id, cfg_.service_name);',
+        'spdlog::info("Guardian ServiceGuard[{}]: watching service \'{}\'", cfg_.rule_id, cfg_.service_name);',
+        'spdlog::info("Guardian RegistryGuard[{}]: {} {}\\\\{} [{}]", cfg_.rule_id, action, cfg_.hive, cfg_.key, cfg_.value_name);',
+        'spdlog::warn("Guardian outbox send stalled (event_id {})", event_id);',
+        'spdlog::info("Guardian: file guard armed for rule \'{}\' (path={})", log_id_token(rule.rule_id()), log_path);',
+        'spdlog::info("Guardian: service guard armed for rule \'{}\' (service={})", log_id_token(rule.rule_id()), log_service);',
+    ]
+    for src in must_match:
+        if not flagged(src):
+            raise SystemExit(f"selfcheck: expected a violation, found none:\n  {src!r}")
+
+    # 2. Must-not-match: the same shapes, correctly wrapped.
+    must_not = [
+        'spdlog::warn("Guardian FileGuard[{}]: no watch armed for {}", log_id_token(cfg_.rule_id), log_key_token(cfg_.path));',
+        'spdlog::error("Guardian: reconcile threw for rule \'{}\'", log_id_token(rule.rule_id()));',
+        'spdlog::warn("GuaranteedStateStore: status upsert failed for rule_id={}: {}", log_id_token(rule_id), e);',
+        'spdlog::warn("Guardian: event ingest error (rule={}): {}", log_id_token(rule_id), e);',
+        'spdlog::warn("Guardian push: rule {} (\'{}\') requests enforce", log_id_token(row.rule_id), log_key_token(row.name));',
+        'spdlog::error("Guardian spark: key \'{}\' still has queued claims", ::yuzu::log_key_token(key));',
+        'spdlog::info("SparkEngine: armed \'{}\'", ::yuzu::log_key_token(key));',
+        'spdlog::info("SparkEngine: disarmed \'{}\' (last subscription gone)", ::yuzu::log_key_token(key));',
+        'spdlog::warn("SparkEngine: consumer \'{}\' handler threw on spark \'{}\'", consumer->name, ::yuzu::log_key_token(key));',
+        'spdlog::warn("SparkEngine: watch \'{}\' FAULTED", ::yuzu::log_key_token(key));',
+        'spdlog::error("SparkEngine: defensive unwatch(\'{}\') after a failed watch()", ::yuzu::log_key_token(key));',
+        'spdlog::warn("spark_file: probe for \'{}\' failed", ::yuzu::log_key_token(fs::path(w.dir).string()));',
+        'spdlog::warn("spark_registry: establishing \'{}\' failed", ::yuzu::log_key_token(w.spark_key));',
+        'spdlog::warn("Guardian SystemdServiceGuard[{}]: LoadUnit \'{}\' transient error", log_id_token(cfg_.rule_id), log_key_token(unit));',
+        'spdlog::warn("Guardian RegistryGuard[{}]: invalid hive \'{}\'", log_id_token(cfg_.rule_id), log_key_token(cfg_.hive));',
+        'spdlog::info("Guardian RegistryGuard[{}]: {} {}\\\\{} [{}]", log_id_token(cfg_.rule_id), action, log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_name));',
+        'spdlog::warn("Guardian outbox send stalled (event_id {})", log_id_token(event_id));',
+        # a ternary hiding the wrap call inside its own argument slot --
+        # guardian_spark_runtime.cpp's real "subscription {} lost" shape.
+        'spdlog::warn("Guardian spark: key \'{}\' subscription {} lost ({})", ::yuzu::log_key_token(key), subscription_id, detail.empty() ? "no reason given" : ::yuzu::log_key_token(detail));',
+        # the REAL guard_registry.cpp:523 shape: the bracket holds value_type
+        # (correctly raw, a closed-set string), value_name is correctly
+        # wrapped one slot later in "(expect {}=" -- the excludes_suffix case.
+        'spdlog::info("Guardian RegistryGuard[{}]: watching {}\\\\{} [{}] (expect {}={}) [resilient]", log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key), cfg_.value_type, log_key_token(cfg_.value_name), cfg_.expected);',
+    ]
+    for src in must_not:
+        if flagged(src):
+            raise SystemExit(f"selfcheck: expected no violation, found one:\n  {src!r}")
+
+    # 3. Mutation-style cases: two sensitive placeholders, wrap only ONE --
+    # must still be flagged (the naive-design gap this scanner exists to
+    # catch, guardian_spark_runtime.cpp:2798's real shape).
+    mutations = [
+        # rule_id wrapped, key raw.
+        'spdlog::error("Guardian spark: key \'{}\' still has {} queued claim(s) after the sweep for rule \'{}\'", key, n, ::yuzu::log_id_token(rule_id));',
+        # key wrapped, rule_id raw.
+        'spdlog::error("Guardian spark: key \'{}\' still has {} queued claim(s) after the sweep for rule \'{}\'", ::yuzu::log_key_token(key), n, rule_id);',
+        # guardian_push_builder.cpp's two-slot form: id wrapped, name raw.
+        'spdlog::warn("Guardian push: rule {} (\'{}\') requests enforce on {}", log_id_token(row.rule_id), row.name, why);',
+        # ... and the reverse.
+        'spdlog::warn("Guardian push: rule {} (\'{}\') requests enforce on {}", row.rule_id, log_key_token(row.name), why);',
+        # guard_registry.cpp's 392-style shape (value_name genuinely in the
+        # bracket, no "(expect " suffix -- the excludes_suffix condition must
+        # NOT blind this pattern to a real regression here): hive/key wrapped,
+        # value_name left raw.
+        'spdlog::info("Guardian RegistryGuard[{}]: {} {}\\\\{} [{}] {} -> {} ({}us)", log_id_token(cfg_.rule_id), d.remediation_action, log_key_token(cfg_.hive), log_key_token(cfg_.key), cfg_.value_name, detected, cfg_.expected, d.remediation_latency_us);',
+    ]
+    for src in mutations:
+        if not flagged(src):
+            raise SystemExit(f"selfcheck: expected mutation-style violation, found none:\n  {src!r}")
+    # And BOTH wrapped must pass.
+    both_wrapped = [
+        'spdlog::error("Guardian spark: key \'{}\' still has {} queued claim(s) after the sweep for rule \'{}\'", ::yuzu::log_key_token(key), n, ::yuzu::log_id_token(rule_id));',
+        'spdlog::warn("Guardian push: rule {} (\'{}\') requests enforce on {}", log_id_token(row.rule_id), log_key_token(row.name), why);',
+    ]
+    for src in both_wrapped:
+        if flagged(src):
+            raise SystemExit(f"selfcheck: expected no violation once both slots are wrapped:\n  {src!r}")
+
+    # 4. Reworded-literal cases -- prove pattern matching isn't over-fit to one
+    # exact phrase (spark_registry.cpp/spark_file.cpp use several distinct
+    # phrasings of the same "for '{}'" shape).
+    reworded = [
+        'spdlog::warn("spark_file: establishing \'{}\' failed ({}, err={}) - watch is deaf", w.dir, reason, err);',
+        'spdlog::warn("spark_registry: probe for \'{}\' failed at {} (err={})", w.spark_key, stage, err);',
+        'spdlog::warn("spark_registry: drain worker for \'{}\' {} ({} backlogged)", w->spark_key, why, n);',
+    ]
+    for src in reworded:
+        if not flagged(src):
+            raise SystemExit(f"selfcheck: expected reworded-literal violation, found none:\n  {src!r}")
+
+    # 5. Multi-line call case -- format string AND arguments split across
+    # physical lines (mirrors real sites in guard_file.cpp/guard_registry.cpp).
+    multiline_bad = (
+        'spdlog::warn(\n'
+        '    "Guardian FileGuard[{}]: parent-directory watch for {} "\n'
+        '    "not armed (event creation failed)",\n'
+        '    cfg_.rule_id, cfg_.path);\n'
+    )
+    if not flagged(multiline_bad):
+        raise SystemExit("selfcheck: expected multi-line violation, found none")
+    multiline_ok = (
+        'spdlog::warn(\n'
+        '    "Guardian FileGuard[{}]: parent-directory watch for {} "\n'
+        '    "not armed (event creation failed)",\n'
+        '    log_id_token(cfg_.rule_id), log_key_token(cfg_.path));\n'
+    )
+    if flagged(multiline_ok):
+        raise SystemExit("selfcheck: expected no violation on wrapped multi-line call")
+
+    # 6. format_arm_committed_line(...) call site -- must be exempted, not
+    # flagged, at BOTH the real shape (bare "{}", never reaches the
+    # sensitivity check at all) and a synthetic shape where the OUTER
+    # placeholder's literal text IS sensitive (proves the exemption itself,
+    # not just the accident of a bare "{}").
+    real_shape = 'spdlog::info("{}", format_arm_committed_line(rule_id, detach_epoch_, gen, guard_type, via, ms));'
+    if flagged(real_shape):
+        raise SystemExit("selfcheck: real format_arm_committed_line call site was flagged")
+    synthetic_shape = (
+        'spdlog::info("Guardian spark: arm committed for rule \'{}\'", '
+        'format_arm_committed_line(rule_id, epoch, incarnation, type, via, ms));'
+    )
+    if flagged(synthetic_shape):
+        raise SystemExit("selfcheck: format_arm_committed_line exemption did not hold under a sensitive literal")
+    # log_safe(...) -- the second recognised safe formatter.
+    log_safe_shape = (
+        'spdlog::info("guardian: platform support-matrix stale — agent={} rule={} spark_type={}", '
+        'log_safe(std::string(agent_id)), log_safe(std::string(rule_id)), log_safe(std::string(spark_type)));'
+    )
+    if flagged(log_safe_shape):
+        raise SystemExit("selfcheck: log_safe exemption did not hold")
+
+    # 7. The KNOWN, ACCEPTED GAP: a bare "{}" printing a local variable built
+    # from a wrapped concatenation three lines above (guardian_engine.cpp's
+    # degrade_msg). Must NOT be flagged -- this is a documented limitation of
+    # literal-text matching, not something this scanner can or should catch
+    # (would require tracing local-variable data flow). See the module
+    # docstring's KNOWN, ACCEPTED, PERMANENT LIMITATION paragraph.
+    degrade_msg_shape = (
+        'const std::string degrade_msg = "Guardian: rule \'" + log_id_token(rule.rule_id()) + '
+        '"\' failed to re-arm (" + e.what() + ") - NOT enforcing this rule";\n'
+        'spdlog::error("{}", degrade_msg);'
+    )
+    if flagged(degrade_msg_shape):
+        raise SystemExit(
+            "selfcheck: the documented degrade_msg limitation regressed -- a bare '{}' literal "
+            "should never be flagged regardless of what local variable it prints"
+        )
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def _scanned_files() -> list[Path]:
+    out = subprocess.run(
+        ["git", "ls-files", "--", *SEARCH_ROOTS],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout
+    files = []
+    for rel in out.splitlines():
+        p = REPO_ROOT / rel
+        if p == SELF or not p.is_file():
+            continue
+        if FILE_BASENAME_RE.match(p.name):
+            files.append(p)
+    return files
+
+
+def main() -> int:
+    _selfcheck()
+    hits: list[str] = []
+    for path in _scanned_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        rel = path.relative_to(REPO_ROOT)
+        for line_no, pattern_names, stmt in find_violations_in_text(text):
+            snippet = " ".join(stmt.split())[:160]
+            hits.append(f"{rel}:{line_no}: [{pattern_names}] {snippet}")
+    if hits:
+        print(
+            "FAIL: unwrapped rule-id/Spark-key-shaped spdlog:: argument(s) found (#4665 "
+            "CWE-117 log-injection tripwire). Wrap with yuzu::log_id_token / "
+            "yuzu::log_key_token (common/include/yuzu/log_token.hpp):"
+        )
+        print("\n".join(hits))
+        return 1
+    print("OK: no unwrapped rule-id/Spark-key-shaped spdlog:: arguments found")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
