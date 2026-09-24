@@ -121,10 +121,12 @@ struct ConnTarget {
 /// docs/user-manual/ha-postgres.md documents) would otherwise wait out the
 /// whole deadline on a frozen n1 every tick while the pool serves from n2.
 /// So the probe splits the host list itself and gives each host its own
-/// deadline. Residual, documented: a single host NAME that resolves to several
-/// addresses is iterated inside libpq and keeps the no-advance behaviour.
-/// On a parse failure or a list shape libpq itself would reject, returns ONE
-/// target carrying the original values, so libpq reports the error.
+/// deadline. Residuals, documented: a single host NAME that resolves to several
+/// addresses is iterated inside libpq and keeps the no-advance behaviour, and a
+/// host list supplied through `service=` or `PGHOST` is not split (PQconninfoParse
+/// expands neither). On a list shape libpq itself would reject, returns ONE target
+/// carrying the original values, so libpq reports that error; on a parse failure,
+/// one raw-DSN target whose connect reports a FIXED message (connect_one).
 std::vector<ConnTarget> build_targets(const std::string& dsn) {
     ConnOptions base;
     std::vector<std::string> hosts, addrs, ports;
@@ -213,9 +215,12 @@ public:
         }
         if (*read_only) {
             // A standby, or a primary refusing writes (default_transaction_read_only,
-            // e.g. managed Postgres on a full disk). Drop the session so the next tick
-            // re-resolves through the host list / proxy (header, finding 2).
+            // e.g. managed Postgres on a full disk). Drop the session AND move the
+            // starting host on, so the next tick re-resolves through the host list /
+            // proxy instead of reconnecting to this same read-only server (header,
+            // finding 2; next_host_after_read_only for the multi-host pin).
             conn_.reset();
+            preferred_ = pr::next_host_after_read_only(preferred_, targets_.size());
             return R{R::Kind::ReadOnly, "connected server does not accept writes (in recovery, or "
                                         "transaction_read_only is on)"};
         }

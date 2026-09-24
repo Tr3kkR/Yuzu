@@ -33,6 +33,9 @@
 #                       a server BOOTED with h1 already frozen still becomes ready.
 #                       libpq's non-blocking connect never advances past a silent
 #                       first host on its own (Gate 4 UP-1 / chaos CH-2).
+#   G. read-only second host  `host=A,B` with NO target_session_attrs, B read-only:
+#                       stop A (red), start A -> /readyz 200 again, not pinned to B
+#                       (Gate 8 round 2 UH-R2-1).
 #
 # Before WS-8, scenario A stayed green indefinitely and C closed the listener
 # immediately (see pg_reachability_probe.hpp / shutdown_drain_rules.hpp).
@@ -54,7 +57,7 @@ PG_IMAGE="${YUZU_HA_READYZ_PG_IMAGE:-postgres:18.4-bookworm@sha256:efef99e1558f8
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server-bin) SERVER_BIN="$2"; shift 2 ;;
-        -h|--help)    sed -n '2,42p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,45p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -263,6 +266,24 @@ if boot "$MDSN"; then pass "a server booted with the first host frozen became re
 else fail "a server booted with the first host frozen never became ready"; fi
 stop_server 210
 docker unpause "$PG" >/dev/null
+
+echo "== G: multi-host DSN without target_session_attrs, a read-only second host, a primary blip"
+# Round-2 governance UH-R2-1: the probe starts a reconnect from the host that last
+# CONNECTED; a read-only server keeps accepting connections, so without moving on
+# after a read-only answer the probe pinned itself to it and stayed red after the
+# primary came back. Host A = the writable primary, host B = read-only and up.
+psql_in "$PG2" "ALTER SYSTEM SET default_transaction_read_only = on" && psql_in "$PG2" "SELECT pg_reload_conf()"
+GDSN="postgresql://yuzu:${PG_PASS}@127.0.0.1:${PGPORT},127.0.0.1:${PG2PORT}/yuzu"
+boot "$GDSN" || exit 1
+pass "server ready on host A with a read-only host B listed second"
+docker stop -t 2 "$PG" >/dev/null
+if t=$(wait_for /readyz 503 20 '"pg":"'); then pass "/readyz 503 $(pg_reason) ${t}s after the primary stopped"
+else fail "/readyz not 503 within 20s of the primary stopping: $(body /readyz)"; fi
+docker start "$PG" >/dev/null && pg_up "$PG"
+if t=$(wait_for /readyz 200 30); then pass "/readyz 200 again ${t}s after the primary came back (not pinned to read-only B)"
+else fail "/readyz still not ready 30s after the primary came back: $(body /readyz)"; fi
+stop_server 210
+psql_in "$PG2" "ALTER SYSTEM RESET default_transaction_read_only" && psql_in "$PG2" "SELECT pg_reload_conf()"
 
 echo
 if (( FAILS == 0 )); then echo "ha-readyz-scenarios: ALL PASS"; exit 0; fi

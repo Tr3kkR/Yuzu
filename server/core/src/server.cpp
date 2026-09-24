@@ -20541,7 +20541,7 @@ private:
     // /readyz's `pg_reachable` row. Dedicated connection (NOT pg_pool_), own loop
     // thread. stop() joins the THREAD; the OBJECT lives until ~ServerImpl because
     // /readyz handlers may still be running after web_server_->stop() (they read
-    // its atomics only) — never reset() it inside stop().
+    // its snapshot under the probe's own leaf mutex) — never reset() it inside stop().
     std::unique_ptr<PgReachabilityProbe> pg_reachability_probe_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)

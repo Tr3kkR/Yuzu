@@ -1,7 +1,7 @@
 - **Breaking — `/readyz` now goes red when the server cannot reach a writable Postgres primary, and
   shutdown can hold a drain grace for load balancers (HA WS-8, ADR-2002 §12).** A new gating `pg_reachable` row is
   fed by a probe on its own dedicated Postgres connection (not the pool), with client-side deadlines on
-  every wait and one deadline per host of a multi-host DSN. `/readyz` reports not ready after two
+  every socket wait and one deadline per host of a multi-host DSN. `/readyz` reports not ready after two
   failed probes, at once when the probe reaches a standby or a primary with
   `default_transaction_read_only` on, or after 15 s without a success. The 503 body names the reason in a new `pg` field
   (`unreachable`, `stale`, `read_only`, `not_yet_probed`). Before this, `/readyz` stayed 200 through a

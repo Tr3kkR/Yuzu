@@ -167,6 +167,18 @@ TEST_CASE("pg_reachability rule: the timing budget never reds a healthy replica"
     STATIC_REQUIRE(pr::kFailThreshold >= 2);
 }
 
+TEST_CASE("pg_reachability rule: a read-only answer moves the starting host on",
+          "[server][readyz][pg_reachability]") {
+    // Gate 8 round 2 UH-R2-1: starting a reconnect from the last host that
+    // CONNECTED pinned the probe to a read-only server (it keeps accepting
+    // connections). The rule rotates instead, so every host is tried in turn.
+    STATIC_REQUIRE(pr::next_host_after_read_only(0, 1) == 0);
+    STATIC_REQUIRE(pr::next_host_after_read_only(0, 2) == 1);
+    STATIC_REQUIRE(pr::next_host_after_read_only(1, 2) == 0);
+    STATIC_REQUIRE(pr::next_host_after_read_only(2, 3) == 0);
+    STATIC_REQUIRE(pr::next_host_after_read_only(0, 0) == 0);
+}
+
 TEST_CASE("pg_reachability rule: reason tokens are stable and carry no detail",
           "[server][readyz][pg_reachability]") {
     CHECK(std::string(pr::reason(pr::Verdict::Ready)) == "ok");
@@ -497,9 +509,10 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): stop() interrupts a real in-flight q
     for (int i = 0; i < 100 && !active; ++i) {
         const auto n = admin_scalar(db.dsn(),
                                     "SELECT count(*) FROM pg_stat_activity WHERE "
-                                    "application_name = $1 AND state = 'active'",
+                                    "application_name = $1 AND state = 'active' AND "
+                                    "datname = current_database()",
                                     "yuzu_ws8_probe_stopq");
-        active = n && *n == "1";
+        active = n && !n->empty() && *n != "0";
         if (!active)
             std::this_thread::sleep_for(100ms);
     }
