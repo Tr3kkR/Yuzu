@@ -121,8 +121,8 @@ metadata:
     /usr/lib/jvm, /opt/java, /usr/lib64/jvm and /var/opt/java — flavour (jdk,
     jre, unmodelled), version, install path and vendor (the build's self-reported
     `IMPLEMENTOR` value, e.g. Eclipse Adoptium vs Debian; it is not verified). A
-    home with a java binary but no `release` file (distro OpenJDK 8) is a row
-    with version `-` and a `release_missing` constraint. No `java` process is
+    home with a java binary but no `release` file (Debian/Ubuntu and RHEL-family
+    OpenJDK 8 packages) is a row with version `-` and a `release_missing` constraint. No `java` process is
     started. A `supported` status with no rows means none was found at those
     roots (an Oracle-RPM /usr/java or a tarball install elsewhere is not looked
     for); a `constrained` status means a read failed or was skipped and the list

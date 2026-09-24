@@ -1,6 +1,7 @@
 Directory: tests/unit/fixtures/wave10/runtimes/linux/
 Fixtures for the runtimes Linux-leg tests (tests/unit/test_runtimes_parsers.cpp loads the
-three capture files; tests/unit/test_runtimes_linux_parsers.cpp materializes tree.manifest).
+three capture files; tests/unit/test_runtimes_linux_parsers.cpp materializes tree.manifest and
+jdk_layouts.manifest and reads mountinfo_docker_nfs4.txt).
 One directory-level provenance file; every fixture below is labelled. The three capture
 files are REAL CAPTURE from command-only Docker containers (no long-running service,
 nothing installed beyond the stated apt packages); tree.manifest carries per-section
@@ -58,7 +59,7 @@ ubuntu2204-openjdk8:    ubuntu:22.04 after `apt-get install -y --no-install-reco
            java-8-openjdk-arm64 home, a java-1.8.0-openjdk-arm64 alias symlink and a .jinfo file.
 rocky9-openjdk8:        rockylinux:9 after `dnf install -y java-1.8.0-openjdk-headless`
            (1.8.0.504.b01-1.2.el9_8.aarch64): the home has jre/bin/java only (no bin/), plus five
-           alias symlinks (three into /etc/alternatives).
+           alias symlinks (four into /etc/alternatives).
 alpine320-openjdk8:     alpine:3.20 after `apk add openjdk8-jre-base`: java-1.8-openjdk with bin/java
            and jre/bin/java, plus the default-jvm and java-8-openjdk alias symlinks.
 opensuse156-openjdk17:  opensuse/leap:15.6 after `zypper -n in --no-recommends
