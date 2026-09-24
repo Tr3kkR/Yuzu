@@ -30,7 +30,11 @@
 #      bounded retry. Elsewhere, drift is reported, never healed. A
 #      manifest-vouched per-agent probe failure is retried then fails the
 #      job — it never falls back to the shared agent-0 cluster. Without any
-#      psql, conformance is UNVERIFIED (a warning, not a failure).
+#      psql, conformance is UNVERIFIED (a warning, not a failure). A raw
+#      psql failure's diagnostic text (which can echo a malformed DSN's
+#      password verbatim) is withheld under GitHub Actions rather than
+#      republished in a public ::error::/::warning:: annotation — see
+#      p1_diag.
 #      Test seam: YUZU_CI_PG_SLEEP_SCALE scales the two bounded sleeps
 #      (defaults to 1; the docs-suite selftest sets 0 so every scenario
 #      runs in milliseconds).
@@ -147,13 +151,44 @@ p1_psql() {
   PGCONNECT_TIMEOUT=10 MSYS2_ARG_CONV_EXCL='*' "$P1_PSQL" -X -w "$@"
 }
 
-# p1_flatten <text> — CRLF-strip then newline-flatten psql/error output for
-# a single-line GitHub Actions ::error::/::warning:: annotation, which stops
-# rendering at the first newline (a multi-line $rows embedded raw truncates
-# the annotation after the first row).
+# p1_flatten <text> — CRLF-strip then newline-and-tab-flatten psql/error
+# output for a single-line GitHub Actions ::error::/::warning:: annotation,
+# which stops rendering at the first newline (a multi-line $rows embedded
+# raw truncates the annotation after the first row). psql's own connection-
+# refused text continues onto a second line with a leading TAB ("\tIs the
+# server running..."); left unflattened that TAB survives mid-line inside
+# an otherwise single-line annotation.
 p1_flatten() {
   local text="${1//$'\r'/}"
-  echo "${text//$'\n'/ }"
+  text="${text//$'\n'/ }"
+  echo "${text//$'\t'/ }"
+}
+
+# p1_diag <rc> <text> [force_untrusted] — like p1_flatten, but withholds RAW
+# psql diagnostic text under GitHub Actions when it cannot be trusted to be
+# well-formed pg_settings rows: rc != 0 (the psql invocation itself failed —
+# a malformed/mistyped DSN password can make psql echo the credential
+# verbatim in its own client-side error text, e.g. "invalid percent-encoded
+# token: \"codex_secret_%ZZ\"") or force_untrusted is set (the caller
+# already knows the text isn't a clean pg_settings read, e.g. p1_conform's
+# "fail unparseable" arm). GitHub Actions' ::error::/::warning:: annotations
+# are PUBLIC and its secret masking is exact-value-only, so a credential
+# substring that isn't byte-for-byte the configured secret leaks in the
+# clear; p1_flatten alone only makes that single-line-safe, it does not
+# remove it. rc == 0 and no force (the read succeeded and the caller knows
+# the text is a real pg_settings/ALTER SYSTEM result, which cannot contain a
+# DSN) is flattened and printed as before, on or off Actions.
+p1_diag() {
+  local rc="$1" text="$2" force="${3:-}"
+  if [[ "$rc" == "0" && -z "$force" ]]; then
+    p1_flatten "$text"
+    return
+  fi
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "psql rc=${rc} (diagnostic withheld under Actions: psql may echo DSN credential material)"
+  else
+    echo "psql rc=${rc}: $(p1_flatten "$text")"
+  fi
 }
 
 # p1_conform <dsn> — read -> decide -> heal -> bounded re-read the
@@ -178,7 +213,7 @@ p1_conform() {
   rc=0
   rows="$(p1_psql "$dsn" -tA -c "$q" 2>&1)" || rc=$?
   if [[ "$rc" != "0" ]]; then
-    echo "::error::ensure-postgres: durability read failed on ${hp} (${dsn_redacted}): $(p1_flatten "$rows")" >&2
+    echo "::error::ensure-postgres: durability read failed on ${hp} (${dsn_redacted}): $(p1_diag "$rc" "$rows")" >&2
     return 1
   fi
 
@@ -193,7 +228,7 @@ p1_conform() {
       ;;
     drift*)
       if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-        echo "::warning::ensure-postgres: ${decision#drift } not off on ${hp} — NOT healing (heal runs only under GitHub Actions, against a loopback host, with the manifest-vouched YUZU_CI_PSQL); for a disposable CI cluster tune it via ALTER SYSTEM ... = off + SELECT pg_reload_conf()." >&2
+        echo "::warning::ensure-postgres: ${decision#drift } not off on ${hp} — NOT healing (heal runs only under GitHub Actions, against a loopback host, with the manifest-vouched YUZU_CI_PSQL); for a disposable CI cluster tune it via ALTER SYSTEM ... = off + SELECT pg_reload_conf(). (psql source: ${P1_PSQL_SRC}, host: ${hp%%:*})" >&2
       else
         echo "ensure-postgres: note — ${decision#drift } not off on ${hp}; the [pg] shard runs with full durability (expected for a non-CI cluster; not healing)." >&2
       fi
@@ -208,7 +243,7 @@ p1_conform() {
         -c 'ALTER SYSTEM SET full_page_writes = off' \
         -c 'SELECT pg_reload_conf()' 2>&1)" || rc=$?
       if [[ "$rc" != "0" ]]; then
-        echo "::error::ensure-postgres: heal failed on ${hp}: $(p1_flatten "$rows")" >&2
+        echo "::error::ensure-postgres: heal failed on ${hp}: $(p1_diag "$rc" "$rows")" >&2
         return 1
       fi
       # pg_reload_conf() only signals the postmaster; SIGHUP handling (and,
@@ -223,11 +258,16 @@ p1_conform() {
         fi
         sleep $((1 * P1_SLEEP_SCALE))
       done
-      echo "::error::ensure-postgres: ${hp} still not durability-off 5s after heal ($(p1_flatten "$rows")) — check pg_settings.source (a per-role/per-database override or command-line -c beats ALTER SYSTEM); re-provision." >&2
+      echo "::error::ensure-postgres: ${hp} still not durability-off 5s after heal ($(p1_diag "$rc" "$rows")) — check pg_settings.source (a per-role/per-database override or command-line -c beats ALTER SYSTEM); re-provision." >&2
       return 1
       ;;
     fail*)
-      echo "::error::ensure-postgres: durability settings unreadable on ${hp} (${decision#fail }): $(p1_flatten "$rows")" >&2
+      # rc is guaranteed 0 here (a non-zero initial read already returned
+      # above) but the text is by definition NOT a well-formed pg_settings
+      # read (that is why decide classified it "fail") — force the same
+      # Actions-gated withholding p1_diag applies to a genuine psql failure,
+      # rather than trusting rc==0 to mean "safe to print raw".
+      echo "::error::ensure-postgres: durability settings unreadable on ${hp} (${decision#fail }): $(p1_diag "$rc" "$rows" 1)" >&2
       return 1
       ;;
     *)

@@ -233,6 +233,7 @@ err="$(cat "$state/stderr")"
 calls="$(cat "$state/calls.log")"
 expect "drift-not-healed" "rc" "0" "$RC"
 expect_contains "drift-not-healed" "stderr" "NOT healing" "$err"
+expect_contains "drift-not-healed" "stderr" "psql source: path" "$err"
 expect_contains "drift-not-healed" "stdout" "YUZU_TEST_POSTGRES_DSN=${DSN0}" "$OUT"
 expect_not_contains "drift-not-healed" "calls.log" "ALTER SYSTEM issued" "$calls"
 
@@ -246,7 +247,7 @@ expect_contains "non-ci-note" "stderr" "note —" "$err"
 expect_not_contains "non-ci-note" "stderr" "::warning" "$err"
 expect_contains "non-ci-note" "stdout" "YUZU_TEST_POSTGRES_DSN=${DSN0}" "$OUT"
 
-# ── 5. read fails ────────────────────────────────────────────────────────
+# ── 5. read fails (under Actions: raw psql diagnostic withheld) ────────────
 N=$((N + 1))
 state="$(new_state 2 "$CAP_REFUSED" '' '' '')"
 invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
@@ -257,8 +258,35 @@ expect_not_contains "read-fails" "stdout" "YUZU_TEST_POSTGRES_DSN=" "$OUT"
 expect "read-fails" "::error:: line count" "1" "$(grep -c '^::error::' "$state/stderr")"
 error_line="$(grep '^::error::' "$state/stderr")"
 expect_contains "read-fails" "::error:: line" "durability read failed" "$error_line"
-expect_contains "read-fails" "::error:: line" "Is the server running" "$error_line"
-expect "read-fails" "no tab-indented stderr line" "0" "$(grep -c $'^\t' "$state/stderr")"
+expect_contains "read-fails" "::error:: line" "psql rc=2" "$error_line"
+expect_not_contains "read-fails" "::error:: line" "Is the server running" "$error_line"
+expect "read-fails" "no tab byte anywhere in the ::error:: line" "0" "$(grep -c $'\t' <<<"$error_line")"
+
+# ── 5b. read fails outside Actions — raw diagnostic RETAINED (developer
+#        shells still get the real psql text, only public Actions
+#        annotations withhold it) ───────────────────────────────────────────
+N=$((N + 1))
+state="$(new_state 2 "$CAP_REFUSED" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' '' "$DSN0" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "read-fails-no-actions" "rc" "1" "$RC"
+expect_contains "read-fails-no-actions" "stderr" "durability read failed" "$err"
+expect_contains "read-fails-no-actions" "stderr" "Is the server running" "$err"
+expect_not_contains "read-fails-no-actions" "stdout" "YUZU_TEST_POSTGRES_DSN=" "$OUT"
+
+# ── 5c. malformed-URI password never reaches stderr under Actions ──────────
+# Real psql (18.6) on an invalid percent-encoded DSN password exits 2 and
+# echoes the offending token verbatim: `psql: error: invalid percent-encoded
+# token: "codex_secret_%ZZ"`. Fake psql stands in for that exact capture.
+N=$((N + 1))
+CAP_BADURI='psql: error: invalid percent-encoded token: "codex_secret_%ZZ"'
+DSN_BADURI='postgresql://alice:codex_secret_%ZZ@127.0.0.1:55439/postgres'
+state="$(new_state 2 "$CAP_BADURI" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN_BADURI" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "malformed-uri-withheld" "rc" "1" "$RC"
+expect_not_contains "malformed-uri-withheld" "stderr" "codex_secret_%ZZ" "$err"
+expect_contains "malformed-uri-withheld" "stderr" "psql rc=2" "$err"
 
 # ── 6. heal fails ────────────────────────────────────────────────────────
 N=$((N + 1))
