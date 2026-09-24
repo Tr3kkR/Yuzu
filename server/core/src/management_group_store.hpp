@@ -112,7 +112,24 @@ public:
                                                 const std::string& agent_id);
     std::expected<void, std::string> remove_member(const std::string& group_id,
                                                    const std::string& agent_id);
+    /// LEGACY fail-soft: `get_members_checked(group_id).value_or({})` — a
+    /// store-not-open / pool-acquire-timeout / query-error degrade renders as
+    /// an empty vector, INDISTINGUISHABLE from a genuinely empty group (#1762).
+    /// Every caller here is render-only / deny-or-benign display (dashboard
+    /// fragments, dispatch-scope resolution, the deny-or-benign consumers
+    /// still counted below) that predates the degrade-distinguishable twin.
+    /// Prefer `get_members_checked` for NEW code, especially anything that
+    /// would otherwise render a degrade as "0 members" (the #1762 shape).
     std::vector<ManagementGroupMember> get_members(const std::string& group_id) const;
+
+    /// Degrade-distinguishable twin of `get_members()` (#1762): `nullopt` on
+    /// store-not-open / pool-acquire-timeout / query-error (each bumps
+    /// `yuzu_server_mgmt_group_read_degrade_total{reason=...}`, matching
+    /// `get_agent_groups`/`get_ancestor_ids` below) so a caller that needs to
+    /// tell "the read failed" apart from "the group has zero members" can fail
+    /// closed instead of rendering the degrade as an empty cohort.
+    [[nodiscard]] std::optional<std::vector<ManagementGroupMember>>
+    get_members_checked(const std::string& group_id) const;
 
     /// CONFINEMENT read (ADR-0042): the management groups an agent belongs to.
     /// Feeds `RbacStore::check_scoped_permission`'s reachable-set build. Returns

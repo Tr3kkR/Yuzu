@@ -2992,11 +2992,17 @@ groups:
             zero-result inventory answer while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuMgmtGroupReadDegraded
-        # A CONFINEMENT-feeding management-group hierarchy read (ancestors /
-        # descendants / agent-groups, ADR-0042) degraded, so the caller failed
-        # closed to DenyAll. This is the confinement substrate itself faulting,
-        # not the fleet shrinking: a fired alert means SCOPED operators see
-        # reduced/empty lists, NOT that groups were deleted. Same dashboard-
+        # A CONFINEMENT-feeding management-group read (ancestors / descendants /
+        # agent-groups / member resolution, ADR-0042 + #1762) degraded. Three
+        # shapes share this one counter, by caller: (1) the confinement
+        # hierarchy reads fail closed to DenyAll; (2) a checked member read
+        # (get_members_checked, e.g. the DEX app-perf group trend / /auto
+        # VERIFY compare) surfaces the degrade as a 503/degraded result to its
+        # caller; (3) the LEGACY get_members() wrapper still renders the SAME
+        # degrade as an empty member list to its render-only callers (dashboard
+        # fragments, dispatch-scope resolution) — this is deliberate fail-soft
+        # behaviour there, not a bug, but it is why a fired alert must not be
+        # read as "groups were deleted" or "the fleet shrank". Same dashboard-
         # invisibility as YuzuInventoryReadDegraded — /readyz stays green under
         # pure pool saturation, so only the store-specific counter moves.
         # reason = store_not_open | pool_acquire_timeout | query_error.
@@ -3009,14 +3015,18 @@ groups:
           summary: "Management-group confinement reads degrading ({{ $labels.reason }})"
           description: >-
             yuzu_server_mgmt_group_read_degrade_total{reason="{{ $labels.reason }}"}
-            is non-zero: a confinement-feeding hierarchy read degraded and the
-            caller failed closed to DenyAll. This is a confinement-substrate
-            degrade — scoped operators now see REDUCED or EMPTY lists, it does
-            NOT mean management groups shrank or devices left the fleet.
-            pool_acquire_timeout/query_error correlate with yuzu_pg_* saturation
-            or outage; store_not_open means the store failed to open at boot. Do
-            not read a scoped operator's short/empty list as authoritative while
-            this fires.
+            is non-zero: a confinement-feeding management-group read degraded.
+            Depending on the caller this means the caller failed closed to
+            DenyAll, returned a degraded/503 result to its own caller (e.g. the
+            DEX app-perf group trend or /auto VERIFY compare), or — for the
+            legacy get_members() wrapper's render-only callers — received an
+            empty member list rather than the group's real membership. This is
+            a confinement-substrate degrade, it does NOT mean management groups
+            shrank or devices left the fleet. pool_acquire_timeout/query_error
+            correlate with yuzu_pg_* saturation or outage; store_not_open means
+            the store failed to open at boot. Do not read a scoped operator's
+            short/empty list, or an empty app-perf/VERIFY cohort, as
+            authoritative while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuAnalyticsStoreNotOpen
         # AnalyticsEventStore (ADR-0049) failed to open at boot and is

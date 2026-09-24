@@ -1946,9 +1946,10 @@ public:
         metrics_.describe("yuzu_server_mgmt_group_read_degrade_total",
                           "Management-group confinement reads (get_agent_groups / "
                           "get_ancestor_ids / get_descendant_ids / get_member_agents_in_subtrees "
-                          "/ get_assignments_for_principal / get_visible_agents) that returned a "
-                          "degrade (nullopt/DenyAll) rather than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error)",
+                          "/ get_assignments_for_principal / get_visible_agents / "
+                          "get_members_checked, incl. the legacy get_members() wrapper — "
+                          "#1762) that returned a degrade (nullopt/DenyAll) rather than a "
+                          "result, by reason (store_not_open/pool_acquire_timeout/query_error)",
                           "counter");
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", reason}});

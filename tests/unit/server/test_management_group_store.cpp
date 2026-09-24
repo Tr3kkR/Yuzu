@@ -859,3 +859,22 @@ TEST_CASE("ManagementGroupStore: confinement reads degrade-distinguishable when 
     CHECK(empty->empty());
 }
 
+// #1762: a member-read degrade must be distinguishable from a genuinely
+// empty group. get_members_checked() reports the degrade (nullopt); the
+// LEGACY get_members() stays fail-soft (empty vector) for its render-only
+// callers, but MUST NOT be mistaken for "the group has zero members" by any
+// caller that needs to fail closed instead (dex_perf_api's group_trend,
+// verify_api's compare — both now use get_members_checked).
+TEST_CASE("ManagementGroupStore: get_members_checked degrades on a closed store, "
+         "get_members stays fail-soft (#1762)",
+         "[management_group][degrade]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(!store.is_open());
+
+    CHECK(!store.get_members_checked("group-x").has_value());
+    // The legacy wrapper renders the SAME degrade as an empty vector — that is
+    // the documented fail-soft behaviour, not a regression.
+    CHECK(store.get_members("group-x").empty());
+}
+
