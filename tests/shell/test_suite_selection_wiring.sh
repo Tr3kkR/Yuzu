@@ -236,6 +236,12 @@ pr agent     'printf "// more\n" >> tests/unit/test_a.cpp'
 chain "an agent test alone skips the server family"            true  "true false"
 pr server    'printf "int y;\n" >> server/core/src/x.cpp'
 chain "server code alone skips the agent family"               true  "false true"
+# a path is data: printed with a prefix, so a file named like a workflow command cannot become one
+pr inject    'printf "x\n" > "::warning title=injected::x"'
+run_body "$REPO" "$BODY/prpaths.sh" GITHUB_SHA="$MERGE" PR_HEAD_SHA="$PR_HEAD" RUNNER_TEMP="$RT" GITHUB_OUTPUT="$TMP/o_paths"
+check "chain         a path is never printed at the start of a line" "0|1" \
+  "$(grep -c '^::warning title=injected' "$TMP/out")|$(grep -c '^- ::warning title=injected::x$' "$TMP/out")"
+fgit checkout -q base
 # binding failures: the list is refused, and both gates fail closed
 pr bind      'printf "more\n" >> docs/guide.md'
 chain "a PR head that is not the merge's second parent fails closed" true "false false" "$MERGE" "$(fgit rev-parse base)"
