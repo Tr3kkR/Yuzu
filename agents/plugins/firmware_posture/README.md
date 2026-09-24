@@ -44,7 +44,7 @@ flowchart LR
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
 - **`firmware` / macOS** — verified on Apple Silicon only (Mac16,10, macOS 26.6.2): there IODeviceTree:/rom does not exist and the version is IODeviceTree:/chosen system-firmware-version (an iBoot tag such as mBoot-18000.161.10, not a BIOS date); the Intel /rom version/release-date/vendor keys are UNVERIFIED on hardware. release_date reads absent on Apple Silicon and update_pending is not reported
-- **`firmware` / Linux** — the fwupd leg needs libsystemd at build time (a system dependency, never vcpkg); without it update_pending reads unreadable with the fwupd:not_built token and the sysfs rows remain. Hosts without DMI (containers, some VMs) report the DMI fields absent and hosts whose bus is reachable but has no fwupd daemon report update_pending unavailable: neither is a failure. A host where the system bus cannot be opened at all (a container without the bus socket) reads update_pending unreadable with `fwupd:bus_open:enoent`, because that proves only that the bus is unreachable, not that fwupd is absent. The populated-DMI shape is not captured from a physical Linux host
+- **`firmware` / Linux** — the fwupd leg needs libsystemd at build time (a system dependency, never vcpkg); without it update_pending reads unreadable with the fwupd:not_built token and the sysfs rows remain. Hosts without DMI (containers, some VMs) report the DMI fields absent and hosts without the fwupd daemon report update_pending unavailable: neither is a failure. The populated-DMI shape is not captured from a physical Linux host
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -126,15 +126,16 @@ firmware|model|Mac16,10|sysctl
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash e3b945e9e6db
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-24 · euid 0 · leg-hash e3b945e9e6db
 
 ```
 == action=firmware
 firmware|vendor|absent|dmi
 firmware|version|absent|dmi
 firmware|release_date|absent|dmi
-firmware|update_pending|unavailable|fwupd
-[result_status] OK / FULL
+firmware|update_pending|unreadable|fwupd
+[result_status] CONSTRAINED / PARTIAL / fwupd:bus_open:enoent
+[rc] 1
 ```
 <!-- END GENERATED -->
 
