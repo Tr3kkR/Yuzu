@@ -346,12 +346,13 @@ template <typename StatfsFn>
 }
 
 /// The errno a leaf open() failure resolves to, once the surface check (run only when the leaf
-/// itself reported ENOENT) is in hand. A refused surface probe reports ITS OWN refusal untouched
-/// -- never remapped, never downgraded to "unconfirmed" -- because a denial is the strongest
-/// signal available and collapsing it into ENODEV is exactly the false-CONSTRAINED-instead-of-
-/// PERMISSION_DENIED defect this function exists to close. Every other open() errno (including a
-/// non-refused, non-ENOENT surface outcome, which never reaches here) passes through
-/// remap_enoent_for_surface unchanged from before.
+/// itself reported ENOENT) is in hand. A non-ENOENT open() errno returns untouched: the surface
+/// was never consulted, so it never reaches remap_enoent_for_surface. A refused surface probe
+/// reports ITS OWN refusal untouched -- never remapped, never downgraded to "unconfirmed" --
+/// because a denial is the strongest signal available and collapsing it into ENODEV is exactly
+/// the false-CONSTRAINED-instead-of-PERMISSION_DENIED defect this function exists to close. Only
+/// a non-refused surface outcome (confirmed procfs, or nothing confirmed) reaches
+/// remap_enoent_for_surface, unchanged from before.
 [[nodiscard]] constexpr int resolve_leaf_errno(int open_errno, SurfaceCheck surface) noexcept {
     if (open_errno != ENOENT) return open_errno;
     if (surface.refused_errno != 0) return surface.refused_errno;
