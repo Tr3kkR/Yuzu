@@ -1968,14 +1968,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             audit_log_for_principal(
                 req, "auth.breakglass.denied", "denied", username,
                 auth::role_to_string(*role_opt), "User", username,
-                "break-glass login refused: no MFA enrolled (enrollment not offered — re-enroll "
-                "out of band)");
+                "break-glass login refused: no MFA enrolled (enrollment not offered — see the "
+                "break-glass section of docs/ops-runbooks/auth-db-recovery.md)");
             emit_event("auth.breakglass.denied", req,
                        {{"source_ip", req.remote_addr}, {"username", username}}, {},
                        Severity::kCritical);
             spdlog::error("BREAK-GLASS login DENIED for '{}' (source {}): no MFA enrolled — "
                           "refusing to offer enrollment (would defeat the second factor). "
-                          "Re-enroll the break-glass account out of band.",
+                          "Re-enroll it per the break-glass section of "
+                          "docs/ops-runbooks/auth-db-recovery.md.",
                           username, req.remote_addr);
             return;
         }
