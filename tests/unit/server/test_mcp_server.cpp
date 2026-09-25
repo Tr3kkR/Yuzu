@@ -8410,11 +8410,14 @@ TEST_CASE("MCP C8: create_result_set_from_inventory_query is denied for a "
     ts.mock_token_scope_service = "printers";
     ts.metrics_for_test = &reg;
     // A captured bool, not a Catch2 FAIL() inside the lambda: the dispatcher
-    // likely wraps tool bodies in a catch(...) boundary, and even if it
-    // didn't, a Catch2 assertion off the request-handling thread is UB. The
-    // reached flag is checked on the test thread after the call returns,
-    // matching this file's own established idiom (see e.g. `last_scoped_agent`
-    // a few hundred lines above).
+    // likely wraps tool bodies in a catch(...) boundary, which would silently
+    // swallow an in-lambda FAIL() and turn a real regression into a quiet
+    // pass. The reached flag is checked on the test thread after the call
+    // returns, matching this file's own established idiom (see e.g.
+    // `last_scoped_agent` a few hundred lines above). McpTestServer::call()
+    // invokes the handler synchronously on the test thread (no cross-thread
+    // hazard here), so the swallowed-assertion risk above is the reason for
+    // this idiom, not a thread-safety one.
     bool fleet_read_fn_reached = false;
     ts.fleet_read_fn_for_test = [&fleet_read_fn_reached](
                                     const httplib::Request&, httplib::Response&,
