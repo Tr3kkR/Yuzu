@@ -1856,6 +1856,15 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
     // past the stale-serve bound: enforcement is in effect because the view
     // is genuinely degraded, not merely aging within tolerance.
     CHECK(rbac_enforcement_in_effect(&replica_b));
+
+    // A3 (governance round 3, SHOULD-4): the NEW three-way label must land
+    // on kDegraded here, never kDisabled — this is the cached-DISABLED,
+    // genuinely-stale branch (the pool is STILL starved, `held` never
+    // released), as opposed to the sibling cached-ENABLED-stale test above
+    // that documents the short-circuit asymmetry. rbac_enforcement_label()
+    // mirrors rbac_enforcement_in_effect()'s own branch order exactly, so
+    // this is the same degrade this test already proved, split three ways.
+    CHECK(rbac_enforcement_label(&replica_b) == RbacEnforcementLabel::kDegraded);
 }
 
 // G11-CPPEXPERT-B2 (#2703 Gate 8, fixed): the sibling test above proves

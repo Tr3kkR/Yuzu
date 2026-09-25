@@ -137,10 +137,11 @@ public:
     /// `frozen_population` — ALL in one transaction. `title`/`created_by`
     /// must be non-empty. `rbac_enforcement` must be exactly one of
     /// `"enabled"`/`"disabled"`/`"degraded"` (A3 — the caller computes this
-    /// via `access_review_model::access_review_rbac_enforcement` from the
-    /// SAME `RbacStore` read used to build `frozen_population`, and passes
-    /// it in; this store has no `RbacStore*` of its own and never derives
-    /// authorization state itself) — an empty or unrecognised value is
+    /// via `access_review_model::access_review_rbac_enforcement` on the same
+    /// `RbacStore` INSTANCE used to build `frozen_population`, read
+    /// immediately afterward — a separate, later call, not the same read —
+    /// and passes it in; this store has no `RbacStore*` of its own and never
+    /// derives authorization state itself) — an empty or unrecognised value is
     /// rejected, mirroring `record_attestation`'s `decision` validation; the
     /// column's own `""` default exists ONLY for rows frozen before this
     /// field existed (schema migration 2), never as a value a live caller

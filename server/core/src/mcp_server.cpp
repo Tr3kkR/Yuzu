@@ -2788,7 +2788,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
@@ -2798,7 +2798,7 @@ static const ToolDef kTools[] = {
      "a campaign opened before this field existed). Mirrors GET /api/v1/access-reviews. "
      "Self-audited as access_review.list. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}}},"required":["count","campaigns"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}}},"required":["count","campaigns"]})j"},
 
     {"close_access_review",
      "Close an open review campaign. Does NOT require every attestation to be decided "
@@ -23622,7 +23622,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // body instead, never silently swallowed.
                 const bool audit_ok = audit_fn(req, "access_review.exported", "success",
                                                "AccessReview", "",
-                                               "rows=" + std::to_string(rows.size()));
+                                               "rows=" + std::to_string(rows.size()) +
+                                                   " rbac_enforcement=" + rbac_enforcement);
                 JObj payload;
                 payload.add("count", static_cast<int64_t>(rows.size()))
                     .raw("rows", arr.str())
@@ -23670,7 +23671,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // A3 (RBAC delivery plan) — see the REST twin's identical comment.
+                // A3 (RBAC delivery plan): the enforcement state stamped onto this
+                // campaign row at freeze time — computed from the same RbacStore
+                // instance, read immediately after the grant population above (a
+                // separate, later call, not the same read). Mirrors the REST
+                // twin's identical comment.
                 const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
 
                 // Expand each row to one GrantRef per (principal, role) — the shape
@@ -23711,7 +23716,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const bool audit_ok =
                     audit_fn(req, "access_review.campaign_opened", "success", "AccessReview",
-                            *open_res, "grants=" + std::to_string(frozen.size()));
+                            *open_res, "grants=" + std::to_string(frozen.size()) +
+                                           " rbac_enforcement=" + rbac_enforcement);
                 JObj payload;
                 payload.add("campaign_id", *open_res)
                     .add("grant_count", static_cast<int64_t>(frozen.size()));

@@ -1488,17 +1488,8 @@ RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
     return RbacEnforcementLabel::kDisabled;
 }
 
-std::string_view to_string(RbacEnforcementLabel label) noexcept {
-    switch (label) {
-    case RbacEnforcementLabel::kEnabled:
-        return "enabled";
-    case RbacEnforcementLabel::kDisabled:
-        return "disabled";
-    case RbacEnforcementLabel::kDegraded:
-        return "degraded";
-    }
-    return "degraded"; // unreachable for a valid enumerator; fail closed on the label too
-}
+// to_string(RbacEnforcementLabel) is constexpr and header-inline (rbac_store.hpp) —
+// matches every other enum-to-string mapper in this codebase.
 
 // ── Roles CRUD ───────────────────────────────────────────────────────────────
 

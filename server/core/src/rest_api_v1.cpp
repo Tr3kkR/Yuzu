@@ -6830,7 +6830,8 @@ void RestApiV1::register_routes(
             try {
                 audit_emitted =
                     audit_fn(req, "access_review.exported", "success", "AccessReview", "",
-                            "format=" + format + " rows=" + std::to_string(rows.size()));
+                            "format=" + format + " rows=" + std::to_string(rows.size()) +
+                                " rbac_enforcement=" + rbac_enforcement);
             } catch (const std::exception& ex) {
                 spdlog::warn("access_review.exported audit emission threw: {}", ex.what());
             }
@@ -6994,8 +6995,10 @@ void RestApiV1::register_routes(
             }
 
             // A3 (RBAC delivery plan): the enforcement state stamped onto this
-            // campaign row at freeze time — computed from the SAME RbacStore
-            // read used to build the frozen population above, never
+            // campaign row at freeze time — computed from the same RbacStore
+            // INSTANCE, read immediately after the grant population above
+            // (a separate, later call — not the same read; it can trigger
+            // its own maybe_refresh_generation() round-trip), never
             // re-derived on a later read (matches every other frozen field).
             const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
 
@@ -7042,7 +7045,8 @@ void RestApiV1::register_routes(
             try {
                 open_audit_emitted =
                     audit_fn(req, "access_review.campaign_opened", "success", "AccessReview",
-                            *open_res, "grants=" + std::to_string(frozen.size()));
+                            *open_res, "grants=" + std::to_string(frozen.size()) +
+                                           " rbac_enforcement=" + rbac_enforcement);
             } catch (const std::exception& ex) {
                 spdlog::warn("access_review.campaign_opened audit emission threw: {}", ex.what());
             }

@@ -120,10 +120,24 @@ AccRevShared& acc_rev_shared() {
 // constructor's seed_defaults() re-seeds the system roles on an empty
 // table, so this reproduces the same fully-fresh-RBAC-state-per-test
 // guarantee the old per-harness SQLite file gave. rbac_store.securable_types
-// /operations/rbac_meta are static seed data no test mutates, so they're
-// deliberately left alone (mirrors public.schema_meta below). public
-// .schema_meta is deliberately untouched — the clone stays migrated, so the
-// per-harness store ctors find the schema current and skip migration.
+// /operations are static seed data no test mutates, so they're deliberately
+// left alone (mirrors public.schema_meta below). public.schema_meta is
+// deliberately untouched — the clone stays migrated, so the per-harness
+// store ctors find the schema current and skip migration.
+//
+// rbac_store.rbac_meta's `rbac_enabled` row is NOT static — a test that
+// calls RbacStore::set_rbac_enabled(true) (governance round 3 SHOULD-3,
+// the genuinely-ENABLED rbac_enforcement route test) durably flips it, and
+// TRUNCATE above never reaches rbac_meta (it isn't in that list, and
+// row_meta is a key/value table shared with write_generation/backfill
+// markers, not something to TRUNCATE wholesale). Reset the ONE key tests
+// actually toggle back to the fresh-install default explicitly, in its own
+// statement (PQexecParams is single-command-only, so this cannot ride the
+// TRUNCATE above) — every harness's freshly-constructed RbacStore reads
+// this durable row at its own first refresh, so this single UPDATE is
+// sufficient; no generation bump is needed (there is no PRE-EXISTING
+// in-process RbacStore instance whose cache this must invalidate — each
+// harness constructs its own).
 void acc_rev_reset() {
     auto lease = acc_rev_shared().pool->acquire();
     REQUIRE(lease);
@@ -137,6 +151,13 @@ void acc_rev_reset() {
         std::vector<std::string>{});
     INFO("[acc_rev_reset] " << PQresultErrorMessage(trunc.get()));
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+
+    auto reset_enabled = yuzu::server::pg::exec_params(
+        lease.get(),
+        "UPDATE rbac_store.rbac_meta SET value = 'false' WHERE key = 'rbac_enabled'",
+        std::vector<std::string>{});
+    INFO("[acc_rev_reset:rbac_enabled] " << PQresultErrorMessage(reset_enabled.get()));
+    REQUIRE(reset_enabled.status() == PGRES_COMMAND_OK);
 }
 
 struct AuditRecord {
@@ -1074,6 +1095,43 @@ TEST_CASE("GET /access-reviews/{id} and GET .../export: rbac_enforcement is pres
     REQUIRE(get_res->status == 200);
     auto get_body = nlohmann::json::parse(get_res->body);
     CHECK(get_body["data"]["campaign"]["rbac_enforcement"] == "disabled");
+}
+
+// Governance round 3 SHOULD-3: every other route-level rbac_enforcement
+// assertion in this file exercises only the harness's "disabled" default —
+// the classifier itself is exhaustively unit-tested (test_rbac_store.cpp),
+// and the wiring has been read-reviewed, but the actual end-to-end
+// route -> handler -> field path for a genuinely ENABLED store was
+// previously unverified by any test. `h.rbac->set_rbac_enabled(true)` is
+// safe here: this harness's permission gate is `perm_override`
+// (test-controlled), entirely independent of the real RBAC engine, so
+// toggling the store's enabled flag changes ONLY the derived
+// rbac_enforcement label, never what the harness permits.
+TEST_CASE("rbac_enforcement reflects a genuinely ENABLED store across REST JSON, REST CSV, "
+         "and an MCP tool",
+         "[pg][access_review][rest][mcp]") {
+    AccessReviewHarness h;
+    h.rbac->set_rbac_enabled(true);
+    REQUIRE(h.rbac->is_rbac_enabled());
+
+    auto json_res = h.sink.Get("/api/v1/access-reviews/export");
+    REQUIRE(json_res);
+    REQUIRE(json_res->status == 200);
+    auto json_body = nlohmann::json::parse(json_res->body);
+    CHECK(json_body["rbac_enforcement"] == "enabled");
+
+    auto csv_res = h.sink.Get("/api/v1/access-reviews/export?format=csv");
+    REQUIRE(csv_res);
+    REQUIRE(csv_res->status == 200);
+    CHECK(csv_res->body.starts_with("# rbac_enforcement=enabled\r\n"
+                                    "principal_type,principal_id,"));
+
+    auto mcp_res = h.mcp_call_tool("export_access_review", nlohmann::json::object());
+    REQUIRE(mcp_res);
+    CHECK(mcp_res->status == 200);
+    auto mcp_body = nlohmann::json::parse(mcp_res->body);
+    REQUIRE(mcp_body.contains("result"));
+    CHECK(mcp_body["result"]["structuredContent"]["rbac_enforcement"] == "enabled");
 }
 
 TEST_CASE("GET /access-reviews: 403 without AccessReview:Read", "[pg][access_review][rest][list]") {

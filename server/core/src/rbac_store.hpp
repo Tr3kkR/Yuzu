@@ -571,8 +571,23 @@ enum class RbacEnforcementLabel {
 /// "enabled" | "disabled" | "degraded" — the wire/DB string form of
 /// `RbacEnforcementLabel`, used verbatim as the access-review export's
 /// `rbac_enforcement` field and the frozen campaign row's column of the same
-/// name (`access_review_store.hpp`).
-[[nodiscard]] std::string_view to_string(RbacEnforcementLabel label) noexcept;
+/// name (`access_review_store.hpp`). `constexpr`, header-inline — matches
+/// every other enum-to-string mapper in this codebase
+/// (`authz_model.hpp::to_string(Operation/McpTierClass/RiskTier)`,
+/// `agent_registry.hpp::to_string(DispatchDenialReason)`,
+/// `schedule_params_parsers.hpp::to_string(ScheduleParamsError)`); nothing
+/// here depends on anything not visible at header-parse time.
+[[nodiscard]] constexpr std::string_view to_string(RbacEnforcementLabel label) noexcept {
+    switch (label) {
+    case RbacEnforcementLabel::kEnabled:
+        return "enabled";
+    case RbacEnforcementLabel::kDisabled:
+        return "disabled";
+    case RbacEnforcementLabel::kDegraded:
+        return "degraded";
+    }
+    return "degraded"; // unreachable for a valid enumerator; fail closed on the label too
+}
 
 /// Build the `groups.name` used for an IdP-sourced group: `source:external_id`.
 /// `source == "local"` groups are NOT namespaced — returns `external_id`

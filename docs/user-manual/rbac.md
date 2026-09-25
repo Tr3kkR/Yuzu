@@ -237,6 +237,43 @@ See `docs/auth-architecture.md` → "The authorization topology floor
 `docs/security-reviews/authz-topology-floor-2026-08-05.md` for the recorded
 decision (including what was deliberately excluded from the floor and why).
 
+**The access-review export's `rbac_enforcement` stamp inherits this same
+degrade-vs-outage ambiguity — read this if you're relying on it as
+evidence.** `enabled`/`disabled`/`degraded` (full description:
+`rest-api.md` → the `GET /api/v1/access-reviews/export` section) is derived
+from the identical fail-closed machinery this whole section describes — a
+replica whose generation refresh has failed reports `degraded`, same as a
+replica whose RBAC store is unreachable. **Correlate against
+`yuzu_server_rbac_read_degrade_total{reason=~"generation_refresh_failed.*"}`**
+(and the narrower `stale_beyond_accepted_bound` reason) if you need to
+distinguish "the store genuinely couldn't confirm state at pull time" from
+"an administrator turned RBAC on/off" — the stamp alone cannot make that
+distinction for you.
+
+**The frozen campaign row is a strictly worse case than the live export.**
+`GET .../export` recomputes `rbac_enforcement` fresh on every pull — a
+transient degrade self-corrects the next time someone re-runs the export.
+`POST /api/v1/access-reviews` (opening a review campaign) computes the
+stamp **once**, at open time, and — per this feature's deliberate no-prune
+retention policy — that campaign row persists **indefinitely**. A
+`degraded` (or, on the cached-enabled short-circuit documented in
+`rest-api.md`, an `enabled`) stamp recorded during a transient partition is
+therefore **permanent evidence with no later self-correction**: re-reading
+the same closed campaign always returns the value frozen at open, never a
+retry. If a campaign was opened during a known RBAC-store incident, treat
+its `rbac_enforcement` value as suspect and open a fresh campaign once the
+store is confirmed healthy, rather than trusting the frozen one.
+
+**This is an evidence-confidence gap, never a security-control failure.**
+A stale or degraded `rbac_enforcement` reading never weakens actual
+authorization — `check_permission`/`check_scoped_permission` independently
+deny on the exact same degraded view (deny-on-degrade, ADR-0041, as
+described throughout this section); nothing about the access-review stamp
+being wrong changes what a real request is allowed to do. The risk is
+purely that an auditor reading the export or a closed campaign draws the
+wrong conclusion about what state RBAC was in — not that access control
+itself misbehaves.
+
 ## Concepts
 
 | Concept | Description |
