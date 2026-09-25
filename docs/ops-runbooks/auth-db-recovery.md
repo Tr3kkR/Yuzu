@@ -357,7 +357,6 @@ sudo -u _yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
   --postgres-dsn "$YUZU_POSTGRES_DSN" \
   --ca-dir /etc/yuzu/certs \
-  --data-dir /var/lib/yuzu \
   --mfa-reset alice
 # {"status":"ok","user":"alice","action":"mfa.reset.breakglass"}
 ```
@@ -369,23 +368,11 @@ sudo -u _yuzu yuzu-server \
   anymore. Point `--postgres-dsn` at the real production database or the row
   lands somewhere nobody is looking (SOC 2 CC6.6), same risk as before, wrong
   flag.
-- `--data-dir` is still required, but for a narrower reason than it used to
-  be: it is where this one-shot looks for a **legacy** `audit.db` to migrate
-  from (`<data-dir>/audit.db`), not where it writes to. Pass the same
-  directory the running service uses so the one-shot sees the same legacy
-  file (or its absence) that a real boot would.
-- **One-shot lockout on a never-booted host.** This command refuses — it does
-  NOT silently skip the check — if the mandatory legacy backfill has not
-  completed on `--postgres-dsn` yet (no `backfill_complete` marker in
-  `audit_store.audit_retention_meta`). A one-shot is deliberately not trusted
-  to declare "no legacy trail exists" on its own (ADR-0040: only a server
-  boot may do that), so on a database that has never seen a successful server
-  boot, `--mfa-reset` and `--break-glass-arm` both fail with "refusing to
-  declare the backfill complete from this entry point... Start the server
-  once, then retry." That IS the remediation: start `yuzu-server` normally
-  once (it completes the backfill — real migration or fresh-install stamp —
-  on its own boot path, which this one-shot deliberately cannot do), stop it,
-  then re-run the one-shot command.
+- `--data-dir` is not needed. There is no legacy `audit.db` backfill gate any
+  more (retired by the ADR-0009 hard cutover, 2026-09-04), so the one-shot also
+  works on a database that has never seen a server boot. If a data directory
+  is set (`--data-dir` or `YUZU_DATA_DIR`), it is still created and checked
+  writable, and a failure there aborts the command.
 - `--ca-dir` is required whenever the KEK is not in the platform default
   location, because the command builds the full auth stack (pool → key
   provider → codec → AuthDB) exactly as the server does.
@@ -454,7 +441,6 @@ sudo -u _yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
   --postgres-dsn "$YUZU_POSTGRES_DSN" \
   --ca-dir /etc/yuzu/certs \
-  --data-dir /var/lib/yuzu \
   --break-glass-user alice \
   --break-glass-arm
 # → arms the named --break-glass-user for --break-glass-window-secs
@@ -469,13 +455,13 @@ whatever the running service passes in its unit file. Omit it and the command
 exits non-zero with `error: --break-glass-arm requires --break-glass-user`,
 arming nothing.
 
-Arming is fail-closed on audit: the store is checked writable *before* the
-mutate, and if the row fails to persist afterwards the arm is rolled back
-(the account ends up NOT armed). That makes the `--postgres-dsn` note above
+Arming is fail-closed on audit: the audit store is checked reachable and
+migrated *before* the mutate, and if the row fails to persist afterwards the
+arm is rolled back (the account ends up NOT armed). If the rollback also fails,
+the command exits non-zero and says so on stderr: the account may still be
+armed, with no audit row. That makes the `--postgres-dsn` note above
 load-bearing here too — point it at the real production database, or you
-will arm the glass and record it somewhere nobody is looking. The one-shot
-lockout note above applies here identically: `--break-glass-arm` refuses on
-a never-booted host the same way `--mfa-reset` does, for the same reason.
+will arm the glass and record it somewhere nobody is looking.
 
 Same flag requirements and the same threat model as `--mfa-reset` above. The
 arm is audited at `kCritical` as `auth.breakglass.armed`, attributed to the OS
@@ -487,6 +473,36 @@ The break-glass account **must** have MFA enrolled: boot fails closed if it
 does not, and an un-enrolled break-glass account is hard-denied at login
 (enrolment is never offered on that path, since that would defeat the second
 factor).
+
+To enrol the break-glass account, restart the server with `--auth-mode=standard`
+and sign in as that account. This re-enables local-password login for every local
+account, so keep the window short: on bare metal consider `--web-address
+127.0.0.1`; in a container, restrict the published port instead (the image binds
+0.0.0.0). The break-glass lockout exemption does not apply in standard mode, so
+failed password attempts can lock the account for `--auth-lockout-window-secs`.
+Only with the listener restricted as above, consider `--auth-lockout-threshold=0`
+for the window (it disables throttling for every local account); otherwise an SSO
+admin, if the IdP is up, can clear a lock with `POST /api/v1/users/{name}/unlock`.
+Under
+`--mfa-enforcement=required` the sign-in itself enrols MFA; otherwise enrol at
+Settings → Multi-Factor Authentication, which needs the admin role. For a
+non-admin break-glass account, also pass `--mfa-enforcement=required` for that
+restart, and note that it applies to every user for the window: un-enrolled local
+users are enrolled at login, and SSO users whose IdP sends no `amr` cannot pass
+step-up. Then restore `--auth-mode=sso-only` and your usual `--mfa-enforcement`.
+If the arm has lapsed by then and you still need break-glass access (the IdP is
+still down), re-run `--break-glass-arm`; do not re-arm for a planned rotation.
+The mode switch itself writes no audit row, so record the window in a change
+ticket; the evidence is the startup WARN that `--break-glass-user` is ignored under
+standard mode, the missing sso-only boot banner, the
+`auth.login` and `mfa.enroll.verified` rows inside the window, and the banner
+returning on the final restart.
+
+To rotate the break-glass TOTP, clear it first with `--mfa-reset <user>` (an
+enrolled account gets a challenge at sign-in, not enrolment, and cannot re-enrol
+from Settings), then follow the enrolment sequence above. Do not restart under
+sso-only between the reset and the re-enrolment: boot refuses until the account
+is enrolled again.
 
 ## Locked out by MFA enforcement misconfiguration
 

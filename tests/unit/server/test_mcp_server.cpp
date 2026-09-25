@@ -1530,7 +1530,6 @@ private:
         if (dex_perf_fn_for_test || app_perf_providers_for_test.fleet ||
             app_perf_providers_for_test.apps || app_perf_providers_for_test.device ||
             app_perf_providers_for_test.group || app_perf_providers_for_test.tag_cohort ||
-            app_perf_providers_for_test.tag_values ||
             app_perf_providers_for_test.version_devices)
             mcp.set_dex_perf_api(std::make_shared<yuzu::server::test::FnDexPerfApi>(
                 dex_perf_fn_for_test, app_perf_providers_for_test));
@@ -7573,6 +7572,51 @@ TEST_CASE("MCP DEX: get_dex_device_score returns the shape, confined to THIS dev
             saw_view = true;
     CHECK(saw_view);
     CHECK(ts.audit_log.back() == "mcp.get_dex_device_score|success");
+}
+
+// #4855: a degraded signal-summary read must return a retryable ERROR, never
+// serialize a fabricated healthy score of 100 with no signals. DROP TABLE on
+// a second connection forces a genuine query-level failure while the store
+// stays open (same technique the REST/lens degrade tests use). The
+// behavioral-PII dex.device.view audit row stays "success" (the device WAS
+// accessed on the caller's behalf); the SEPARATE tool-invocation mcp_audit
+// record is what flips to "failure".
+TEST_CASE("MCP DEX: get_dex_device_score on a degraded signal-summary read returns a retryable "
+          "error, never a fabricated healthy score",
+          "[pg][mcp][integration][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":951,"params":{"name":"get_dex_device_score","arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC transport-level 200, error in the body
+    CHECK(res->body.find("\"result\"") == std::string::npos); // no success payload
+    CHECK(res->body.find("DEX store read degraded") != std::string::npos);
+    CHECK(res->body.find("retry_after_ms") != std::string::npos);
+    bool saw_view_success = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.device.view|success")
+            saw_view_success = true;
+    CHECK(saw_view_success); // behavioral-PII audit still records the access
+    CHECK(ts.audit_log.back() == "mcp.get_dex_device_score|failure");
 }
 
 TEST_CASE("MCP DEX: get_dex_device_score scope gate unwired -> fail closed, never global",
@@ -19191,6 +19235,101 @@ TEST_CASE("MCP get_management_group: an oversized group_id is rejected by the #4
               .value() == 1.0);
 }
 
+// Governance round-1 (sec-1/arch-1, #1762): get_management_group used to call
+// the LEGACY fail-soft ManagementGroupStore::get_members(), collapsing a
+// member-table degrade into the same empty vector a genuinely-empty group
+// returns. It now calls get_members_checked() and answers a retryable error
+// instead — same shape as get_dex_device_score's #4855 degrade test above.
+TEST_CASE("MCP get_management_group: a degraded member read fails closed with a retryable "
+          "error, never an authoritative empty member list (#1762)",
+          "[pg][mcp][management_group][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Degrade Tier";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    REQUIRE(store.add_member(*created, "agent-77").has_value());
+
+    // Drop the member table (group metadata stays readable) so
+    // get_members_checked() degrades while get_group() still succeeds.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE management_group_store.management_group_members")};
+        REQUIRE(d.ok());
+    }
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5002,)"
+        R"("params":{"name":"get_management_group","arguments":{"group_id":")" +
+        *created + R"("}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC transport-level 200, error in the body
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "management group store read degraded");
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultShortRetryMs);
+}
+
+// Governance round-2 (G8-1, #1762): get_management_group used to call the
+// LEGACY fail-soft ManagementGroupStore::get_group(), whose nullopt collapses
+// a store-not-open / pool-acquire-timeout / query-error degrade with a
+// genuine "no such group" — so a degraded GROUP-ROW read (not just the member
+// read the round-1 test above covers) reported the SAME "group not found"
+// error as a genuinely nonexistent id. It now calls get_group_checked() and
+// answers the SAME retryable error the member-degrade case does; a genuine
+// not-found still reports "group not found" unchanged.
+TEST_CASE("MCP get_management_group: a degraded GROUP-ROW read fails closed with a retryable "
+          "error, never a flat not-found (#1762 G8-1)",
+          "[pg][mcp][management_group][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Degrade Tier Group Row";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+
+    // Drop the groups table itself (CASCADE also drops the dependent FK
+    // constraints) so get_group_checked() degrades before the tool ever
+    // reaches get_members_checked().
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{PQexec(
+            conn.get(), "DROP TABLE management_group_store.management_groups CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5003,)"
+        R"("params":{"name":"get_management_group","arguments":{"group_id":")" +
+        *created + R"("}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC transport-level 200, error in the body
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "management group store read degraded");
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultShortRetryMs);
+}
+
 TEST_CASE("MCP update_management_group: happy path renames a group",
           "[mcp][pg][management_group]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
@@ -28471,32 +28610,45 @@ TEST_CASE("MCP result-sets: a store DbError AFTER a real dispatch has already fi
           "carries a retry hint - poll executions instead of blindly re-sending",
           "[mcp][integration][result-sets]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
-    yuzu::test::ResultSetStorePg rs_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle; // migrates the schema, gives us dsn()
 
-    // Break the store's own schema AFTER construction (is_open() already
-    // latched true) so create_pending() fails with DbError specifically -
-    // the dispatch itself must still succeed first, matching the real
-    // "bookkeeping row failed to persist after the fleet was already
-    // reached" scenario this branch exists for.
-    {
-        auto lease = rs_bundle.pool().try_acquire_for(std::chrono::seconds{5});
-        REQUIRE(lease);
-        auto dropped = yuzu::server::pg::exec_params(
-            lease.get(), "DROP SCHEMA result_set_store CASCADE", std::vector<std::string>{});
-        REQUIRE(dropped.status() == PGRES_COMMAND_OK);
-    }
-
+    // #4306 finding 1 changed how this test must force the DbError: the
+    // pre-existing version dropped the WHOLE result_set_store schema, which
+    // now also breaks the NEW pre-dispatch quota pre-check
+    // (count_for_owner_checked reads the same now-missing schema) - the
+    // request would refuse before ever reaching dispatch, invalidating this
+    // test's "dispatch itself must still succeed first" premise. Take a
+    // table lock INSIDE the dispatch closure instead (mirrors the lock-
+    // inside-dispatch technique used elsewhere in this PR to force a fault
+    // strictly after a real dispatch) so the quota pre-check succeeds
+    // against the live schema, dispatch genuinely fires, and ONLY THEN does
+    // create_pending's own INSERT hit a deterministic 55P03 lock-timeout
+    // fault - isolating the branch this test actually exists to cover.
+    pg::PgConn locker{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
     auto succeeding_dispatch =
-        [](const std::string&, const std::string&, const std::vector<std::string>&,
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
            const std::string&, const std::unordered_map<std::string, std::string>&,
            const std::string&,
            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    locker.get(),
+                    "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                    std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
         return {.sent = 1, .command_id = "cmd-dberror"};
     };
 
+    pg::PgPool short_lock_pool{{.conninfo = rs_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ResultSetStore short_lock_store{short_lock_pool};
+    REQUIRE(short_lock_store.is_open());
+
     McpTestServer ts;
     ts.execution_tracker_for_test = tracker_bundle.get();
-    ts.result_set_store_for_test = rs_bundle.get();
+    ts.result_set_store_for_test = &short_lock_store;
     ts.start_with_dispatch(succeeding_dispatch, "operator");
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":14,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1"}}})");
@@ -28508,6 +28660,347 @@ TEST_CASE("MCP result-sets: a store DbError AFTER a real dispatch has already fi
           std::string::npos);
     REQUIRE(body["error"]["data"].contains("retry_after_ms"));
     CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4306 PR-B MCP twins: findings 1 + 3 (+ #4307 finding 2) — mirrors the REST
+// coverage in test_rest_result_sets_async.cpp for the MCP tool surface.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("MCP create_result_set_from_tar_query: a degraded quota pre-check fails closed "
+          "BEFORE any dispatch — nothing reaches an agent (#4306 finding 1)",
+          "[pg][mcp][integration][result-sets][security][4306]") {
+    // No parent_id: a supplied parent_id would hit rs_resolve_owned_parent's
+    // own DB read first and refuse there instead, before ever reaching the
+    // quota pre-check under test — same reasoning as the REST twin.
+    yuzu::test::ExecutionTrackerPg tracker_bundle; // separate ephemeral DB,
+                                                    // unaffected by the lock below
+    yuzu::test::ResultSetStorePg rs_bundle;        // migrates the schema, gives us dsn()
+
+    pg::PgPool short_lock_pool{{.conninfo = rs_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ResultSetStore short_lock_store{short_lock_pool};
+    REQUIRE(short_lock_store.is_open());
+
+    pg::PgConn locker{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&,
+                       const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        FAIL("dispatch_fn must not be reached — the degraded quota pre-check must refuse first");
+        return {.sent = 0, .command_id = ""};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = &short_lock_store;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    const std::string msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.find("could not verify the per-owner result-set quota") != std::string::npos);
+    CHECK(msg.find("nothing was dispatched") != std::string::npos);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+TEST_CASE("MCP create_result_set_from_tar_query: a post-dispatch DbError from create_pending "
+          "surfaces RESULT_SET_STORE_FAULT_AFTER_DISPATCH -- distinct from the pre-dispatch "
+          "quota-check-degraded RESULT_SET_STORE_UNAVAILABLE token above -- and carries "
+          "execution_id plus a null retry_after_ms (gov-4306-S4/S9)",
+          "[pg][mcp][integration][result-sets][tar][4306]") {
+    // No parent_id: same reasoning as the sibling quota-pre-check test above.
+    yuzu::test::ExecutionTrackerPg tracker_bundle; // separate ephemeral DB,
+                                                    // unaffected by the lock below
+    yuzu::test::ResultSetStorePg rs_bundle;        // migrates the schema, gives us dsn()
+
+    // Short lock_timeout_ms (established technique, mirrors the REST twin in
+    // test_rest_result_sets_async.cpp) so the lock taken INSIDE the dispatch
+    // closure below faults create_pending's INSERT deterministically and
+    // fast, rather than waiting out the default 10s lock_timeout. The quota
+    // pre-check runs BEFORE dispatch, strictly before the lock is taken, so
+    // it completes on the still-unlocked table -- dispatch genuinely fires.
+    pg::PgPool short_lock_pool{{.conninfo = rs_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ResultSetStore short_lock_store{short_lock_pool};
+    REQUIRE(short_lock_store.is_open());
+
+    pg::PgConn locker{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    // Take the table lock INSIDE the fake dispatch closure, mirroring the
+    // REST twin's on_dispatch technique exactly.
+    auto dispatch =
+        [&locker](const std::string&, const std::string&, const std::vector<std::string>&,
+                  const std::string&, const std::unordered_map<std::string, std::string>&,
+                  const std::string&,
+                  const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(locker.get(),
+                                "LOCK TABLE result_set_store.result_sets IN ACCESS "
+                                "EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        return {.sent = 1, .command_id = "c1"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = &short_lock_store;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1","name":"postdispatch"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    const std::string msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.starts_with("RESULT_SET_STORE_FAULT_AFTER_DISPATCH:"));
+    CHECK(msg.find("do not re-send") != std::string::npos);
+    CHECK(msg.find("execution_id=") != std::string::npos);
+    // DELIBERATELY non-retryable: a real dispatch already succeeded, so a
+    // positive retry hint would tell an agentic caller to re-send a command
+    // that already reached the fleet (matches the REST twin's regression
+    // lock).
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+TEST_CASE("MCP create_result_set_from_inventory_query: a degraded members-table read on the "
+          "parent-narrowing loop refuses rather than materialising an unnarrowed result set "
+          "(#4306 finding 3)",
+          "[pg][mcp][integration][result-sets][inventory][security][4306]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    // Same DSN as rs_bundle -- InventoryStore only needs to be WIRED so the
+    // tool's fleet_read_fn gate doesn't 503 before ever reaching the
+    // parent_id block; it reads its own unrelated schema, untouched by the
+    // lock below.
+    yuzu::server::InventoryStore inventory{rs_bundle.pool()};
+    REQUIRE(inventory.is_open());
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "mcp-members-parent";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1", "a2"});
+    REQUIRE(parent.has_value());
+
+    pg::PgPool short_lock_pool{{.conninfo = rs_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ResultSetStore short_lock_store{short_lock_pool};
+    REQUIRE(short_lock_store.is_open());
+
+    pg::PgConn locker{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_set_members IN ACCESS "
+                            "EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = &short_lock_store;
+    ts.inventory_store_for_test = &inventory;
+    ts.audit_succeeds_ = false; // gov-4306-S3: the failure-row audit is itself dropped
+    ts.start(); // fixture default fleet_read_fn_for_test admits unfiltered
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query","arguments":{"name":"x","parent_id":")" +
+        parent->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find(
+              "could not read the parent set's members") != std::string::npos);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    // gov-4306-S3 fix: this branch previously called `(void)audit_fn(...)`,
+    // discarding the return value, so a dropped audit row could never surface
+    // as audit_persisted:false.
+    REQUIRE(body["error"]["data"].contains("audit_persisted"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+TEST_CASE("MCP list_result_sets: a degraded read refuses (kInternalError), never a success "
+          "response with an empty array indistinguishable from a genuinely empty owner "
+          "(#4306/#4307 finding 2)",
+          "[pg][mcp][integration][result-sets][security][4306]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    CreateRequest cr;
+    cr.owner_principal = "test-user";
+    cr.name = "has-one";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    REQUIRE(rs_bundle.get()->create_materialized(cr, {"a"}).has_value());
+
+    pg::PgPool short_lock_pool{{.conninfo = rs_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ResultSetStore short_lock_store{short_lock_pool};
+    REQUIRE(short_lock_store.is_open());
+
+    pg::PgConn locker{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = &short_lock_store;
+    ts.audit_succeeds_ = false; // gov-4306-S3: the failure-row audit is itself dropped
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_result_sets"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("could not list result sets") !=
+          std::string::npos);
+    // gov-4306-S3 fix: mcp_audit's return was previously discarded, so a
+    // dropped audit row here could never surface as audit_persisted:false.
+    REQUIRE(body["error"]["data"].contains("audit_persisted"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+TEST_CASE("MCP get_result_set_members: a degraded members-table read refuses "
+          "(kInternalError), never a success response with an empty array (#4306 finding 3 "
+          "/ #4307 finding 2)",
+          "[pg][mcp][integration][result-sets][security][4306]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    CreateRequest cr;
+    cr.owner_principal = "test-user";
+    cr.name = "has-members";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto seeded = rs_bundle.get()->create_materialized(cr, {"a", "b"});
+    REQUIRE(seeded.has_value());
+
+    pg::PgPool short_lock_pool{{.conninfo = rs_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ResultSetStore short_lock_store{short_lock_pool};
+    REQUIRE(short_lock_store.is_open());
+
+    pg::PgConn locker{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_set_members IN ACCESS "
+                            "EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    // load_owned's own get() reads result_sets, NOT result_set_members, so
+    // rs_load_owned passes under this lock -- the members read itself is
+    // what's under test here (distinct from the list/lineage tests, which
+    // lock result_sets and so exercise rs_load_owned's PRE-EXISTING gate
+    // instead; see the lineage test below for the discrimination caveat).
+    McpTestServer ts;
+    ts.result_set_store_for_test = &short_lock_store;
+    ts.audit_succeeds_ = false; // gov-4306-S3: the failure-row audit is itself dropped
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_result_set_members","arguments":{"id":")" +
+        seeded->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("could not read result-set "
+                                                            "members") != std::string::npos);
+    // gov-4306-S3 fix: mcp_audit's return was previously discarded, so a
+    // dropped audit row here could never surface as audit_persisted:false.
+    REQUIRE(body["error"]["data"].contains("audit_persisted"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+TEST_CASE("MCP get_result_set_lineage: a degraded result_sets read refuses "
+          "(kInternalError) -- NOTE: this exercises rs_load_owned's PRE-EXISTING "
+          "ownership-check gate (get() also reads result_sets), not lineage_checked "
+          "specifically, since both hit the same table under a table-wide lock and "
+          "rs_load_owned runs first. lineage_checked's own DbError branch is covered "
+          "directly in test_result_set_store.cpp; this test proves the TOOL as a whole "
+          "stays fail-closed end to end (#4306 finding 3 / #4307 finding 2)",
+          "[pg][mcp][integration][result-sets][security][4306]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    CreateRequest cr;
+    cr.owner_principal = "test-user";
+    cr.name = "has-lineage";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto seeded = rs_bundle.get()->create_materialized(cr, {"a"});
+    REQUIRE(seeded.has_value());
+
+    pg::PgPool short_lock_pool{{.conninfo = rs_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ResultSetStore short_lock_store{short_lock_pool};
+    REQUIRE(short_lock_store.is_open());
+
+    pg::PgConn locker{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = &short_lock_store;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_result_set_lineage","arguments":{"id":")" +
+        seeded->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    // rs_load_owned's own message, not lineage_checked's -- see the TEST_CASE
+    // name for why.
+    CHECK(body["error"]["message"].get<std::string>().find(
+              "could not verify result-set ownership") != std::string::npos);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
 }
 
 // Adversarial review (PR #4330, Codex + Kimi): rs_run_async silently
