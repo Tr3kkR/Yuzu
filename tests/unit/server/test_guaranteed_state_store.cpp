@@ -32,6 +32,7 @@
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -693,6 +694,98 @@ TEST_CASE("GuaranteedStateStore: observation projects uniform detail_json keys",
     CHECK(obs[0].component == "ntdll.dll");
     CHECK(obs[0].version == "11.0.26100.1"); // slice 2b: per-version stability projects
     CHECK(obs[0].platform == "windows");
+}
+
+// ── #4665: log-injection neutralisation on the rule_id/event_id error paths ─
+//
+// guaranteed_state_store.cpp wraps every rule_id/event_id it hands to
+// spdlog:: on these best-effort warn/error paths with yuzu::log_id_token (a
+// hostile value cannot forge a log line or smuggle extra key=value tokens
+// onto it). Each case below forces a GENUINE SQL-level failure via a
+// second-connection exec_sql, rather than faking the log call, so it
+// exercises the real production code path. agent_id is deliberately left
+// unwrapped everywhere in this file (issue #489, a separate fleet-wide
+// outcome) and is not asserted on here.
+//
+// Each assertion below checks the id= FIELD carries the neutralised form,
+// not that the raw hostile string is globally absent from the captured
+// text: the trailing {} in both log lines is PQerrorMessage()/pr.error()
+// (deliberately unwrapped, same reasoning as `why` in
+// guardian_push_builder.cpp) and Postgres's own constraint-violation DETAIL
+// text ("Failing row contains (...)" / "Key (...)=(...) already exists")
+// echoes the raw offending value back through THAT channel -- confirmed
+// empirically while writing this test. That is a separate, out-of-scope
+// exposure through the SQL diagnostic text itself (not an id/key field, and
+// not something log_id_token/log_key_token is meant to touch); see the PR
+// report for a note on it.
+
+TEST_CASE("GuaranteedStateStore: a hostile rule_id is neutralised on a failed "
+          "compliance-census upsert",
+          "[pg][guaranteed_state_store][events][log_hygiene]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    // A CHECK constraint the public API can never violate on its own — added
+    // directly so upsert_rule_status's INSERT...ON CONFLICT genuinely fails,
+    // exercising the real "status upsert failed" warn path rather than
+    // mocking the log call.
+    exec_sql(db.dsn(),
+             "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+             "ADD CONSTRAINT chk_test_no_newline_rule_id "
+             "CHECK (rule_id NOT LIKE '%' || chr(10) || '%')");
+
+    const std::string hostile_rule_id = "rule\ninjected-line";
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    // drift.remediated -> "compliant" state, so the census upsert fires.
+    REQUIRE(store.insert_event(make_event("evt-census-1", hostile_rule_id, "agent-A")));
+    cap.stop();
+
+    const std::string logs = cap.text();
+    CHECK(logs.find("status upsert failed") != std::string::npos);
+    // log_id_token(rule_id) is inserted correctly at the rule_id= field: the
+    // embedded newline is folded to '_' rather than splitting the log line
+    // or leaking a second, forged rule_id= token.
+    CHECK(logs.find("rule_id=rule_injected-line") != std::string::npos);
+    CHECK(logs.find("rule_id=rule\ninjected-line") == std::string::npos);
+}
+
+TEST_CASE("GuaranteedStateStore: a hostile event_id is neutralised on a failed "
+          "observation projection",
+          "[pg][guaranteed_state_store][events][crash][dex][log_hygiene]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    const std::string hostile_event_id = "obs-collide\ninjected-line";
+    // Pre-seed a colliding PK directly in the read-model table -- the public
+    // API can never produce two rows sharing an event_id, so this is the only
+    // way to force project_observation's INSERT to genuinely fail rather than
+    // faking the log call.
+    exec_sql(db.dsn(), "INSERT INTO guaranteed_state_store.guardian_observations "
+                       "(event_id, agent_id, observed_at, obs_type) VALUES ('" +
+                           hostile_event_id +
+                           "', 'agent-B', '2026-06-08T12:00:00Z', 'process.crashed')");
+
+    GuaranteedStateEventRow crash;
+    crash.event_id = hostile_event_id;
+    crash.rule_id = "__observation__";
+    crash.agent_id = "agent-B";
+    crash.event_type = "process.crashed";
+    crash.severity = "info";
+    crash.detail_json = R"({"subject":"notepad.exe"})";
+    crash.timestamp = "2026-06-08T12:00:00Z";
+
+    yuzu::test::LogCapture cap(spdlog::level::err);
+    REQUIRE(store.insert_event(crash)); // event itself is kept even though projection fails
+    cap.stop();
+
+    const std::string logs = cap.text();
+    CHECK(logs.find("observation projection failed") != std::string::npos);
+    // log_id_token(row.event_id) is inserted correctly at the event_id=
+    // field, same reasoning as the rule_id case above.
+    CHECK(logs.find("event_id=obs-collide_injected-line") != std::string::npos);
+    CHECK(logs.find("event_id=obs-collide\ninjected-line") == std::string::npos);
 }
 
 TEST_CASE("GuaranteedStateStore: dex_device_top_apps splits crashes/hangs by version",

@@ -123,7 +123,7 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 
 #### Step-up on high-risk surfaces (PR 2)
 
-Eleven REST + Settings endpoints (token mint/revoke, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push, user delete, user role change) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
+Twenty-four REST + Settings endpoints (token mint/revoke/rotate/confirm, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push, the full engine-principal lifecycle — create/delete, credential mint/rotate/confirm, role grant/revoke, transfer-owner — account unlock, user delete, user role change, and the two JIT admin-elevation endpoints, which use the same gate with the step-up window floored to 300s so elevation always requires a fresh proof) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
 
 ```json
 {
@@ -333,7 +333,7 @@ Yuzu supports SAML 2.0 SP-initiated single sign-on against a single, statically-
 
 > **HTTPS required:** SAML uses a `Secure` browser-binding cookie (`__Host-yuzu_saml_bind`). Browsers silently drop `Secure` cookies over plain HTTP. SAML fails closed at startup when `--https-cert`/`--https-key` are not configured. Do not run SAML over HTTP.
 
-> **MFA step-up:** MFA step-up is not supported for SAML sessions in this release. A SAML session hitting any of the 11 step-up-gated endpoints (token mint/revoke, session revoke, Guardian rule write, software deploy, user management) receives a `403` regardless of `--mfa-enforcement` mode. Use `--mfa-enforcement=optional` and rely on your IdP to enforce MFA at login time. Do not use `--mfa-enforcement=required` for SAML deployments — it denies SAML users at all step-up gates.
+> **MFA step-up:** MFA step-up is not supported for SAML sessions in this release. A SAML session hitting any of the 24 step-up-gated endpoints (token lifecycle, session revoke, Guardian rule write, software deploy, engine-principal lifecycle, user management, JIT admin elevation) receives a `403` regardless of `--mfa-enforcement` mode. Use `--mfa-enforcement=optional` and rely on your IdP to enforce MFA at login time. Do not use `--mfa-enforcement=required` for SAML deployments — it denies SAML users at all step-up gates.
 
 > **SCIM linkage and force-logout:** if SCIM provisioning is also enabled, a SAML login whose NameID resolves to a SCIM resource forms a durable link, and SCIM deprovisioning that resource revokes the linked SAML session automatically. A SAML session is also individually force-loggable by an admin via `DELETE /api/v1/sessions?username=saml:<entity_id>#<NameID>`. See [SCIM ↔ SAML identity linkage](scim-provisioning.md#scim--saml-identity-linkage-federated-session-revocation) for the NameID-Format contract this depends on.
 

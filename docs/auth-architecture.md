@@ -1266,7 +1266,7 @@ applies to these two flags).
 ### MFA enforcement with SAML
 
 **MFA step-up is not supported for SAML sessions in this release.** A SAML
-session hitting any of the 11 step-up-gated endpoints (token mint/revoke,
+session hitting any of the 24 step-up-gated endpoints (token mint/revoke,
 session revoke, Guardian rule write, software deploy, user delete/role change)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"` — regardless of `--mfa-enforcement` mode. The gate (`require_mfa_step_up`
