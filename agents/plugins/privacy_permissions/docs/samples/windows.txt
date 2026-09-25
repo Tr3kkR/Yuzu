@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-24 · LocalSystem (elevated; account names replaced with jsmith) · leg-hash 4b65028e3cd3
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-24 · LocalSystem (elevated; account names replaced with jsmith; captured before the bounds and refusal changes, re-stamped not recaptured) · leg-hash 4b65028e3cd3
 == action=permissions
 permissions|windows|jsmith/-|camera|allowed|Allow|-|-
 permissions|windows|jsmith/-|full_disk_access|allowed|Allow|-|-

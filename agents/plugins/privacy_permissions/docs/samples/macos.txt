@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-23 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner; account names replaced with jsmith) · leg-hash 4b65028e3cd3
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-25 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner; account names replaced with jsmith) · leg-hash 4b65028e3cd3
 == action=permissions
 permissions|macos|-|camera|absent|-|-|-
 permissions|macos|-|microphone|absent|-|-|-
@@ -8,7 +8,7 @@ permissions|macos|com.microsoft.VSCode|full_disk_access|allowed|2|-|-
 permissions|macos|com.nordvpn.macos|full_disk_access|denied|0|-|-
 permissions|macos|com.spotify.client|full_disk_access|denied|0|-|-
 permissions|macos|net.whatsapp.WhatsApp|full_disk_access|denied|0|-|-
-permissions|macos|jsmith/-|camera|absent|-|-|-
+permissions|macos|jsmith/org.whispersystems.signal-desktop|camera|allowed|2|-|-
 permissions|macos|jsmith/com.microsoft.teams2|microphone|allowed|2|-|-
 permissions|macos|jsmith/org.whispersystems.signal-desktop|microphone|allowed|2|-|-
 permissions|macos|jsmith/-|full_disk_access|absent|-|-|-

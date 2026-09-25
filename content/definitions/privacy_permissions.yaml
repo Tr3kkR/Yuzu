@@ -41,8 +41,8 @@ metadata:
     `denied` row whose `raw` names the refusal, never collapsed into `absent`. Every category
     gets a row, or is covered by a whole-source row (category "-"). The two `last_used_*` fields
     are Windows-only (epoch-milliseconds; "-" elsewhere). Reads one machine per request and is
-    off until enabled: Windows is measured on one non-MDM host, macOS reads `denied` until the
-    agent has Full Disk Access, and Linux reports only the agent's own session, normally
+    off until enabled: Windows is measured on one non-MDM host, macOS is expected to read `denied`
+    until the agent has Full Disk Access, and Linux reports only the agent's own session, normally
     `unavailable` under the shipped service.
   tags: [privacy_permissions, security, posture, privacy, forensics]
 
@@ -127,8 +127,9 @@ spec:
           The mechanism-native value behind `state` (a TCC auth_value integer: 0 denied, 2 and 3
           allowed, anything else prompt_undetermined; a ConsentStore Value string; a joined
           portal permission list); on a failure row (`denied` from a refused read, or
-          `unreadable`) the failure token that also appears in the agent-log provenance, with `\`
-          written `/`; "-" when nothing meaningful beyond the state itself.
+          `unreadable`) the failure token, with `\` written `/` (the agent-log provenance carries
+          it too, except a Windows per-app failure, which reaches it as the coarse
+          `<source>:<category>:<cause>`); "-" when nothing meaningful beyond the state itself.
         example: "2"
         platforms: [windows, linux, darwin]
       - name: last_used_start
