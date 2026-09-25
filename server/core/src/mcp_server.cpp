@@ -85,6 +85,7 @@
 #include "plugin_config_store.hpp"
 #include "plugin_config_parsers.hpp"
 #include "upload_grant_parsers.hpp"
+#include <yuzu/log_token.hpp> // is_valid_rule_id — shared REST/MCP/agent rule id charset (#4665)
 #include <yuzu/server/auth_db.hpp> // B4: is_valid_username (unlock_account, mirrors the REST route)
 
 // B5 (api-parity #2146) — offload-target / platform-license / software-
@@ -792,7 +793,11 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})j"},
 
     {"get_management_group",
-     "Get one management group's metadata plus its current member list. Mirrors GET "
+     "Get one management group's metadata plus its current member list. #1762: "
+     "a DEGRADED read of EITHER the group row itself or its "
+     "member list (store closed / pool-acquire timeout / query error) returns a "
+     "retryable error, never a fabricated healthy result — do not conflate that with "
+     "the not-found case (a genuinely nonexistent group_id, no retry hint). Mirrors GET "
      "/api/v1/management-groups/{id}. Requires ManagementGroup:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"})j"
@@ -1266,7 +1271,7 @@ static const ToolDef kTools[] = {
      "twin applies an MFA step-up check; MCP applies none for a cookie-session caller "
      "(architecture-wide gap, not specific to this tool - tracked in #4309).",
      R"j({"type":"object","properties":{)j"
-     R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"description":"Unique Guard identifier"},)j"
+     R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"pattern":"^[A-Za-z0-9._-]+$","description":"Unique Guard identifier"},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique human-authored Guard name"},)j"
      R"j("version":{"type":"integer","minimum":1,"default":1},)j"
      R"j("enabled":{"type":"boolean","default":true},)j"
@@ -1432,12 +1437,15 @@ static const ToolDef kTools[] = {
     // GuaranteedState:Read gate as query_software_licenses/get_dex_device_app_perf
     // below, not the global perm gate.
     {"get_dex_device_score",
-     "Per-device DEX read model: the 0-100 experience score (-1 when unavailable — no "
-     "store, or the score cannot be computed) plus this device's OWN signal summary "
+     "Per-device DEX read model: the 0-100 experience score (-1 when no store is "
+     "configured) plus this device's OWN signal summary "
      "(obs_type -> count/distinct_devices/last_seen). The per-device twin of "
      "list_dex_signals's fleet rollup. Behavioral PII — every call is audit-logged "
      "(dex.device.view), same verb as the REST twin and the dashboard's per-device DEX "
-     "lens. Mirrors GET /api/v1/dex/devices/{id}. Requires GuaranteedState:Read, "
+     "lens. #4855: a DEGRADED signal-summary read (store closed / pool-acquire timeout / "
+     "query error) returns a retryable error instead of a score — never conflate the -1 "
+     "'no store' case above with a degraded read, which is an ERROR response, not a -1 "
+     "score. Mirrors GET /api/v1/dex/devices/{id}. Requires GuaranteedState:Read, "
      "management-group-scoped to this device.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact agent/device id"},)j"
@@ -1561,11 +1569,14 @@ static const ToolDef kTools[] = {
      "Device/App/Network composite, measured crash-free rate, top apps, and the most-affected- "
      "devices list. The devices list names affected agent IDs (behavioral data), confined to "
      "the caller's management-group scope — every call is audit-logged (dex.overview.view). "
-     "Mirrors GET /api/v1/dex/overview. Requires GuaranteedState:Read.",
+     "unscored (#4855) counts connected devices whose per-device score could not be computed "
+     "(no store, or a degraded per-device read) — treat a non-zero unscored as partial "
+     "coverage, not a healthier fleet than reported. Mirrors GET /api/v1/dex/overview. Requires "
+     "GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
      R"j({"type":"object","properties":{)j"
      R"j("window":{"type":"string"},"overall_experience":{"type":"integer"},"device_score":{"type":"integer"},"app_score":{"type":"integer"},"network_score":{"type":"integer"},)j"
-     R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
+     R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"unscored":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
      R"j("crash_free_pct":{"type":["number","null"]},"windows_reporting":{"type":"integer"},"crashes_per_1k_device_days":{"type":["number","null"]},)j"
      R"j("total_crashes":{"type":"integer"},"devices_impacted":{"type":"integer"},"total_online":{"type":"integer"},)j"
      R"j("active_signal_types":{"type":"integer"},"health_score":{"type":["number","null"]},"os_reporting_count":{"type":"integer"},)j"
@@ -9886,10 +9897,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_management_group (B4, #2146 API-parity) ───────────────
-            // Mirrors GET /api/v1/management-groups/{id}. get_group's nullopt
-            // collapses "no such group" with "store degraded" (the store API's
-            // own limitation — REST reports both as a flat 404, mirrored here
-            // exactly rather than inventing a distinction REST does not make).
+            // Mirrors GET /api/v1/management-groups/{id}. get_group_checked
+            // (#1762) distinguishes a genuine not-found (404-equivalent) from
+            // a store degrade (a retryable error) — the two are no longer
+            // collapsed.
             if (tool_name == "get_management_group") {
                 if (!tier_allows(tier, "ManagementGroup", "Read")) {
                     res.set_content(
@@ -9923,18 +9934,43 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto g = mgmt_store->get_group(group_id);
+                // get_group_checked (not the fail-soft get_group()) — a
+                // store-not-open / pool-acquire-timeout / query-error degrade
+                // must not render as a flat "group not found" (#1762 shape);
+                // fail closed with a retryable error instead, matching the
+                // REST twin's 503. A genuine not-found still reports
+                // retry-hint-exempt, mirroring REST's flat 404 with no retry
+                // hint.
+                auto g = mgmt_store->get_group_checked(group_id);
                 if (!g) {
-                    // retry-hint-exempt: ManagementGroupStore::get_group's nullopt is a
-                    // genuine "no such group" (its own store-degrade case is
-                    // distinct and much rarer); REST reports the SAME flat 404 with no
-                    // retry hint, so this mirrors it rather than inventing one REST
-                    // does not have.
+                    mcp_audit("failure", "management group store read degraded; group=" + group_id);
+                    res.set_content(
+                        a4_error(kInternalError, "management group store read degraded",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!*g) {
                     mcp_audit("denied", "group not found");
                     res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
                     return;
                 }
-                auto members = mgmt_store->get_members(group_id);
+                // get_members_checked (not the fail-soft get_members()) — a
+                // store-not-open / pool-acquire-timeout / query-error degrade
+                // must not render as an authoritative empty member list
+                // (#1762 shape); fail closed with a retryable error instead,
+                // matching the REST twin's 503.
+                auto members = mgmt_store->get_members_checked(group_id);
+                if (!members) {
+                    mcp_audit("failure", "management group store read degraded; group=" + group_id);
+                    res.set_content(
+                        a4_error(kInternalError, "management group store read degraded",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
                 mcp_audit("success", group_id);
                 // Shared builder (management_group_model.hpp) - the REST twin
                 // GET /api/v1/management-groups/{id} calls the SAME function,
@@ -9942,7 +9978,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // §1 Rule 1).
                 res.set_content(
                     success_response(
-                        id, tool_result(management_group_detail_json(*g, members), kObjectOutputSchema)),
+                        id, tool_result(management_group_detail_json(**g, *members), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -10055,8 +10091,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto existing = mgmt_store->get_group(group_id);
                 if (!existing) {
-                    // retry-hint-exempt: same collapsed not-found/degrade shape as
-                    // get_management_group above — mirrors REST's flat 404 exactly.
+                    // retry-hint-exempt: this write path stays on the fail-soft
+                    // get_group() (unlike get_management_group above, which
+                    // moved to get_group_checked for #1762) — a collapsed
+                    // not-found/degrade nullopt, mirroring REST's PUT route's
+                    // own flat 404 exactly (also still on get_group()).
                     mcp_audit("denied", "group not found");
                     res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
                     return;
@@ -11640,7 +11679,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                int64_t limit = param_int(args, "limit", 50);
+                // #4307 item 7 (#2970B convention): param_int silently
+                // substitutes the default on a present-but-wrong-typed
+                // `limit` (e.g. a string or bool) rather than rejecting it -
+                // param_int_strict returns nullopt for that shape instead,
+                // matching the established sites elsewhere in this file
+                // (e.g. list_definitions' iq.limit above).
+                const auto limit_opt = param_int_strict(args, "limit", 50);
+                if (!limit_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not
+                        // a store/query fault - resending the identical
+                        // malformed argument cannot succeed.
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                int64_t limit = *limit_opt;
                 if (limit < 1)
                     limit = 1;
                 if (limit > 500)
@@ -11714,6 +11769,37 @@ McpServer::HandlerFn McpServer::build_handler(
                 // device_ids bound was ever checked - the exact "same input
                 // class, different outcome" inconsistency update_management_
                 // group's own fix (above) closed for a sibling tool.
+                //
+                // #4307 item 6: a malformed/empty parent_id (`{"parent_id":
+                // 123}` or `{"parent_id":""}`) previously fell straight
+                // through the is_string()+!empty() guard below and was
+                // silently treated as "no parent_id" -- mirrors REST's
+                // identical fix on the generic POST /api/v1/result-sets
+                // route. Unlike the three create_result_set_from_*/
+                // reevaluate_result_set producers' identically-shaped guard
+                // (#2500), parent_id here is NOT a dispatch-targeting
+                // argument -- this tool is synchronous and never dispatches
+                // -- so this is a caller-UX/lineage-correctness fix, not a
+                // dispatch-safety one: no
+                // yuzu_server_dispatch_target_rejected_total counter (that
+                // metric family is reserved for the targeting-argument
+                // tools).
+                if (args.contains("parent_id") &&
+                    (!args["parent_id"].is_string() ||
+                     args["parent_id"].get_ref<const std::string&>().empty())) {
+                    const std::string_view reason = args["parent_id"].is_string()
+                                                        ? kReasonParentIdEmpty
+                                                        : kReasonParentIdType;
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   std::string("reason=") + std::string(reason));
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_PARENT: parent_id was supplied but names "
+                                       "no parent set; omit it entirely to leave the set "
+                                       "parentless"),
+                        "application/json");
+                    return;
+                }
                 std::optional<std::string> pid;
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
@@ -12707,7 +12793,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
-                int64_t limit = param_int(args, "limit", 1000);
+                // #4307 item 7 (#2970B convention): param_int silently
+                // substitutes the default on a present-but-wrong-typed
+                // `limit` rather than rejecting it - param_int_strict
+                // returns nullopt for that shape instead, matching this
+                // tool's sibling list_result_sets above.
+                const auto limit_opt = param_int_strict(args, "limit", 1000);
+                if (!limit_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not
+                        // a store/query fault - resending the identical
+                        // malformed argument cannot succeed.
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                int64_t limit = *limit_opt;
                 if (limit < 1)
                     limit = 1;
                 if (limit > 10000)
@@ -13635,11 +13736,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     row.yaml_source = param_str(args, "yaml_source");
                 }
 
-                if (row.rule_id.empty() || row.name.empty() ||
+                if (!is_valid_rule_id(row.rule_id) || row.name.empty() ||
                     (!spec.structured && row.yaml_source.empty())) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.create", "denied",
+                        "GuaranteedState", row.rule_id,
+                        "invalid rule_id, missing name, or missing yaml_source");
+                    // retry-hint-exempt: validation failure, not a store fault.
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "rule_id and name are required, plus either a "
+                                       "rule_id must be non-empty, match [A-Za-z0-9._-]+, and "
+                                       "be at most 256 bytes; name is required, plus either a "
                                        "structured spark+assertion or a yaml_source"),
                         "application/json");
                     return;
@@ -14530,9 +14637,25 @@ McpServer::HandlerFn McpServer::build_handler(
                 // three. Set-and-proceed: MCP has no Sec-Audit-Failed header, so the
                 // persist bool is captured and surfaced as audit_persisted:false in the
                 // body instead (never a failed call — see docs/api-twin-recipe.md §4).
+                // #4858: the read above may have degraded; this behavioural row
+                // records the access, not the outcome (#4855) — it stays "success"
+                // regardless of a `model.degraded` result below (the device WAS
+                // accessed on the caller's behalf) — the separate `mcp_audit`
+                // tool-invocation record is what flips to "failure" on a degrade.
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.device.view", "success", "Agent", agent_id,
                     "DEX per-device score + signal summary via MCP get_dex_device_score");
+                if (model.degraded) {
+                    // #4855: never serialize a degraded model as a healthy score of
+                    // 100 with no signals -- a retryable error, matching the REST
+                    // twin's 503 and get_dex_device_app_perf's degrade branch below.
+                    mcp_audit("failure", "DEX store read degraded; agent=" + agent_id);
+                    res.set_content(
+                        a4_error(kInternalError, "DEX store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
                 mcp_audit("success", agent_id);
                 res.set_content(
                     success_response(
