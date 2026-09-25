@@ -26,6 +26,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -725,8 +726,18 @@ struct FakePostgres {
             if (sqlstate == "close")
                 return; // accept, read the startup packet, hang up without a word
             if (sqlstate == "silent") { // hold the connection open, say nothing
+                // Until the peer closes: incoming bytes are ignored, a read timeout
+                // (SO_RCVTIMEO) or EINTR keeps it open; EOF or a real error ends it.
                 unsigned char b;
-                while (!stop.load() && ::read(c, &b, 1) > 0) {
+                for (;;) {
+                    if (stop.load())
+                        break;
+                    const ssize_t r = ::read(c, &b, 1);
+                    if (r > 0)
+                        continue;
+                    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+                        continue;
+                    break;
                 }
                 return;
             }

@@ -1601,13 +1601,16 @@ gaps closed:
   Nine review rounds each found a new divergence between the probe and the pool, all one class: the pool
   holds N connections opened at N moments under N resolved settings and never re-validates them, so no
   single probe connection can represent them. The promise is therefore stated precisely:
-  `pg_reachable` is a one-session, fresh-connect signal — red when this replica, connecting exactly as
-  its pool would at that moment, cannot establish a session to a server that accepts writes, or when the
-  probe's own held session stops answering or turns read-only. It does not observe the pool's other held
-  connections, nor settings re-resolved after the probe last connected. Named residuals, each a tracked
-  issue: held pool connections to a server demoted in place; service-file/environment edits until the
-  probe's next reconnect; a multi-address host name with one silent address; `max_connections`
-  exhaustion; about ±1 s timing tolerance. Freeze rule: no further emulation of libpq/pool behaviour in
+  `pg_reachable` is a one-session signal — red when the probe's most recent connect, made with the pool's
+  own parameters (a single host capped at 5 s), could not establish a session to a server that accepts
+  writes, or when the probe's held session stops answering or turns read-only. It keeps a healthy session
+  open, so it does not observe the pool's other held connections, nor anything that changed after the
+  probe last connected. Named residuals: held pool connections to a server demoted in place (#4942);
+  anything that changes whether a new connection would succeed — service-file/environment edits, a
+  password rotation or expiry, a pg_hba or certificate change — until the probe's next reconnect (#4956);
+  a multi-address host name with one silent address (#4954); `max_connections` exhaustion (#4943); and,
+  accepted and untracked, timing — about ±1 s against the pool's connect, a single host capped at 5 s
+  (red-only). Freeze rule: no further emulation of libpq/pool behaviour in
   the probe; a newly found divergence is an issue against this contract unless it produces a false green
   for a fresh connect on a single-endpoint or read-write multi-host DSN, which stays blocking. The durable
   fix for held connections is pool-side (validate on acquire / maximum lifetime), not more probe

@@ -6,20 +6,25 @@
 /// in pg_reachability_rules.hpp (pure); this file is the I/O half.
 ///
 /// THE CONTRACT (Gate 8 round 9, architecture review adopted by the operator).
-/// `pg_reachable` is a ONE-SESSION, FRESH-CONNECT signal. It is red when this
-/// replica, connecting exactly as its pool would at that moment (same DSN,
-/// environment, service file, `connect_timeout`), cannot establish a session to
-/// a server that accepts writes; or when the probe's own held session stops
-/// answering or turns read-only. It does NOT observe the pool's other held
-/// connections (the pool never re-validates them), nor settings re-resolved
-/// after the probe last connected. Named residuals, each tracked as an issue:
-///   (1) held pool connections to a server demoted in place;
-///   (2) service-file / environment edits — seen only at the probe's next
-///       reconnect (a connect failure, query failure or read-only answer drops
-///       its session);
-///   (3) a multi-address host name with one silent address;
-///   (4) `max_connections` exhaustion (the probe is refused first);
-///   (5) about ±1 s of timing tolerance against the pool's connect.
+/// `pg_reachable` is a ONE-SESSION signal. It is red when the probe's most
+/// recent connect — made with the pool's own parameters (same DSN, environment,
+/// service file and `connect_timeout` default; a single host capped at
+/// kConnectDeadline) — could not establish a session to a server that accepts
+/// writes; or when the probe's held session stops answering or turns read-only.
+/// It keeps a healthy session open, so it does NOT observe the pool's other held
+/// connections (the pool never re-validates them), nor anything that changed
+/// after the probe last connected. Named residuals:
+///   (1) held pool connections to a server demoted in place (#4942);
+///   (2) anything that changes whether a NEW connection would succeed — a
+///       service-file or environment edit, a password rotation or expiry, a
+///       pg_hba or certificate change — seen only at the probe's next reconnect
+///       (a connect failure, query failure, read-only answer or settings refusal
+///       drops its session) (#4956);
+///   (3) a multi-address host name with one silent address (#4954);
+///   (4) `max_connections` exhaustion (the probe is refused first) (#4943);
+///   (5) timing, accepted and untracked: about ±1 s against the pool's connect,
+///       and a single host capped at kConnectDeadline (a pool connect slower than
+///       that can succeed while the probe reads red — never green).
 /// FREEZE RULE: no further emulation of libpq/pool behaviour lands here. A newly
 /// found divergence is a tracked issue against this contract UNLESS it produces
 /// a false GREEN for a fresh connect on a single-endpoint DSN or a read-write
