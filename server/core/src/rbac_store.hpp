@@ -48,6 +48,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -530,6 +531,48 @@ private:
 /// extend trust in a cached "disabled" any more than a cached permission
 /// verdict (adversarial-review round, #2703).
 [[nodiscard]] bool rbac_enforcement_in_effect(const RbacStore* store) noexcept;
+
+/// Three-way, AUDIT-FACING classification of RBAC enforcement state (A3, the
+/// Periodic Access Review export, SOC 2 CC6.2) — strictly more granular than
+/// `rbac_enforcement_in_effect`'s plain enforced/not-enforced boolean, which
+/// deliberately conflates "genuinely enabled" with "degraded view, deny by
+/// default" (both gate DENY, so the boolean is right for authorization). An
+/// auditor reading an evidence export needs the distinction: a `kDegraded`
+/// stamp says "we could not confirm the state, gates denied defensively" —
+/// NOT "an administrator turned RBAC on".
+///
+/// This is a READ-ONLY label for export/evidence surfaces — never an
+/// authorization decision. A caller deciding whether to admit/deny a request
+/// MUST keep using `rbac_enforcement_in_effect()` directly, never this enum.
+enum class RbacEnforcementLabel {
+    kEnabled,  ///< store open, `is_rbac_enabled() == true`.
+    kDisabled, ///< store open, `is_rbac_enabled() == false`, view FRESH — the
+               ///< one case `rbac_enforcement_in_effect()` returns `false` for.
+    kDegraded, ///< everything else `rbac_enforcement_in_effect()` returns
+               ///< `true` for WITHOUT a confirmed enable: a null/not-open
+               ///< store, or an open-and-disabled store whose view is STALE
+               ///< (`rbac_enabled_view_degraded() == true`).
+};
+
+/// Maps `store` to one of the three `RbacEnforcementLabel` states above.
+/// Deliberately mirrors `rbac_enforcement_in_effect`'s own branch order and
+/// short-circuiting EXACTLY (same three accessors, same precedence) so the
+/// two can never silently drift apart: `rbac_enforcement_in_effect(store) ==
+/// (rbac_enforcement_label(store) != RbacEnforcementLabel::kDisabled)` holds
+/// for every input. One asymmetry worth stating explicitly because a
+/// reviewer will ask: a store that is cached-ENABLED but whose generation
+/// view also happens to be stale classifies as `kEnabled`, not `kDegraded` —
+/// `is_rbac_enabled()` short-circuits before `rbac_enabled_view_degraded()`
+/// is ever consulted, exactly like `rbac_enforcement_in_effect()` itself;
+/// gates still deny either way, so this is the same fail-closed answer, just
+/// a less granular label for that one case.
+[[nodiscard]] RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept;
+
+/// "enabled" | "disabled" | "degraded" — the wire/DB string form of
+/// `RbacEnforcementLabel`, used verbatim as the access-review export's
+/// `rbac_enforcement` field and the frozen campaign row's column of the same
+/// name (`access_review_store.hpp`).
+[[nodiscard]] std::string_view to_string(RbacEnforcementLabel label) noexcept;
 
 /// Build the `groups.name` used for an IdP-sourced group: `source:external_id`.
 /// `source == "local"` groups are NOT namespaced — returns `external_id`

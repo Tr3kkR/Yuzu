@@ -838,7 +838,10 @@ TEST_CASE("export: format classifier — json|csv 200, anything else 400",
     auto csv_res = h.sink.Get("/api/v1/access-reviews/export?format=csv");
     REQUIRE(csv_res);
     CHECK(csv_res->status == 200);
-    CHECK(csv_res->body.starts_with("principal_type,principal_id,"));
+    // A3: the unconditional rbac_enforcement metadata line precedes the real
+    // header — fresh harness, RBAC never toggled on in this harness.
+    CHECK(csv_res->body.starts_with("# rbac_enforcement=disabled\r\n"
+                                    "principal_type,principal_id,"));
 
     auto default_res = h.sink.Get("/api/v1/access-reviews/export");
     REQUIRE(default_res);
@@ -1039,6 +1042,38 @@ TEST_CASE("GET /access-reviews: happy path returns opened campaigns", "[pg][acce
     CHECK(res->status == 200);
     CHECK(res->body.find(cid) != std::string::npos);
     CHECK(res->body.find("\"List me\"") != std::string::npos);
+
+    // A3 (RBAC delivery plan) — the campaign was frozen with RBAC's default
+    // (never toggled in this harness) enforcement state.
+    auto body = nlohmann::json::parse(res->body);
+    bool found = false;
+    for (auto& c : body["data"]) {
+        if (c["campaign_id"] == cid) {
+            found = true;
+            CHECK(c["rbac_enforcement"] == "disabled");
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("GET /access-reviews/{id} and GET .../export: rbac_enforcement is present and "
+         "reflects RBAC's current state",
+         "[pg][access_review][rest]") {
+    AccessReviewHarness h;
+
+    auto export_res = h.sink.Get("/api/v1/access-reviews/export");
+    REQUIRE(export_res);
+    REQUIRE(export_res->status == 200);
+    auto export_body = nlohmann::json::parse(export_res->body);
+    REQUIRE(export_body.contains("rbac_enforcement"));
+    CHECK(export_body["rbac_enforcement"] == "disabled");
+
+    const auto cid = h.open_campaign_rest("Enforcement stamp test");
+    auto get_res = h.sink.Get("/api/v1/access-reviews/" + cid);
+    REQUIRE(get_res);
+    REQUIRE(get_res->status == 200);
+    auto get_body = nlohmann::json::parse(get_res->body);
+    CHECK(get_body["data"]["campaign"]["rbac_enforcement"] == "disabled");
 }
 
 TEST_CASE("GET /access-reviews: 403 without AccessReview:Read", "[pg][access_review][rest][list]") {
@@ -1093,6 +1128,9 @@ TEST_CASE("MCP: export_access_review / open_access_review / get_access_review / 
             if (row["principal_id"] == "mcpuser")
                 found = true;
         CHECK(found);
+        // A3 (RBAC delivery plan) — fresh harness, RBAC never toggled on.
+        REQUIRE(sc.contains("rbac_enforcement"));
+        CHECK(sc["rbac_enforcement"] == "disabled");
     }
 
     // open_access_review — freezes the current population into a campaign.
@@ -1119,6 +1157,7 @@ TEST_CASE("MCP: export_access_review / open_access_review / get_access_review / 
         auto& sc = body["result"]["structuredContent"];
         CHECK(sc["campaign"]["campaign_id"] == campaign_id);
         CHECK(sc["campaign"]["status"] == "open");
+        CHECK(sc["campaign"]["rbac_enforcement"] == "disabled"); // A3 — frozen at open
         CHECK(sc["pending_count"].get<std::int64_t>() >= 1);
     }
 
@@ -1130,9 +1169,12 @@ TEST_CASE("MCP: export_access_review / open_access_review / get_access_review / 
         auto body = nlohmann::json::parse(res->body);
         auto& sc = body["result"]["structuredContent"];
         bool found = false;
-        for (auto& c : sc["campaigns"])
-            if (c["campaign_id"] == campaign_id)
+        for (auto& c : sc["campaigns"]) {
+            if (c["campaign_id"] == campaign_id) {
                 found = true;
+                CHECK(c["rbac_enforcement"] == "disabled"); // A3
+            }
+        }
         CHECK(found);
     }
 

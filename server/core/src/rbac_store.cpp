@@ -1474,6 +1474,32 @@ bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
     return store->rbac_enabled_view_degraded();
 }
 
+RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
+    // Mirrors rbac_enforcement_in_effect()'s branch order and short-circuiting
+    // exactly (see that function's comments for the rationale on each step) —
+    // this is the SAME derivation, just split into three outcomes instead of
+    // two. Keep any future change to that function's branches in sync here.
+    if (!store || !store->is_open())
+        return RbacEnforcementLabel::kDegraded;
+    if (store->is_rbac_enabled())
+        return RbacEnforcementLabel::kEnabled;
+    if (store->rbac_enabled_view_degraded())
+        return RbacEnforcementLabel::kDegraded;
+    return RbacEnforcementLabel::kDisabled;
+}
+
+std::string_view to_string(RbacEnforcementLabel label) noexcept {
+    switch (label) {
+    case RbacEnforcementLabel::kEnabled:
+        return "enabled";
+    case RbacEnforcementLabel::kDisabled:
+        return "disabled";
+    case RbacEnforcementLabel::kDegraded:
+        return "degraded";
+    }
+    return "degraded"; // unreachable for a valid enumerator; fail closed on the label too
+}
+
 // ── Roles CRUD ───────────────────────────────────────────────────────────────
 
 std::vector<RbacRole> RbacStore::list_roles() const {

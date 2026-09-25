@@ -463,6 +463,99 @@ TEST_CASE("rbac_enforcement_in_effect fails closed on null / load-failed store",
     }
 }
 
+// A3 (RBAC delivery plan, access-review export) — rbac_enforcement_label's
+// three-way classification, exercising the SAME four scenarios as the
+// boolean test above plus the "cached-enabled but view also stale" ordering
+// asymmetry the header comment calls out explicitly. The exact-mapping
+// property (`rbac_enforcement_in_effect(store) == (label != kDisabled)`) is
+// asserted alongside every CHECK below, not just described.
+TEST_CASE("rbac_enforcement_label maps exactly onto rbac_enforcement_in_effect, split into "
+         "enabled/disabled/degraded",
+         "[rbac_store][visibility][pg]") {
+    SECTION("null store → degraded (fail closed)") {
+        CHECK(rbac_enforcement_label(nullptr) == RbacEnforcementLabel::kDegraded);
+        CHECK(to_string(rbac_enforcement_label(nullptr)) == "degraded");
+        CHECK(rbac_enforcement_in_effect(nullptr) ==
+             (rbac_enforcement_label(nullptr) != RbacEnforcementLabel::kDisabled));
+    }
+
+    SECTION("load-failed store (is_open()==false) → degraded (fail closed)") {
+        PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+                    .size = 1}};
+        RbacStore broken{bad};
+        REQUIRE_FALSE(broken.is_open());
+        CHECK(rbac_enforcement_label(&broken) == RbacEnforcementLabel::kDegraded);
+        CHECK(rbac_enforcement_in_effect(&broken) ==
+             (rbac_enforcement_label(&broken) != RbacEnforcementLabel::kDisabled));
+    }
+
+    SECTION("loaded + explicitly disabled + fresh view → disabled") {
+        RBAC_STORE(store);
+        REQUIRE(store.is_open());
+        REQUIRE_FALSE(store.is_rbac_enabled());
+        CHECK(rbac_enforcement_label(&store) == RbacEnforcementLabel::kDisabled);
+        CHECK(to_string(rbac_enforcement_label(&store)) == "disabled");
+        CHECK(rbac_enforcement_in_effect(&store) ==
+             (rbac_enforcement_label(&store) != RbacEnforcementLabel::kDisabled));
+    }
+
+    SECTION("loaded + enabled → enabled") {
+        RBAC_STORE(store);
+        store.set_rbac_enabled(true);
+        REQUIRE(store.is_rbac_enabled());
+        CHECK(rbac_enforcement_label(&store) == RbacEnforcementLabel::kEnabled);
+        CHECK(to_string(rbac_enforcement_label(&store)) == "enabled");
+        CHECK(rbac_enforcement_in_effect(&store) ==
+             (rbac_enforcement_label(&store) != RbacEnforcementLabel::kDisabled));
+    }
+}
+
+// The one asymmetry the header comment on rbac_enforcement_label() flags
+// explicitly: a store that is cached-ENABLED but whose generation view is
+// ALSO stale classifies as kEnabled, not kDegraded — is_rbac_enabled() short-
+// circuits before rbac_enabled_view_degraded() is ever consulted, mirroring
+// rbac_enforcement_in_effect()'s own precedence exactly. Reuses the same
+// starved-replica technique as the sibling rbac_enforcement_in_effect
+// staleness test (#2703) so this is the REAL degrade path, not a stand-in.
+TEST_CASE("rbac_enforcement_label: cached-enabled short-circuits past a stale view — stays "
+         "kEnabled, never kDegraded (documents the one deliberate asymmetry vs. a granular "
+         "read)",
+         "[rbac_store][visibility][pg]") {
+    RBAC_STORE(replica_a);
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.is_rbac_enabled());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    // replica_b observes the durable enable at its own construction (shares
+    // the same already-migrated database as replica_a via RBAC_STORE's
+    // template clone — but set_rbac_enabled(true) above ran AFTER replica_b's
+    // template was cloned, so replica_b must independently observe it here).
+    REQUIRE(replica_b.is_rbac_enabled());
+
+    // Starve replica_b's pool so every subsequent refresh attempt times out,
+    // then advance wall time past kRbacStaleServeBoundMs — the exact
+    // technique the sibling rbac_enforcement_in_effect staleness test uses.
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+
+    // The view is now genuinely stale — proven directly, bypassing
+    // is_rbac_enabled()'s own refresh attempt (Gate 8 technique, lines above)
+    // — but the label still reports kEnabled: is_rbac_enabled() itself
+    // re-attempts a refresh, fails (pool starved), and per its own "never
+    // touch rbac_enabled_ on a read error" contract keeps serving the
+    // last-known-good cached value, which was `true`.
+    CHECK(replica_b.rbac_enabled_view_degraded());
+    CHECK(replica_b.is_rbac_enabled());
+    CHECK(rbac_enforcement_label(&replica_b) == RbacEnforcementLabel::kEnabled);
+    // Gates still deny either way — the exact-mapping property holds even on
+    // this asymmetric branch.
+    CHECK(rbac_enforcement_in_effect(&replica_b));
+}
+
 // ── Role CRUD ────────────────────────────────────────────────────────────────
 
 TEST_CASE("RbacStore: create custom role", "[rbac_store][pg]") {
