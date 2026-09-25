@@ -7,14 +7,19 @@
 // a genuine empirical observation rather than an inference from the other two legs.
 //
 // MI-1: correctness of install_log_handoff_in_this_image()/
-// release_log_handoff_from_this_image() across this test binary's own image, PLUS the
-// topology measurement itself - does a call compiled into THIS test binary's image and a
-// call compiled into libyuzu_agent_core.so's image (log_handoff_emit_probe_for_test(),
-// log_handoff.hpp) both land in the same capture sink once install_log_handoff_in_this_image()
-// has run? If both reach it, the two images route through the same default-logger slot
-// (whether that means one shared registry, or two registries whose "" default-logger
-// entries happen to alias the same object, is not distinguished by this measurement -
-// only that a caller in either image observes the same effective logger).
+// release_log_handoff_from_this_image() across this test binary's own image, PLUS a FIRST
+// measurement - does a call compiled into THIS test binary's image and a call compiled
+// into libyuzu_agent_core.so's image (log_handoff_emit_probe_for_test(), log_handoff.hpp)
+// both land in the same capture sink once install_log_handoff_in_this_image() has run?
+// IMPORTANT: this measurement alone does NOT distinguish "one shared registry" from "two
+// separate registries, each independently pointed at the same logger by
+// install_log_handoff_in_this_image()'s own redundant same-image call" - see MI-1b below,
+// which is the test that actually discriminates the two.
+//
+// MI-1b: the actual topology discriminator - isolates LogHandoff::install()/teardown()'s
+// OWN, library-only effect from agent_log_wiring.hpp's exe-image half, answering the
+// question this whole fixture exists for: is that exe-image half load-bearing, or a
+// defensive no-op?
 //
 // MI-3: a REAL agent_actions plugin dispatch measures the same question from a THIRD
 // image (a loaded plugin .so/.dylib/.dll) via a production code path: its real
@@ -69,6 +74,12 @@ namespace {
 // test` invocation of this binary) - verified empirically that `meson test` itself runs
 // with CWD == build root, so the fallback lands in the same place MESON_BUILD_ROOT
 // would point to anyway.
+//
+// Catch2 does not run TEST_CASEs in source-declaration order (randomized by default in
+// this suite), and MI-1/MI-1b/MI-3 each contribute their own section to this one report
+// file - so the FIRST call in a given process truncates (clearing stale content left by
+// an earlier `meson test` run), and every call after that appends, regardless of which
+// TEST_CASE happens to run first.
 void write_topology_report(const std::string& text) {
     fs::path out_dir;
     if (const auto* build_root = std::getenv("MESON_BUILD_ROOT"))
@@ -80,7 +91,11 @@ void write_topology_report(const std::string& text) {
     fs::create_directories(out_dir, ec); // no-op if it already exists; ignore failure -
                                           // the ofstream open below is the real check.
 
-    std::ofstream out{out_dir / "log_handoff_multi_image_topology.txt", std::ios::trunc};
+    static bool truncated_once = false;
+    const auto mode = truncated_once ? std::ios::app : std::ios::trunc;
+    truncated_once = true;
+
+    std::ofstream out{out_dir / "log_handoff_multi_image_topology.txt", mode};
     if (out)
         out << text;
 }
@@ -164,27 +179,40 @@ TEST_CASE("MI-1: install_log_handoff_in_this_image/release_log_handoff_from_this
     // observational verdict below.
     REQUIRE(saw_test_line);
 
-    std::string topology;
+    // IMPORTANT CAVEAT (found while writing this file's own report - see MI-1b below):
+    // install_log_handoff_in_this_image() does not ONLY call LogHandoff::install()
+    // (which runs inside libyuzu_agent_core's own image and touches only THAT image's
+    // registry) - it ALSO makes its own, SEPARATE, redundant spdlog::set_default_logger(lg)
+    // call, which is header-only and therefore executes physically inside THIS CALLING
+    // image, touching THIS image's OWN registry if it is a different object. That second
+    // call means "both lines reach the sink" is GUARANTEED by install_log_handoff_in_this_image()'s
+    // own design REGARDLESS of whether there are one or two registry objects underneath -
+    // it does NOT by itself discriminate the two topologies. MI-1b below is the test that
+    // actually discriminates them, by calling LogHandoff::install() directly (bypassing
+    // the redundant call) and by tearing down without the exe-image swap.
+    std::string finding;
     if (saw_library_line && saw_test_line) {
-        topology = "SHARED (or at least routed to the same effective default-logger slot): "
-                   "both the library-image probe and the test-image call reached the same "
-                   "capture sink";
+        finding = "both the library-image probe and the test-image call reached the same "
+                  "capture sink after install_log_handoff_in_this_image() ran (does NOT by "
+                  "itself distinguish one shared registry from two separately-installed "
+                  "ones - see MI-1b)";
     } else if (saw_test_line && !saw_library_line) {
-        topology = "SEPARATE: the test-image call reached the capture sink but the "
-                   "library-image probe did not - libyuzu_agent_core's image appears to "
-                   "have its own spdlog registry/default-logger slot, distinct from this "
-                   "test binary's";
+        finding = "the test-image call reached the capture sink but the library-image "
+                  "probe did not - unexpected given install_log_handoff_in_this_image()'s "
+                  "own design (LogHandoff::install() itself, which runs in the library "
+                  "image, already points that image's registry at the same logger); "
+                  "investigate before trusting this result";
     } else {
-        topology = "AMBIGUOUS: neither line landed as expected - see the raw capture below";
+        finding = "neither line landed as expected - see the raw capture below";
     }
 
-    INFO("MI-1 topology: " << topology);
-    WARN("MI-1 topology: " << topology);
+    INFO("MI-1 finding: " << finding);
+    WARN("MI-1 finding: " << finding);
 
-    std::string report = "#4666 PR-2 W3a MI-1 topology measurement\n";
+    std::string report = "#4666 PR-2 W3a MI-1 measurement (see MI-1b for the topology verdict)\n";
     report += "saw_library_line=" + std::string(saw_library_line ? "true" : "false") + "\n";
     report += "saw_test_line=" + std::string(saw_test_line ? "true" : "false") + "\n";
-    report += "conclusion: " + topology + "\n";
+    report += "finding: " + finding + "\n";
     report += "raw capture (" + std::to_string(snap.size()) + " line(s)):\n";
     for (const auto& c : snap)
         report += "  - " + c.payload + "\n";
@@ -218,6 +246,124 @@ TEST_CASE("MI-1: install_log_handoff_in_this_image applies the level - a below-l
     const auto snap = sink->snapshot();
     REQUIRE(snap.size() == 1);
     CHECK(snap[0].payload == "at-the-installed-level");
+}
+
+// ---------------------------------------------------------------------------
+// MI-1b: the actual topology discriminator.
+//
+// MI-1 above cannot by itself distinguish "one shared registry" from "two separate
+// registries, each independently pointed at the same logger by design" -
+// install_log_handoff_in_this_image() ALWAYS makes its own redundant, same-image
+// spdlog::set_default_logger(lg) call IN ADDITION TO LogHandoff::install()'s own internal
+// one (see agent_log_wiring.hpp's own comment on that redundancy), so "both lines reach
+// the sink" is guaranteed by that design regardless of the underlying topology. These two
+// cases isolate LogHandoff::install()/teardown()'s OWN, library-only effect from
+// agent_log_wiring.hpp's exe-image half, to answer the actual question this fixture
+// exists for: is that exe-image half load-bearing, or a defensive no-op?
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MI-1b(a): does LogHandoff::install() ALONE (bypassing the exe-image redundant "
+          "spdlog::set_default_logger call) make a same-image spdlog::info() reach the sink?",
+          "[log_handoff][multi_image]") {
+    auto sink = std::make_shared<GatedCaptureSink>(/*initially_paused=*/false);
+    auto result = LogHandoff::create_with_sinks({sink});
+    REQUIRE(result.has_value());
+    auto h = std::move(*result);
+    yuzu::test::ScopeExit release_on_exit{[&] { release_log_handoff_from_this_image(*h); }};
+
+    {
+        auto lg = h->install(); // R-LOGGER: this returned reference is dropped at the end
+                                 // of this scope, never held past it (agent_log_wiring.hpp's
+                                 // own rule) - deliberately NOT calling
+                                 // install_log_handoff_in_this_image() here, which would
+                                 // additionally make its own same-image
+                                 // spdlog::set_default_logger(lg) call and defeat the whole
+                                 // point of this measurement.
+        REQUIRE(lg != nullptr);
+        lg->set_level(spdlog::level::info);
+    }
+
+    const bool same_default_ptr = (spdlog::default_logger_raw() == h->logger().get());
+
+    spdlog::info("MI-1b(a) probe line");
+    const bool reached = yuzu::test::spin_until([&] { return sink->count() >= 1; }, 2s);
+
+    std::string verdict;
+    if (same_default_ptr && reached) {
+        verdict = "ONE registry (or at least this image's default-logger pointer already "
+                  "aliases the library's): LogHandoff::install() ALONE, with no exe-image "
+                  "redundant call, was enough for this image's own spdlog::info() to reach "
+                  "the sink";
+    } else {
+        verdict = "TWO (or more) registries: LogHandoff::install() alone did NOT route this "
+                  "image's own spdlog::info() to the sink (same_default_ptr=" +
+                  std::string(same_default_ptr ? "true" : "false") +
+                  ", reached=" + std::string(reached ? "true" : "false") +
+                  ") - install_log_handoff_in_this_image()'s redundant exe-image "
+                  "spdlog::set_default_logger() call is what makes that work in production";
+    }
+    WARN("MI-1b(a) verdict: " << verdict);
+
+    std::string report = "#4666 PR-2 W3a MI-1b(a) measurement\n";
+    report += "same_default_ptr=" + std::string(same_default_ptr ? "true" : "false") + "\n";
+    report += "reached=" + std::string(reached ? "true" : "false") + "\n";
+    report += "verdict: " + verdict + "\n";
+    write_topology_report(report);
+}
+
+TEST_CASE("MI-1b(b): with the exe-image swap skipped, does a bare LogHandoff::teardown() "
+          "alone already destroy the sink, or does this image's own registry keep it alive?",
+          "[log_handoff][multi_image]") {
+    auto sink = std::make_shared<GatedCaptureSink>(/*initially_paused=*/false);
+    auto closed = sink->closed_flag();
+
+    auto result = LogHandoff::create_with_sinks({sink});
+    REQUIRE(result.has_value());
+    auto h = std::move(*result);
+
+    REQUIRE(install_log_handoff_in_this_image(*h, spdlog::level::info, /*json_format=*/false));
+    sink.reset(); // drop OUR reference - see MI-1's own comment on the same pattern.
+
+    // Deliberately call LogHandoff::teardown() DIRECTLY, bypassing
+    // release_log_handoff_from_this_image()'s own exe-image spdlog::set_default_logger(null
+    // sink) swap. teardown() is a real, exported LogHandoff member compiled in
+    // log_handoff.cpp - it can only ever touch the registry IT physically runs in (the
+    // library's own, per log_handoff.hpp's own T2 comment), never this calling image's
+    // separate registry entry (if one exists) that install_log_handoff_in_this_image()'s
+    // earlier redundant call created.
+    h->teardown();
+
+    const bool closed_after_bare_teardown = closed->load(std::memory_order_acquire);
+
+    std::string verdict;
+    if (closed_after_bare_teardown) {
+        verdict = "a bare h->teardown() (library-only, no exe-image swap) ALREADY destroyed "
+                  "the sink - the exe-image logger swap in "
+                  "release_log_handoff_from_this_image() looks REDUNDANT (a defensive no-op) "
+                  "on this platform";
+    } else {
+        verdict = "a bare h->teardown() did NOT destroy the sink - this image's OWN registry "
+                  "still held a live reference to the logger (and therefore its sinks) after "
+                  "the library-only teardown ran; the exe-image logger swap in "
+                  "release_log_handoff_from_this_image() is LOAD-BEARING on this platform, "
+                  "confirmed below by observing it actually finish the job";
+    }
+    WARN("MI-1b(b) verdict (before exe-image swap): " << verdict);
+
+    // Finish the real shutdown sequence the same way main.cpp's LogHandoffEpilogue does -
+    // teardown() on an already-torn-down instance is documented idempotent (a no-op), so
+    // this call's only NEW effect (if any) is release_log_handoff_from_this_image()'s own
+    // same-image spdlog::set_default_logger(null sink) swap.
+    release_log_handoff_from_this_image(*h);
+    REQUIRE(closed->load(std::memory_order_acquire));
+
+    std::string report =
+        "#4666 PR-2 W3a MI-1b(b) measurement (the direct load-bearing-vs-no-op answer)\n";
+    report += "closed_after_bare_teardown=" +
+              std::string(closed_after_bare_teardown ? "true" : "false") + "\n";
+    report += "closed_after_exe_image_swap=true (REQUIRE'd above)\n";
+    report += "verdict: " + verdict + "\n";
+    write_topology_report(report);
 }
 
 // ---------------------------------------------------------------------------

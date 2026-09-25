@@ -76,6 +76,13 @@ done
 # underscore-prefixed form (Darwin) hit.
 SYM_REGISTRY="spdlog7details8registry8instanceEv"
 SYM_DEFAULT_LOGGER="spdlog18default_logger_rawEv"
+# spdlog::set_level() -- the ACTUAL function agent_actions_plugin.cpp's do_set_log_level()
+# calls. Probed as a third, plugin-relevant symbol: on a Darwin build where the plugin
+# never directly references #1/#2 (its own code only calls set_level()/from_str()), this
+# is the one symbol that shows the plugin's real binding -- e.g. "(undefined) external
+# ... (from libyuzu_agent_core)", meaning the plugin's spdlog::set_level() call physically
+# executes as libyuzu_agent_core's own compiled code, against ITS OWN registry.
+SYM_SET_LEVEL="spdlog9set_levelENS_5level10level_enumE"
 
 # Linux: nm -D --defined-only lists symbols this ELF image itself DEFINES in its dynamic
 # symbol table (.dynsym); nm -D -u lists symbols it leaves UNDEFINED (resolved from
@@ -137,7 +144,31 @@ echo "test_spdlog_registry_identity: symbol-binding topology"
 report_symbol "$SYM_REGISTRY" "spdlog::details::registry::instance()"
 echo ""
 report_symbol "$SYM_DEFAULT_LOGGER" "spdlog::default_logger_raw()"
+echo ""
+report_symbol "$SYM_SET_LEVEL" "spdlog::set_level()"
+
+# Darwin-specific interpretive note: a DEFINED (local, non-imported) classification for
+# registry::instance() in BOTH the exe and the core lib means each image carries its OWN
+# compiled copy of the function-local static singleton accessor -- i.e. two SEPARATE
+# spdlog::details::registry objects under Mach-O's two-level namespace (no dyld symbol
+# coalescing observed for this pair on this build). This is report-only supporting
+# evidence, not proof by itself -- test_log_handoff_multi_image.cpp's MI-1b is the actual
+# runtime discriminator between "two objects" and "two objects that still behave as one
+# because they hold the same underlying shared_ptr<logger>".
+if [ "$(uname -s)" = "Darwin" ]; then
+  exe_registry_class="$(classify_darwin "$EXE" "$SYM_REGISTRY")"
+  core_registry_class="$(classify_darwin "$CORE_LIB" "$SYM_REGISTRY")"
+  if [[ "$exe_registry_class" == DEFINED* ]] && [[ "$core_registry_class" == DEFINED* ]]; then
+    echo ""
+    echo "NOTE (Darwin): yuzu-agent AND libyuzu_agent_core both carry their own DEFINED,"
+    echo "non-imported copy of registry::instance() -- consistent with two SEPARATE"
+    echo "spdlog::details::registry singletons under Mach-O's two-level namespace, one per"
+    echo "image. See test_log_handoff_multi_image.cpp's MI-1b for the runtime-confirmed"
+    echo "answer to what that implies for install_log_handoff_in_this_image()/"
+    echo "release_log_handoff_from_this_image()."
+  fi
+fi
 
 echo ""
 echo "test_spdlog_registry_identity: OK -- report-only (see tables above); this cannot"
-echo "prove RUNTIME binding from static symbol tables alone -- test_log_handoff_multi_image.cpp's MI-1/MI-3 are the actual measurement"
+echo "prove RUNTIME binding from static symbol tables alone -- test_log_handoff_multi_image.cpp's MI-1/MI-1b/MI-3 are the actual measurement"
