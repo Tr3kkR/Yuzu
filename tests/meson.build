@@ -291,6 +291,7 @@ agent_test_exe = executable(
     'unit/test_hard_exit.cpp',
     'unit/test_shutdown_deadline_guard.cpp',
     'unit/test_log_handoff.cpp', # #4666 PR-1: bounded async log hand-off primitive
+    'unit/test_service_completion.cpp', # #4666 PR-2: service shutdown completion handshake
     'unit/test_spark_detached_call.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
