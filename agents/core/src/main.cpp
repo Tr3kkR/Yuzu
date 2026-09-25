@@ -969,7 +969,12 @@ int main(int argc, char* argv[]) {
                 yuzu::agent::kOrphanDrainGrace)) {
             // Firewalled: a logging exception here must never skip hard_exit()
             // below - same rationale as log_quietly() elsewhere in this file
-            // (Sol rung-7.6 review finding 2).
+            // (Sol rung-7.6 review finding 2). The #4666 PR-2 drain_log_bounded()
+            // call below shares this SAME try/catch, not a separate one -
+            // drain_log_bounded() is not declared noexcept (log_handoff.hpp), so
+            // leaving it outside this firewall would let an exception there skip
+            // hard_exit() entirely (caught in review; service_win.cpp's equivalent
+            // F3 site hit and fixed the identical hazard independently).
             try {
                 // "Guardian I/O worker(s)" until PR-A (#2012/#3840): n is now a
                 // SUM (guardian_active_io_workers()'s own doc comment) of
@@ -982,12 +987,12 @@ int main(int argc, char* argv[]) {
                                  "after shutdown - forcing process exit rather than race "
                                  "static/DSO teardown against them",
                                  n, yuzu::agent::kOrphanDrainGrace.count());
+                // Best-effort bounded attempt to land the critical() line above
+                // before hard_exit() below throws the rest of the log queue away —
+                // not a delivery guarantee (#4666 PR-2).
+                yuzu::agent::drain_log_bounded(std::chrono::milliseconds{200});
             } catch (...) {
             }
-            // Best-effort bounded attempt to land the spdlog::critical() line above
-            // before hard_exit() below throws the rest of the log queue away — not a
-            // delivery guarantee (#4666 PR-2).
-            yuzu::agent::drain_log_bounded(std::chrono::milliseconds{200});
             yuzu::agent::hard_exit(3); // distinct from EXIT_FAILURE(1) / signal-hard-exit(1)
         }
     }
