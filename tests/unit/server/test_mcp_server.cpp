@@ -27066,6 +27066,42 @@ TEST_CASE("MCP create_result_set_from_inventory_query: an oversized parent_id is
     CHECK(body["error"]["code"] == kInvalidParams);
 }
 
+// #4307 item 6: the generic create_result_set tool's parent_id shape check
+// used to be `contains && is_string && !empty`, so a malformed/empty
+// parent_id fell through to the untargeted "no parent" arm and was silently
+// accepted -- mirrors REST's identical fix on the generic
+// POST /api/v1/result-sets route. This tool never dispatches, so the
+// consequence is a lineage/UX defect, not a dispatch-safety one -- checked
+// ahead of the store-availability gate, so this is a client error even with
+// no ResultSetStore wired.
+TEST_CASE("MCP create_result_set: a malformed or empty parent_id is refused with "
+          "kInvalidParams, not silently treated as parentless",
+          "[mcp][result-sets][security][4307]") {
+    McpTestServer ts;
+    ts.start();
+
+    SECTION("numeric parent_id") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"name":"x","parent_id":123}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
+              std::string::npos);
+    }
+    SECTION("empty-string parent_id") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set","arguments":{"name":"x","parent_id":""}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
+              std::string::npos);
+    }
+}
+
 // Gate 4 unhappy-path finding (#4364 re-review): create_result_set has no
 // source_kind allowlist and only bounds source_kind's own length, so a row
 // can be minted directly (bypassing the create-time params checks
@@ -29248,6 +29284,97 @@ TEST_CASE("MCP result-sets: happy-path lifecycle (create, get, members, lineage,
         CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_FOUND") !=
               std::string::npos);
     }
+}
+
+TEST_CASE("MCP list_result_sets: a wrong-typed limit is rejected, never silently "
+          "defaulted (#2970B/#4307 item 7)",
+          "[pg][mcp][integration][result-sets]") {
+    // param_int used to silently substitute the default (50) for a
+    // present-but-wrong-typed limit -- a JSON string or bool -- so a
+    // caller's typo/serialisation mistake went entirely unreported. Mirrors
+    // the established param_int_strict adoptions elsewhere in this file
+    // (e.g. rotate_api_token's overlap_days).
+    yuzu::test::ResultSetStorePg rs_bundle;
+    CreateRequest cr;
+    cr.owner_principal = "test-user";
+    cr.name = "has-one";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    REQUIRE(rs_bundle.get()->create_materialized(cr, {"a"}).has_value());
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start();
+
+    // A JSON string is what a loosely-typed client sends for an integer.
+    auto str_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_result_sets","arguments":{"limit":"50"}}})");
+    REQUIRE(str_res);
+    auto str_body = nlohmann::json::parse(str_res->body);
+    REQUIRE(str_body.contains("error"));
+    CHECK(str_body["error"]["code"] == kInvalidParams);
+    CHECK(str_body["error"]["message"].get<std::string>().find("must be a JSON integer") !=
+          std::string::npos);
+
+    // A JSON bool is the other loosely-typed shape.
+    auto bool_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_result_sets","arguments":{"limit":true}}})");
+    REQUIRE(bool_res);
+    auto bool_body = nlohmann::json::parse(bool_res->body);
+    REQUIRE(bool_body.contains("error"));
+    CHECK(bool_body["error"]["code"] == kInvalidParams);
+
+    // A genuinely absent limit still applies the default -- omitted is not
+    // malformed, this proves the fix didn't tighten that case too.
+    auto ok_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_result_sets","arguments":{}}})");
+    REQUIRE(ok_res);
+    auto ok_body = nlohmann::json::parse(ok_res->body);
+    REQUIRE(ok_body.contains("result"));
+}
+
+TEST_CASE("MCP get_result_set_members: a wrong-typed limit is rejected, never silently "
+          "defaulted (#2970B/#4307 item 7)",
+          "[pg][mcp][integration][result-sets]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    CreateRequest cr;
+    cr.owner_principal = "test-user";
+    cr.name = "has-members";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto seeded = rs_bundle.get()->create_materialized(cr, {"a", "b"});
+    REQUIRE(seeded.has_value());
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start();
+
+    auto str_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_result_set_members","arguments":{"id":")" +
+        seeded->id + R"(","limit":"1000"}}})");
+    REQUIRE(str_res);
+    auto str_body = nlohmann::json::parse(str_res->body);
+    REQUIRE(str_body.contains("error"));
+    CHECK(str_body["error"]["code"] == kInvalidParams);
+    CHECK(str_body["error"]["message"].get<std::string>().find("must be a JSON integer") !=
+          std::string::npos);
+
+    auto bool_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"get_result_set_members","arguments":{"id":")" +
+        seeded->id + R"(","limit":false}}})");
+    REQUIRE(bool_res);
+    auto bool_body = nlohmann::json::parse(bool_res->body);
+    REQUIRE(bool_body.contains("error"));
+    CHECK(bool_body["error"]["code"] == kInvalidParams);
+
+    // A genuinely absent limit still applies the default.
+    auto ok_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"get_result_set_members","arguments":{"id":")" +
+        seeded->id + R"("}}})");
+    REQUIRE(ok_res);
+    auto ok_body = nlohmann::json::parse(ok_res->body);
+    REQUIRE(ok_body.contains("result"));
+    CHECK(ok_body["result"]["structuredContent"]["device_ids"].size() == 2);
 }
 
 TEST_CASE("MCP result-sets: a non-owner sees the same not-found as a nonexistent id "

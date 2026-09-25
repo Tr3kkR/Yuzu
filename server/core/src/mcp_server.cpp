@@ -11669,7 +11669,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                int64_t limit = param_int(args, "limit", 50);
+                // #4307 item 7 (#2970B convention): param_int silently
+                // substitutes the default on a present-but-wrong-typed
+                // `limit` (e.g. a string or bool) rather than rejecting it -
+                // param_int_strict returns nullopt for that shape instead,
+                // matching the established sites elsewhere in this file
+                // (e.g. list_definitions' iq.limit above).
+                const auto limit_opt = param_int_strict(args, "limit", 50);
+                if (!limit_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not
+                        // a store/query fault - resending the identical
+                        // malformed argument cannot succeed.
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                int64_t limit = *limit_opt;
                 if (limit < 1)
                     limit = 1;
                 if (limit > 500)
@@ -11743,6 +11759,37 @@ McpServer::HandlerFn McpServer::build_handler(
                 // device_ids bound was ever checked - the exact "same input
                 // class, different outcome" inconsistency update_management_
                 // group's own fix (above) closed for a sibling tool.
+                //
+                // #4307 item 6: a malformed/empty parent_id (`{"parent_id":
+                // 123}` or `{"parent_id":""}`) previously fell straight
+                // through the is_string()+!empty() guard below and was
+                // silently treated as "no parent_id" -- mirrors REST's
+                // identical fix on the generic POST /api/v1/result-sets
+                // route. Unlike the three create_result_set_from_*/
+                // reevaluate_result_set producers' identically-shaped guard
+                // (#2500), parent_id here is NOT a dispatch-targeting
+                // argument -- this tool is synchronous and never dispatches
+                // -- so this is a caller-UX/lineage-correctness fix, not a
+                // dispatch-safety one: no
+                // yuzu_server_dispatch_target_rejected_total counter (that
+                // metric family is reserved for the targeting-argument
+                // tools).
+                if (args.contains("parent_id") &&
+                    (!args["parent_id"].is_string() ||
+                     args["parent_id"].get_ref<const std::string&>().empty())) {
+                    const std::string_view reason = args["parent_id"].is_string()
+                                                        ? kReasonParentIdEmpty
+                                                        : kReasonParentIdType;
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   std::string("reason=") + std::string(reason));
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_PARENT: parent_id was supplied but names "
+                                       "no parent set; omit it entirely to leave the set "
+                                       "parentless"),
+                        "application/json");
+                    return;
+                }
                 std::optional<std::string> pid;
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
@@ -12736,7 +12783,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
-                int64_t limit = param_int(args, "limit", 1000);
+                // #4307 item 7 (#2970B convention): param_int silently
+                // substitutes the default on a present-but-wrong-typed
+                // `limit` rather than rejecting it - param_int_strict
+                // returns nullopt for that shape instead, matching this
+                // tool's sibling list_result_sets above.
+                const auto limit_opt = param_int_strict(args, "limit", 1000);
+                if (!limit_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not
+                        // a store/query fault - resending the identical
+                        // malformed argument cannot succeed.
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                int64_t limit = *limit_opt;
                 if (limit < 1)
                     limit = 1;
                 if (limit > 10000)
