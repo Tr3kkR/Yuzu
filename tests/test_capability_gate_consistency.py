@@ -98,6 +98,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
 ]
@@ -129,14 +130,15 @@ FRAGMENT_FILES = [
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
 # 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
-# 2 (browser_inventory) + 1 (firmware_posture) = 217.
+# 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) = 219.
 # This constant has been bumped independently on both sides of a merge several times
 # (PR #4719 CI is the trail; #4721 tracks deriving it per fragment). The rule is
 # always the same: find the shared baseline both sides agree on and add EVERY side's new
 # plugin on top of it, never pick one side's total. Dev is at 216 here (209 baseline +
 # printing.clear_queue 1 + app_control 2 + platform_security 2 + browser_inventory 2);
-# this branch adds firmware_posture's 1 row: 216 + 1 = 217.
-EXPECTED_TOTAL_ROWS = 217
+# firmware_posture's 1 row and runtimes' 2 rows (dotnet, jvm) landed independently on the
+# two sides of the merge: 216 + 1 + 2 = 219.
+EXPECTED_TOTAL_ROWS = 219
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
