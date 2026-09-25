@@ -61,6 +61,7 @@
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
 
+#include <yuzu/log_token.hpp> // is_valid_rule_id — shared REST/MCP/agent rule id charset (#4665)
 #include <yuzu/server/auth_db.hpp> // is_valid_username, is_valid_principal
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
@@ -668,7 +669,7 @@ const std::string& openapi_spec() {
       "GuaranteedStateRule": {
         "type": "object",
         "properties": {
-          "rule_id": {"type": "string", "description": "Stable operator-chosen id ([A-Za-z0-9._-]+)"},
+          "rule_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$", "maxLength": 256, "description": "Stable operator-chosen id ([A-Za-z0-9._-]+)"},
           "name": {"type": "string"},
           "yaml_source": {"type": "string", "description": "Authoritative rule body (kind: GuaranteedStateRule)"},
           "version": {"type": "integer"},
@@ -12556,16 +12557,20 @@ void RestApiV1::register_routes(
             row.yaml_source = body.value("yaml_source", std::string{});
         }
 
-        if (row.rule_id.empty() || row.name.empty() ||
+        if (!is_valid_rule_id(row.rule_id) || row.name.empty() ||
             (!spec.structured && row.yaml_source.empty())) {
             res.status = 400;
             res.set_content(
                 detail::error_json_a4(
                     400,
-                    "rule_id and name are required, plus either a structured "
-                    "spark+assertion or a yaml_source",
-                    cid, "provide rule_id, name and a spark+assertion (or yaml_source)"),
+                    "rule_id must be non-empty, match [A-Za-z0-9._-]+, and be at most 256 "
+                    "bytes; name is required, plus either a structured spark+assertion or a "
+                    "yaml_source",
+                    cid, "provide a valid rule_id ([A-Za-z0-9._-]+, <= 256 bytes), name and a "
+                         "spark+assertion (or yaml_source)"),
                 "application/json");
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState",
+                     row.rule_id, "invalid rule_id, missing name, or missing yaml_source");
             return;
         }
         row.created_by = session->username;

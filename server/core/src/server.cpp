@@ -3448,14 +3448,20 @@ public:
         // the fleet-wide signal that a rule silently stopped enforcing (the
         // rule's own detail page also shows an "invalid data" state, but an
         // operator who never opens that specific rule would otherwise have no
-        // tell). Pre-seed the one closed reason value so the series exists at
-        // zero on a healthy fleet.
+        // tell). A rule_id that fails the create-time charset/length contract
+        // (#4665) is excluded the same way — reason=invalid_rule_id, added
+        // alongside depth_exceeded when the push-builder's server-side filter
+        // for it landed. Pre-seed BOTH closed reason values so each series
+        // exists at zero on a healthy fleet (docs/observability-conventions.md:
+        // every known label combination of a closed-set label is initialised).
         metrics_.describe("yuzu_guardian_push_rule_excluded_total",
-                          "Guardian rules excluded from a push, by reason (currently only "
-                          "depth_exceeded)",
+                          "Guardian rules excluded from a push, by reason (depth_exceeded, "
+                          "invalid_rule_id)",
                           "counter");
         metrics_.counter("yuzu_guardian_push_rule_excluded_total",
                          {{"reason", "depth_exceeded"}});
+        metrics_.counter("yuzu_guardian_push_rule_excluded_total",
+                         {{"reason", "invalid_rule_id"}});
         // T12 (design doc §7): engine-credential overlap-pair rotation sweep.
         // Deliberately a bounded `reason` label set (currently one value,
         // "successor_unused") and NOT `event="security"` — this is an
