@@ -2595,6 +2595,24 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
+# #4666 PR-2 acceptance-evidence harness: formalizes the hand-verified manual
+# repro of the blocked-log-sink SIGTERM scenario (main.cpp's async log
+# hand-off, log_handoff.hpp) into a committed, repeatable shell test against
+# the real yuzu-agent binary. Linux-only -- the blockage-detection mechanism
+# reads /proc/<pid>/task/*/wchan, which has no equivalent on macOS/Windows.
+# `yuzu_agent_exe` (agents/core/meson.build) is named specifically so this
+# depends: entry can pin the real agent binary as a build dependency.
+if (_bash_test.found() and meson.can_run_host_binaries() and build_agent
+    and host_machine.system() == 'linux')
+  test('blocked log sink SIGTERM harness (#4666 PR-2)',
+    _bash_test,
+    args: [files('shell/test_blocked_log_sink_sigterm.sh'), meson.project_build_root()],
+    suite: 'agent',
+    timeout: 300,
+    depends: [yuzu_agent_exe],
+  )
+endif
+
 # End-to-end fake-Meson contract. In particular, an expired/malformed flake
 # registry must fail before the real test runner could be invoked. The script
 # uses POSIX executable fakes and returns a clean platform skip on Windows.
