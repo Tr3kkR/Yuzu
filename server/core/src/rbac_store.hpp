@@ -565,32 +565,47 @@ private:
 /// verdict (adversarial-review round, #2703).
 [[nodiscard]] bool rbac_enforcement_in_effect(const RbacStore* store) noexcept;
 
-/// Three-way classification of RBAC enforcement state — strictly more
-/// granular than `rbac_enforcement_in_effect`'s plain enforced/not-enforced
-/// boolean, which deliberately conflates "genuinely enabled" with "degraded
-/// view, deny by default" (both gate DENY, so the boolean is right for
-/// authorization). A caller that needs to distinguish the two — e.g. to map
-/// a degraded-view "no matching row" outcome to a retryable kUnavailable
-/// instead of a terminal kDenied, see `rbac_admin_predicate.hpp`'s
-/// `is_rbac_administrator` — needs this split instead.
+/// Three-way classification of RBAC enforcement state (originally A3, the
+/// Periodic Access Review export, SOC 2 CC6.2; reconciled here with a second,
+/// independently-authored consumer from PR #4985/A2, `rbac_admin_predicate.
+/// hpp`'s `is_rbac_administrator` — both PRs built the identical shape
+/// against this branch's own primitives before either merged, converging on
+/// this one definition rather than shipping two) — strictly more granular
+/// than `rbac_enforcement_in_effect`'s plain enforced/not-enforced boolean,
+/// which deliberately conflates "genuinely enabled" with "degraded view,
+/// deny by default" (both gate DENY, so the boolean is right for
+/// authorization).
 ///
-/// Doomgoose external review, PR #4985 (IMPORTANT #2): `is_rbac_administrator`
-/// previously treated "no Administrator principal_roles row" identically
-/// whether enforcement was genuinely enabled or only conservatively treated
-/// as enabled during a cache-refresh degrade, silently downgrading a
-/// transient store hiccup into a terminal 403 — exactly the failure mode
-/// that file's own header comment says must never happen. This enum is the
-/// shared primitive both this predicate and any future/sibling classifier
-/// need; EXTEND it, never fork a second copy, matching
-/// `authz_topology_floor.hpp`'s own rule. (Note for whoever reconciles this
-/// with PR #4986/A3, a sibling in flight at the time this was written: that
-/// PR built a conceptually identical three-state classifier for a different
-/// consumer — the access-review export's audit-facing `rbac_enforcement`
-/// stamp. This definition was authored independently against this branch's
-/// own `rbac_enforcement_in_effect`/`rbac_enabled_view_degraded` primitives
-/// — A3's code was not merged here — but intentionally converges on the same
-/// shape/name so the eventual merge collapses to one definition rather than
-/// two competing ones.)
+/// PRIMARY use: an AUDIT-FACING label for export/evidence surfaces. An
+/// auditor reading an evidence export needs the distinction a bare boolean
+/// erases: a `kDegraded` stamp says "we could not confirm the state, gates
+/// denied defensively" — NOT "an administrator turned RBAC on".
+///
+/// SANCTIONED non-export use: `is_rbac_administrator` (Doomgoose external
+/// review, PR #4985 IMPORTANT #2) reads this label to choose WHICH
+/// non-admitting failure to return — a retryable `kUnavailable` (503) versus
+/// a terminal `kDenied` (403) — when a `principal_roles` lookup finds no
+/// Administrator row. It was previously conflating "genuinely enabled, no
+/// row" with "degraded, no row" and returning a terminal 403 for a transient
+/// store hiccup, exactly the failure mode this enum exists to let a caller
+/// avoid. This does NOT admit on `kDegraded` or on any other value — the
+/// admit/deny outcome is unchanged, and stays governed entirely by
+/// `rbac_enforcement_in_effect()`'s own boolean (equal to `!= kDisabled`
+/// below) plus the row lookup; the label only selects the shape of an
+/// already-non-admitting response. It reads `rbac_enforcement_label()`
+/// exactly ONCE per call and branches on that one snapshot — do NOT
+/// decompose this into a call to `rbac_enforcement_in_effect()` plus a
+/// second, separate call to this function "to satisfy the letter" of
+/// export-only use: the view can self-heal between two calls (a healthy
+/// pool's next refresh clears a stale cache), so two calls can observe two
+/// different states across one logical decision.
+///
+/// EXCEPT for that one sanctioned consumer: this is a READ-ONLY label. A NEW
+/// caller deciding whether to admit/deny a request MUST use
+/// `rbac_enforcement_in_effect()` directly, never this enum — adding a
+/// second non-export consumer is a security decision, not a routine edit,
+/// and needs the same admit/deny-outcome-unchanged proof `is_rbac_
+/// administrator` above satisfies.
 enum class RbacEnforcementLabel {
     kEnabled,  ///< store open, `is_rbac_enabled() == true`.
     kDisabled, ///< store open, `is_rbac_enabled() == false`, view FRESH — the
@@ -604,10 +619,42 @@ enum class RbacEnforcementLabel {
 /// Maps `store` to one of the three `RbacEnforcementLabel` states above.
 /// Deliberately mirrors `rbac_enforcement_in_effect`'s own branch order and
 /// short-circuiting EXACTLY (same three accessors, same precedence) so the
-/// two can never silently drift apart:
-/// `rbac_enforcement_in_effect(store) == (rbac_enforcement_label(store) !=
-/// RbacEnforcementLabel::kDisabled)` holds for every input.
+/// two can never silently drift apart: `rbac_enforcement_in_effect(store) ==
+/// (rbac_enforcement_label(store) != RbacEnforcementLabel::kDisabled)` holds
+/// for every input. One asymmetry worth stating explicitly because a
+/// reviewer will ask: a store that is cached-ENABLED but whose generation
+/// view also happens to be stale classifies as `kEnabled`, not `kDegraded` —
+/// `is_rbac_enabled()` short-circuits before `rbac_enabled_view_degraded()`
+/// is ever consulted, exactly like `rbac_enforcement_in_effect()` itself;
+/// gates still deny either way, so this is the same fail-closed answer, just
+/// a less granular label for that one case. `is_rbac_administrator` inherits
+/// this asymmetry unchanged (a cached-enabled+stale RBAC-off admin still
+/// gets a definitive `kDenied`, never `kUnavailable`) — this is the
+/// platform's existing accepted fail-closed posture for that direction
+/// (#2703 addressed the cached-*disabled* direction only), not a new gap
+/// this reconciliation introduces.
 [[nodiscard]] RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept;
+
+/// "enabled" | "disabled" | "degraded" — the wire/DB string form of
+/// `RbacEnforcementLabel`, used verbatim as the access-review export's
+/// `rbac_enforcement` field and the frozen campaign row's column of the same
+/// name (`access_review_store.hpp`). `constexpr`, header-inline — matches
+/// every other enum-to-string mapper in this codebase
+/// (`authz_model.hpp::to_string(Operation/McpTierClass/RiskTier)`,
+/// `agent_registry.hpp::to_string(DispatchDenialReason)`,
+/// `schedule_params_parsers.hpp::to_string(ScheduleParamsError)`); nothing
+/// here depends on anything not visible at header-parse time.
+[[nodiscard]] constexpr std::string_view to_string(RbacEnforcementLabel label) noexcept {
+    switch (label) {
+    case RbacEnforcementLabel::kEnabled:
+        return "enabled";
+    case RbacEnforcementLabel::kDisabled:
+        return "disabled";
+    case RbacEnforcementLabel::kDegraded:
+        return "degraded";
+    }
+    return "degraded"; // unreachable for a valid enumerator; fail closed on the label too
+}
 
 /// The fixed marker substring `RbacStore::unassign_role`'s error string
 /// always contains when refusing the A2 last-Administrator guard (see that

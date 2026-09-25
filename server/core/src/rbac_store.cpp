@@ -1478,13 +1478,14 @@ RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
     // Mirrors rbac_enforcement_in_effect()'s branch order and short-circuiting
     // exactly (see that function's comments for the rationale on each step) —
     // this is the SAME derivation, just split into three outcomes instead of
-    // two. (cpp-safety re-review, PR #4985 fix round, corrected by a
-    // security-guardian follow-up pass: `noexcept` here is honest only to
-    // the same degree as that sibling function's own pre-existing
-    // `noexcept` — `is_open()` IS itself `noexcept`, but `is_rbac_enabled()`
-    // and `rbac_enabled_view_degraded()` are NOT, so this rests on THOSE two
-    // not actually throwing in practice, exactly like the unchanged sibling.
-    // Not a new risk this function introduces.)
+    // two. Keep any future change to that function's branches in sync here.
+    // (cpp-safety re-review, PR #4985 fix round, corrected by a security-
+    // guardian follow-up pass: `noexcept` here is honest only to the same
+    // degree as that sibling function's own pre-existing `noexcept` —
+    // `is_open()` IS itself `noexcept`, but `is_rbac_enabled()` and
+    // `rbac_enabled_view_degraded()` are NOT, so this rests on THOSE two not
+    // actually throwing in practice, exactly like the unchanged sibling. Not
+    // a new risk this function introduces.)
     if (!store || !store->is_open())
         return RbacEnforcementLabel::kDegraded;
     if (store->is_rbac_enabled())
@@ -1493,6 +1494,9 @@ RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
         return RbacEnforcementLabel::kDegraded;
     return RbacEnforcementLabel::kDisabled;
 }
+
+// to_string(RbacEnforcementLabel) is constexpr and header-inline (rbac_store.hpp) —
+// matches every other enum-to-string mapper in this codebase.
 
 // ── Roles CRUD ───────────────────────────────────────────────────────────────
 
