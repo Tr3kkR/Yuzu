@@ -238,7 +238,9 @@ section has the per-route reference including the `503` shape and the `rerun` es
 `tar.rollup`, `filesystem.delete_lines`, `registry.delete_value`, `registry.delete_key`,
 `storage.clear`, `content_dist.stage`, `content_dist.execute_staged`, `content_dist.cleanup`,
 `content_dist.upload_file`, `tags.clear`, `script_exec.exec`, `script_exec.powershell`,
-`script_exec.bash`, `http_client.download`, `certificates.delete`, and `quarantine.quarantine`.
+`script_exec.bash`, `http_client.download`, `certificates.delete`, and `quarantine.quarantine`
+(19 as of this writing — `power_health.set_power_plan` and `printing.clear_queue` have since joined
+them, under the same rule).
 Dispatching any of them without explicit, non-empty `agent_ids` — an omitted/empty target, or a
 `scope` (including `"__all__"`, even alongside `agent_ids`) — is now refused with `400`
 (`"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are
@@ -2799,9 +2801,10 @@ Never upgrade agents before the server -- the server must understand the agent's
 Before upgrading any component:
 
 - [ ] Back up all data (see [Server Administration](server-admin.md))
-  - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
-  - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
-  - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
+  - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`, `auto-approve.cfg`
+  - The NVD cache `nvd_cves.db` in `--data-dir` (the one remaining server SQLite store) — use `sqlite3 <path> ".backup ..."` rather than `cp` against a live database
+  - The blob directories `agent-updates/` (or your `--update-dir`) and `upload-blobs/` in `--data-dir` — the database holds only the OTA-package and completed-upload records that point into them, so a restored dump without these directories leaves records with no files
+  - The **PostgreSQL database** (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) **and the whole `--ca-dir`**, taken at the same point in time — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
 - [ ] **Verify the server's clock before upgrading** (`timedatectl status` or
   `chronyc tracking`; under Docker it is the host's clock that matters). Rows
   already stamped cannot be protected retroactively by any setting, and a server
