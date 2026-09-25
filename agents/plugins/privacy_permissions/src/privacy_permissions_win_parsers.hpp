@@ -74,26 +74,11 @@ inline constexpr std::string_view kNonPackagedToggleAppId = "NonPackaged";
     return PermissionState::prompt_undetermined;
 }
 
-/// `NonPackaged` subkey names are the app's executable path with a small set of characters
-/// percent/hash-escaped (Windows uses `#` in place of `\` and other reserved registry-path
-/// characters in this specific tree). This is a best-effort unescape pending the real-capture
-/// probe (unknown #4/#5 in the plan): the publicly documented ConsentStore NonPackaged scheme
-/// escapes BOTH `\`->`#` AND `:`->`#3A` (e.g. `C#3AUsers#Admin#app.exe`), so `#3A` is checked
-/// FIRST (KIMI-P1-05) -- a single-pass `#`->`\` alone would corrupt the drive separator into
-/// `C\3AUsers\...` instead of `C:\Users\...`. An unrecognized `#`-escape (this scheme's only
-/// other use) still falls through to `\`, degrading safely rather than corrupting or throwing.
+/// `NonPackaged` subkey names are the app's executable path with `\` written as `#` and the drive
+/// colon left literal (measured on the-rig: `C:#Program Files#...`). Nothing else is escaped.
 [[nodiscard]] inline std::string unescape_nonpackaged_app_id(std::string_view escaped) {
-    std::string out;
-    out.reserve(escaped.size());
-    for (std::size_t i = 0; i < escaped.size(); ++i) {
-        if (escaped[i] == '#' && i + 2 < escaped.size() && escaped[i + 1] == '3' &&
-            escaped[i + 2] == 'A') {
-            out += ':';
-            i += 2;
-        } else {
-            out += (escaped[i] == '#') ? '\\' : escaped[i];
-        }
-    }
+    std::string out{escaped};
+    std::replace(out.begin(), out.end(), '#', '\\');
     return out;
 }
 
@@ -186,7 +171,7 @@ struct EnumVerdict {
 }
 
 struct EnumFailure {
-    std::string cause; // `<kind>_enum_truncated` or `<kind>_enum_<rc>`
+    std::string cause; // `<kind>_enum_truncated` or `<kind>_enum_<win32_cause>`
     bool denied = false;
 };
 
@@ -202,7 +187,7 @@ struct EnumFailure {
     case EnumOutcome::failed:
         break;
     }
-    return EnumFailure{std::string{kind} + "_enum_" + std::to_string(v.rc),
+    return EnumFailure{std::string{kind} + "_enum_" + win32_cause(v.rc),
                        v.rc == kErrorAccessDenied};
 }
 
@@ -218,7 +203,7 @@ struct EnumFailure {
     const auto v = classify_subkey_enum(last_rc, probe_rc);
     if (v.outcome == EnumOutcome::complete) return std::nullopt;
     if (v.outcome == EnumOutcome::truncated) return EnumFailure{"profiles:truncated", false};
-    return EnumFailure{"profiles:enum_" + std::to_string(v.rc), v.rc == kErrorAccessDenied};
+    return EnumFailure{"profiles:enum_" + win32_cause(v.rc), v.rc == kErrorAccessDenied};
 }
 
 /// One ProfileList record whose SID key (`key_open`) or ProfileImagePath value failed to read.
@@ -274,6 +259,15 @@ struct LastUsedField {
     return {filetime_to_epoch_ms_string(filetime_100ns), {}, false};
 }
 
+/// The token a failed grant adds to the run's constraint set: `<source>:<category>:<cause>`, no
+/// app. One token per kind of failure however many apps share it, so an owner-stuffed ConsentStore
+/// cannot grow the set; the row's own `raw` still names the app.
+[[nodiscard]] inline std::string coarse_failure_token(std::string_view source,
+                                                      std::string_view category,
+                                                      std::string_view cause) {
+    return std::string{source} + ":" + std::string{category} + ":" + std::string{cause};
+}
+
 /// One (app_id, category) grant as read from ONE ConsentStore root (a profile hive or HKLM).
 /// `app_id` is UNqualified here ("-" = the capability-level default / coverage entry); the
 /// caller qualifies it per profile. `cause` is non-empty exactly when the Value read failed
@@ -285,7 +279,7 @@ struct RawGrant {
     std::string raw_value;
     LastUsedField last_used_start{"-", {}, false};
     LastUsedField last_used_stop{"-", {}, false};
-    std::string cause;
+    std::string cause{};
     // The READ of this grant's `Value` was refused (ERROR_ACCESS_DENIED) -- NOT the same thing
     // as `state == PermissionState::denied` alone, which also (correctly) means "the read
     // succeeded and decoded to a stored `Deny` grant" (CDX-P1-002).
@@ -356,7 +350,7 @@ inline const LastUsedField kLastUsedNotSet{"-", {}, false};
 /// the HKLM value is added beside it, so a read failure is never hidden behind a policy value.
 /// Every other HKLM entry is skipped here (the caller reports those once, hklm_emitted_once).
 /// Two profile entries with the same (app_id, category) -- distinct registry keys that decode to
-/// one id, e.g. NonPackaged `C::a.exe` and `C:#3Aa.exe` -- are both kept as stored, plus one
+/// one id, e.g. a packaged key `X` and a NonPackaged key `X` -- are both kept as stored, plus one
 /// `duplicate_app_id` unreadable row naming the collision; neither silently replaces the other.
 /// Output sorted by (app_id, category).
 [[nodiscard]] inline std::vector<RawGrant> merge_with_hklm(std::span<const RawGrant> profile,

@@ -557,7 +557,8 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
             fn(root);
             called = true;
         });
-    } // ScopedUserHive unloads here -- unload_failed is only final after this scope
+    } // ScopedUserHive unloads here -- unload_failed is final after this scope; if `fn` throws the
+      // unload still runs but the report is never written, so only the exception is seen
     if (report)
         report->unload_failed = unload_failed;
 

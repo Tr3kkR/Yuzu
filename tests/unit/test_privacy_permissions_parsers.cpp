@@ -293,15 +293,13 @@ TEST_CASE("win::decode_consent_value: Allow/Deny decode, wrong type or empty is 
     CHECK(win::decode_consent_value("Prompt", true) == PermissionState::prompt_undetermined);
 }
 
-TEST_CASE("win::unescape_nonpackaged_app_id: '#3A' is the drive colon, bare '#' the path "
-          "separator (KIMI-P1-05: #3A must be checked first or the colon is corrupted)",
+TEST_CASE("win::unescape_nonpackaged_app_id: '#' is the path separator and nothing else is "
+          "rewritten (the drive colon is literal; a `#3A` stays as written)",
           "[privacy_permissions][win_parsers]") {
-    // Real ConsentStore NonPackaged shape: C:\Program Files\App.exe ->
-    // C#3A#Program Files#App.exe (':'->'#3A', '\'->'#').
-    CHECK(win::unescape_nonpackaged_app_id("C#3A#Program Files#App.exe") ==
-         "C:\\Program Files\\App.exe");
-    // A bare '#' with no following "3A" still falls through to the path separator.
-    CHECK(win::unescape_nonpackaged_app_id("C#3AUsers#name#app.exe") == "C:Users\\name\\app.exe");
+    CHECK(win::unescape_nonpackaged_app_id("C:#Program Files#App.exe") ==
+          "C:\\Program Files\\App.exe");
+    CHECK(win::unescape_nonpackaged_app_id("C#3AUsers#name#app.exe") ==
+          "C\\3AUsers\\name\\app.exe");
 }
 
 TEST_CASE("win::filetime_to_epoch_ms_string: zero and pre-epoch are '-', a real value converts",
@@ -540,9 +538,9 @@ TEST_CASE("win::profile_discovery_failure: a refused root or mid-walk enumeratio
     CHECK_FALSE(win::profile_discovery_failure(ok, done, done));       // walk ended cleanly
     CHECK_FALSE(win::profile_discovery_failure(ok, ok, done));         // exactly the cap
     check(win::profile_discovery_failure(ok, ok, ok), "profiles:truncated", false);
-    check(win::profile_discovery_failure(ok, refused, done), "profiles:enum_5", true);
-    check(win::profile_discovery_failure(ok, 1018, done), "profiles:enum_1018", false);
-    check(win::profile_discovery_failure(ok, ok, refused), "profiles:enum_5", true); // cap probe
+    check(win::profile_discovery_failure(ok, refused, done), "profiles:enum_access_denied", true);
+    check(win::profile_discovery_failure(ok, 1018, done), "profiles:enum_win32_1018", false);
+    check(win::profile_discovery_failure(ok, ok, refused), "profiles:enum_access_denied", true);
     const auto key = win::profile_record_failure(true, refused);
     CHECK(key.cause == "profiles:profile_key_access_denied");
     CHECK(key.denied);
@@ -587,6 +585,14 @@ TEST_CASE("win::RetentionBudget: refuses the grant that would cross either run-w
     CHECK(win::kBudgetExceededToken == "collection:budget_exceeded");
 }
 
+TEST_CASE("win::coarse_failure_token: one token per kind of failure, however many apps share it",
+          "[privacy_permissions][win_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    for (int i = 0; i < 1000; ++i)
+        acc.add_failure(win::coarse_failure_token("alice", "camera", "value_oversized"));
+    CHECK(acc.reason() == "alice:camera:value_oversized");
+}
+
 TEST_CASE("win::nonpackaged_open_failure: a missing NonPackaged key is the toggle row reading "
           "absent; a refusal is denied, any other code unreadable",
           "[privacy_permissions][win_parsers]") {
@@ -607,8 +613,7 @@ TEST_CASE("win::nonpackaged_open_failure: a missing NonPackaged key is the toggl
 TEST_CASE("win::merge_with_hklm: two registry keys decoding to one app id keep both rows plus a "
           "duplicate_app_id row -- neither silently replaces the other",
           "[privacy_permissions][win_parsers]") {
-    const std::string id = win::unescape_nonpackaged_app_id("C:#3Aa.exe");
-    REQUIRE(id == win::unescape_nonpackaged_app_id("C::a.exe"));
+    const std::string id = "X"; // a packaged key `X` and a NonPackaged key `X`
     const std::vector<win::RawGrant> profile{{id, "camera", PermissionState::allowed, "Allow"},
                                              {id, "camera", PermissionState::denied, "Deny"}};
     const auto m = win::merge_with_hklm(profile, {});
@@ -647,24 +652,24 @@ TEST_CASE("win::classify_subkey_enum + enum_failure: exactly the cap is complete
     const auto refused = win::enum_failure(
         "packaged", win::classify_subkey_enum(win::kErrorAccessDenied, win::kErrorSuccess));
     REQUIRE(refused);
-    CHECK(refused->cause == "packaged_enum_5");
+    CHECK(refused->cause == "packaged_enum_access_denied");
     CHECK(refused->denied);
     const auto more_data = win::enum_failure("packaged", win::classify_subkey_enum(234, 0));
     REQUIRE(more_data);
-    CHECK(more_data->cause == "packaged_enum_234");
+    CHECK(more_data->cause == "packaged_enum_win32_234");
     CHECK_FALSE(more_data->denied);
     // The cap-boundary probe itself failed: never read as complete.
     const auto probe = win::enum_failure(
         "packaged", win::classify_subkey_enum(win::kErrorSuccess, win::kErrorAccessDenied));
     REQUIRE(probe);
-    CHECK(probe->cause == "packaged_enum_5");
+    CHECK(probe->cause == "packaged_enum_access_denied");
     CHECK(probe->denied);
 }
 
 TEST_CASE("win::is_valid_sid_string: only an S-1-<digits>(-<digits>)* SID may be appended to "
           "HKEY_USERS -- empty or malformed never opens the HKU root",
           "[privacy_permissions][win_parsers]") {
-    CHECK(win::is_valid_sid_string("S-1-5-21-3623811015-3361044348-30300820-1013"));
+    CHECK(win::is_valid_sid_string("S-1-5-21-1111111111-2222222222-3333333333-1013"));
     CHECK(win::is_valid_sid_string("S-1-5-18"));
     CHECK_FALSE(win::is_valid_sid_string(""));
     CHECK_FALSE(win::is_valid_sid_string("S-1-"));
@@ -956,7 +961,8 @@ TEST_CASE("portal::append_lookup_reply_rows: the real location shape reads allow
     SECTION("the probe's devices reply") {
         yuzu::shared::ConstraintAccumulator acc;
         std::vector<PermissionRow> rows;
-        portal::PortalReply r{true, {{"org.example.CamApp", {"yes"}}, {"org.example.MicApp", {"no"}}},
+        portal::PortalReply r{true, // out of order on purpose: rows come out by app_id
+                              {{"org.example.MicApp", {"no"}}, {"org.example.CamApp", {"yes"}}},
                               false, false};
         portal::append_lookup_reply_rows(table_for("camera"), r, rows, acc);
         REQUIRE(rows.size() == 2);

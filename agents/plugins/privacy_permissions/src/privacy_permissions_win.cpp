@@ -9,7 +9,7 @@
  * resolves to LocalSystem's own (irrelevant, near-always-empty) profile, never an interactive
  * user's real ConsentStore. Like license_scan's run_per_user_surfaces and registry's
  * do_get_user_value, this leg enumerates real profiles from HKLM ...\ProfileList
- * (agents/shared/win_profiles.hpp's enumerate_profile_records + build_profile_list, which
+ * (agents/shared/win_profiles.hpp's enumerate_profile_list + build_profile_list, which
  * filters the LocalSystem/LocalService/NetworkService SIDs, cross-referenced with the HKU
  * subkey list) and reads each one's hive via with_user_hive: the loaded HKU\<SID> first, else an
  * offline RegLoadKeyW mount of <profile>\NTUSER.DAT under SeBackup/SeRestore (held for the
@@ -59,6 +59,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <spdlog/spdlog.h>
 
 #include <win_profiles.hpp>
 #include <win_reg_handle.hpp>
@@ -297,12 +299,14 @@ void emit_grant(std::string_view source, bool qualify, const RawGrant& g,
                       g.read_denied};
     if (!g.cause.empty()) {
         row.raw = subject + ":" + g.cause;
-        acc.add_failure(row.raw);
+        acc.add_failure(win::coarse_failure_token(source, g.category, g.cause));
     }
     if (!g.last_used_start.cause.empty())
-        acc.add_failure(subject + ":last_used_start_" + g.last_used_start.cause);
+        acc.add_failure(win::coarse_failure_token(source, g.category,
+                                                  "last_used_start_" + g.last_used_start.cause));
     if (!g.last_used_stop.cause.empty())
-        acc.add_failure(subject + ":last_used_stop_" + g.last_used_stop.cause);
+        acc.add_failure(win::coarse_failure_token(source, g.category,
+                                                  "last_used_stop_" + g.last_used_stop.cause));
     row.read_denied = row.read_denied || g.last_used_start.denied || g.last_used_stop.denied;
     rows.push_back(std::move(row));
 }
@@ -384,16 +388,22 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
             &report);
         // The read itself completed; a failed unload is an operational residue (a mount left
         // behind), reported as a token, not a data gap.
-        if (report.unload_failed) acc.add_failure(pname + ":hive_unload_failed");
+        if (report.unload_failed) {
+            acc.add_failure(pname + ":hive_unload_failed");
+            spdlog::warn("privacy_permissions: hive unload failed for HKU\\{} -- the profile's "
+                         "NTUSER.DAT stays locked until it is released; retry `reg unload HKU\\{}`",
+                         report.mount_name, report.mount_name);
+        }
 
         // Exhaustive over the FOUR HiveAccessStatus outcomes (COD-P1-02/K1): a profile whose hive
         // was never opened must never read as "this profile has no grants" -- each failure is
         // its own row.
-        const auto profile_failed = [&](std::string_view cause) {
-            const bool denied = (peek_rc == ERROR_ACCESS_DENIED);
-            rows.push_back(failure_row("windows", profile_row_id, "-", denied,
-                                       pname + ":" + (denied ? std::string{"access_denied"}
-                                                             : std::string{cause}),
+        // `refused`: the cause is itself a refusal (a missing privilege): denied, token unchanged.
+        const auto profile_failed = [&](std::string_view cause, bool refused = false) {
+            const bool peek_denied = (peek_rc == ERROR_ACCESS_DENIED);
+            rows.push_back(failure_row("windows", profile_row_id, "-", peek_denied || refused,
+                                       pname + ":" + (peek_denied ? std::string{"access_denied"}
+                                                                  : std::string{cause}),
                                        acc));
         };
         switch (status) {
@@ -401,7 +411,7 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
             ++reachable_profiles;
             break;
         case yuzu::win::HiveAccessStatus::privilege_missing:
-            profile_failed("privilege_missing");
+            profile_failed("privilege_missing", true);
             continue;
         case yuzu::win::HiveAccessStatus::not_found:
             // `profile_path_unreadable` (carried from the raw ProfileList record) means even the

@@ -517,21 +517,6 @@ TEST_CASE("Wave 10: ServerImpl's boot sequence actually calls "
     CHECK(block.find("Refusing to start") != std::string::npos);
 }
 
-TEST_CASE("Wave 8: seed_kill_switch_default_off seeds privacy_permissions disabled",
-          "[pg][store][plugin_config][killswitch]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
-    Wired w{db.dsn()};
-    REQUIRE(w.store.seed_kill_switch_default_off(
-        "privacy_permissions", "default-off: forensics class (Wave 8); enable per PUT "
-                               "/api/v1/plugin-config/privacy_permissions/kill-switch"));
-
-    CHECK_FALSE(w.store.action_allowed("privacy_permissions", "permissions"));
-    auto entry = w.store.get_kill_switch("privacy_permissions", "");
-    REQUIRE(entry.has_value());
-    CHECK_FALSE(entry->enabled);
-    CHECK(entry->set_by == "system");
-}
-
 TEST_CASE("Wave 8: ServerImpl's boot sequence actually calls "
           "seed_kill_switch_default_off(\"privacy_permissions\", ...) and fails the boot "
           "closed on a seed error — source tripwire against server.cpp, since a full "

@@ -17,6 +17,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -206,14 +207,18 @@ inline void append_lookup_reply_rows(const PortalTable& t, const PortalReply& re
         rows.push_back(failure_row("linux", "-", t.category, false, cat + ":shape", acc));
         return;
     }
-    for (const auto& e : reply.entries) {
-        const auto d = decode_portal_permissions(t.kind, e.permissions);
+    std::vector<const PortalEntry*> ordered; // the portal's dict order is not stable
+    for (const auto& e : reply.entries) ordered.push_back(&e);
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const auto* a, const auto* b) { return a->app_id < b->app_id; });
+    for (const auto* e : ordered) {
+        const auto d = decode_portal_permissions(t.kind, e->permissions);
         if (!d.cause.empty()) {
-            rows.push_back(failure_row("linux", e.app_id, t.category, false,
-                                       e.app_id + ":" + cat + ":" + std::string{d.cause}, acc));
+            rows.push_back(failure_row("linux", e->app_id, t.category, false,
+                                       e->app_id + ":" + cat + ":" + std::string{d.cause}, acc));
             continue;
         }
-        rows.push_back({"linux", e.app_id, t.category, d.state, join_permissions(e.permissions),
+        rows.push_back({"linux", e->app_id, t.category, d.state, join_permissions(e->permissions),
                         "-", "-", false});
     }
     if (reply.walk_failed)
