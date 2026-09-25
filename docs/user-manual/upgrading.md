@@ -209,8 +209,9 @@ If that shows `service=` or `PGSERVICE`, also read the named entry in the servic
   start (`Invalid Postgres connection settings: ...`) if the resolved settings set
   `load_balance_hosts`, or list several hosts without `target_session_attrs=read-write` (or
   `primary`) — it cannot add the attribute to a service file, so set it there yourself. The readiness
-  probe repeats the check on each new connection, so a later edit that breaks these rules turns
-  `/readyz` red until it is fixed.
+  probe repeats the check each time it opens a connection, but it keeps a healthy one open, so a
+  later edit that breaks these rules shows on `/readyz` only at its next reconnect — **restart the
+  server after editing the service file**.
 - **Not checked — set `target_session_attrs=read-write` yourself:** one host *name* that resolves to
   several servers (DNS round-robin, a Kubernetes headless service).
 

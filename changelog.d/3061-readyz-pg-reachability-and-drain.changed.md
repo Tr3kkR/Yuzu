@@ -15,5 +15,6 @@
   `target_session_attrs=read-write`: it is added when absent (the DSN is rebuilt from libpq's parse and
   re-checked), and any other explicit value except `primary` refuses boot, as does
   `load_balance_hosts` (other than `disable`) — checked on the DSN, the environment and, on the first
-  connection, any service file. Point liveness probes at `/livez`, not `/readyz` — see
+  connection, any service file (the readiness probe repeats the check whenever it reconnects —
+  restart the server after editing a service file). Point liveness probes at `/livez`, not `/readyz` — see
   `docs/user-manual/upgrading.md`.

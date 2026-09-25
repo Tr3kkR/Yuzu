@@ -1397,9 +1397,10 @@ int main(int argc, char* argv[]) {
         // service file (service= / PGSERVICE) is applied by libpq at connect time.
         // Check what libpq actually resolved on a live connection, and refuse to
         // start on load_balance_hosts or a host list without read-write (Gate 8
-        // round 7). libpq re-reads a service file on every connect, so the
-        // readiness probe repeats this check on each new connection: a later
-        // edit turns /readyz red (with the reason in the log) until fixed.
+        // round 7). libpq re-reads a service file on every connect; the readiness
+        // probe repeats this check on each connection IT makes, so a later edit
+        // shows on /readyz only at the probe's next reconnect (contract residual
+        // (2), pg_reachability_probe.hpp) — restart the server after editing it.
         {
             auto lease = auth_pg_pool->acquire();
             if (!lease) {

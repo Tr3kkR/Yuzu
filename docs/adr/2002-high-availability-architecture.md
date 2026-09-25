@@ -1597,6 +1597,21 @@ gaps closed:
   restart a demotion implies, or behind a per-node pooler that keeps server connections open) keeps
   failing those connections. `/readyz` goes red too when a new connection reaches that server; it stays
   green only when a new connection reaches a different, writable host.
+- **The contract, and a freeze (governance round 9, architecture review adopted by the operator).**
+  Nine review rounds each found a new divergence between the probe and the pool, all one class: the pool
+  holds N connections opened at N moments under N resolved settings and never re-validates them, so no
+  single probe connection can represent them. The promise is therefore stated precisely:
+  `pg_reachable` is a one-session, fresh-connect signal — red when this replica, connecting exactly as
+  its pool would at that moment, cannot establish a session to a server that accepts writes, or when the
+  probe's own held session stops answering or turns read-only. It does not observe the pool's other held
+  connections, nor settings re-resolved after the probe last connected. Named residuals, each a tracked
+  issue: held pool connections to a server demoted in place; service-file/environment edits until the
+  probe's next reconnect; a multi-address host name with one silent address; `max_connections`
+  exhaustion; about ±1 s timing tolerance. Freeze rule: no further emulation of libpq/pool behaviour in
+  the probe; a newly found divergence is an issue against this contract unless it produces a false green
+  for a fresh connect on a single-endpoint or read-write multi-host DSN, which stays blocking. The durable
+  fix for held connections is pool-side (validate on acquire / maximum lifetime), not more probe
+  emulation.
 - **Draining.** `--shutdown-drain-seconds` (0–60, default 0) holds the listener open after `/readyz`
   turns `503 draining`, so the fronting layer drains before the socket closes.
 The BYO-LB documentation deliverable above remains open (P2, not in the safe-to-scale gate).

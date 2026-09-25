@@ -106,7 +106,7 @@ std::expected<void, std::string> check_effective_connection(PGconn* conn,
         return std::unexpected(
             "the Postgres connection settings list " + std::to_string(hosts) + " hosts with " +
             (tsa.empty() || tsa == "any"
-                 ? std::string("target_session_attrs=any (the default when none is set)")
+                 ? std::string("target_session_attrs=any (or none set)")
                  : "target_session_attrs=" +
                        (known ? std::string(tsa) : std::string("<unrecognised>"))) +
             ": set target_session_attrs=read-write where the host list is defined, so the "

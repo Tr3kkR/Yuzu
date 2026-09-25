@@ -726,7 +726,7 @@ struct FakePostgres {
                 return; // accept, read the startup packet, hang up without a word
             if (sqlstate == "silent") { // hold the connection open, say nothing
                 unsigned char b;
-                while (!stop.load() && ::read(c, &b, 1) != 0) {
+                while (!stop.load() && ::read(c, &b, 1) > 0) {
                 }
                 return;
             }
@@ -1086,7 +1086,7 @@ TEST_CASE("check_effective_connection: a service file's load_balance_hosts or re
         REQUIRE_FALSE(r.has_value());
         // PQconninfo reports libpq's default "any" for an unset attribute; the
         // message says so rather than implying the operator set it.
-        CHECK(r.error().find("the default when none is set") != std::string::npos);
+        CHECK(r.error().find("any (or none set)") != std::string::npos);
     }
     SECTION("a restart narrowed to one host still applies the full list's read-write rule") {
         // Round 9 (self-review): the probe's restart after a silent host narrows
@@ -1194,8 +1194,9 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): load_balance_hosts=random is refused
           "own per-connection settings check",
           "[server][readyz][pg_reachability][pg]") {
     // Boot refuses load_balance_hosts (pg/multi_host_dsn.hpp); the probe
-    // re-checks every connection it makes, so the setting cannot reach /readyz
-    // green by any route (a service file edited after boot included).
+    // re-checks every connection it makes, so a fresh probe connection never
+    // reads green under it (a service file edited after boot shows at the
+    // probe's next reconnect — contract residual (2)).
     YUZU_REQUIRE_PG_DB(db);
     const auto [pg_host, pg_port] = pg_host_port(db.dsn());
     const std::string dsn = multi_host_dsn(db.dsn(), pg_host + "," + pg_host,
