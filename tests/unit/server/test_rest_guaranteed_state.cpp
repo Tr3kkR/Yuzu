@@ -21,7 +21,7 @@
 
 #include "auth_routes.hpp"
 #include "baseline_store.hpp"
-#include "dex_app_perf_model.hpp" // AppPerfProviders (slice-2 app-perf read seams)
+#include "dex_app_perf_model.hpp" // the app-perf read types (slice-2)
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
@@ -250,7 +250,7 @@ struct RestGsHarness {
     // Slice-2 DEX app-perf read seams. Wired with present-but-empty doubles by
     // default (so the audit/scope/render paths are reachable); left empty when
     // wire_app_perf is false so a test can prove the provider-absent → 503 branch.
-    yuzu::server::AppPerfProviders app_perf_providers_;
+    yuzu::server::test::FnDexPerfApi::Providers app_perf_providers_;
     // ADR-0031 WS-A4 #4250: the shared VerifyApi seam backing GET
     // /api/v1/dex/perf/compare (replaces the retired AppPerfCohortFn-in-
     // AppPerfProviders ad-hoc cohort provider). Left null when wire_app_perf is
@@ -597,7 +597,7 @@ struct RestGsHarness {
                             wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
                                              : RestApiV1::ScopedPermFn{},
                             /*software_inventory_store=*/nullptr,
-                            /*response_scope_fn=*/{}, app_perf_providers_,
+                            /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr,
@@ -2204,6 +2204,37 @@ TEST_CASE("REST dex/devices/{id}: per-device read model — score + THIS device'
     CHECK(crashed_count == 2);
     CHECK_FALSE(saw_other); // WS-2's signal must not leak into WS-1's per-device summary
     // Per-device behavioral read → audited dex.device.view (parity with the lens).
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.device.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+}
+
+// #4855: a degraded signal-summary read must 503, never render a fabricated
+// healthy score of 100 with no signals. DROP TABLE on a second connection
+// forces a genuine query-level failure while the store stays open (same
+// technique the guard/baseline degrade tests in test_guardian_routes.cpp
+// use). The audit fires BEFORE the read (unchanged fail-closed ordering), so
+// it still records "success" here.
+TEST_CASE("REST dex/devices/{id}: a degraded signal-summary read → 503, never a fabricated "
+          "healthy score",
+          "[pg][rest][dex][device][degraded]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"score\"") == std::string::npos); // never a score at all
     bool audited = false;
     for (const auto& a : h.audit_log)
         if (a.action == "dex.device.view" && a.target_id == "WS-1")

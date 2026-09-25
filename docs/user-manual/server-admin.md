@@ -90,7 +90,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mfa-enforcement` | `optional` | MFA enforcement mode: `optional` (users may enroll voluntarily; login never requires it), `admin-only` (an admin without MFA must enroll before login completes), or `required` (every role must enroll). Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrollment (`POST /login/mfa/enroll`) before a session is minted; the server logs an `INFO` line naming the active mode at startup. **Breaking:** earlier releases accepted `admin-only`/`required` as no-ops — if you staged the flag, read `docs/user-manual/upgrading.md` before upgrading (live enforcement begins immediately, and SSO users require an IdP that asserts `amr`). See `docs/user-manual/authentication.md` § Multi-Factor Authentication and `docs/auth-mfa-design.md`. Env: `YUZU_MFA_ENFORCEMENT`. |
 | `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which 11 high-risk REST + Settings endpoints (PR2 of the MFA ladder) accept the session as "stepped up" without re-prompting. Set to `0` to disable the gate entirely (emits a startup `WARN`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state is per-process (lost on restart, not shared across HA replicas without sticky sessions). Env: `YUZU_MFA_LOGIN_PENDING_SECS`. |
-| `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires `--config` + `--data-dir`; no TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
+| `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`), and the same `--config` the service uses if it is not at the platform default (`/etc/yuzu/yuzu-server.cfg` on Linux and root macOS; `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) — the container images run with `--config /var/lib/yuzu/yuzu-server.cfg`, and without it the binary falls into interactive first-run setup and exits. No TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | `--auth-lockout-threshold` | `5` | Consecutive failed **local-password** login attempts before an account is temporarily locked (SOC 2 CC6.3). A locked account returns the **same generic 401** as a bad password — no enumeration/lock-state oracle. Counter resets on a successful login or an admin unlock (`POST /api/v1/users/{name}/unlock`). Scope is local-password only — OIDC/SSO sessions and API tokens are unaffected. Setting `0` **disables** lockout (startup `WARN`) and constitutes a deviation from the CC6.3 hardened baseline — record it as a documented exception on your risk register, do not just flip it. NIST 800-63B §5.2.2 suggests allowing ≥10 attempts where network-layer rate-limiting is also present; raise the threshold accordingly if you front Yuzu with an IP throttle. Env: `YUZU_AUTH_LOCKOUT_THRESHOLD`. |
 | `--auth-lockout-window-secs` | `900` | How long an account stays locked after the threshold is crossed. The lock **auto-expires** after this window — it is never permanent, so it cannot be weaponised to permanently deny a legitimate principal; a waited-out user regains a full attempt budget. Env: `YUZU_AUTH_LOCKOUT_WINDOW_SECS`. |
 | `--jit-max-elevation-secs` | `3600` | **JIT admin elevation** maximum window (SOC 2 CC6.3/CC6.6). Caps the lifetime of a time-boxed admin elevation activated via `POST /api/v1/elevate`; a request asking for longer is clamped. Range 1–86400 (24h). Eligibility is the per-user `users.elevation_eligible` flag (admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), elevation requires a fresh MFA step-up, and for Postgres-backed deployments the grant is **durably persisted** to the cookie session's `SessionStore` row (HA WS-1/1a, ADR-2002 §4), so it **survives a restart** — bounded by this 24h ceiling and the session's own absolute expiry, and auto-reverting on lapse, logout, or explicit revoke (config-file-only deployments keep the old in-memory-per-session behavior a restart drops). API/MCP tokens can never be elevated. Env: `YUZU_JIT_MAX_ELEVATION_SECS`. |
@@ -99,7 +99,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--auth-mode` | `standard` | Local-password login policy (SOC 2 CC6.3). `standard` = password login enabled. `sso-only` = **local-password login is disabled fleet-wide** — only an SSO provider mints a session — so the server **refuses to start** unless OIDC (`--oidc-issuer` + `--oidc-client-id`) or, on Linux/macOS with HTTPS enabled, a complete SAML SP config is present. A rejected local login returns the **same generic 401** as a bad password (no oracle) and is counted via the metric `yuzu_auth_local_disabled_total` (metric, not a per-attempt audit row — avoids audit-flood under credential spray). A single `--break-glass-user` is exempt while armed. Env: `YUZU_AUTH_MODE`. |
 | `--break-glass-user <username>` | *(none)* | The single local account exempt from `--auth-mode=sso-only`, exempt **only while armed** (see `--break-glass-arm`). Under `sso-only` the server **refuses to start** unless this account exists and has **MFA enrolled** (a break-glass account must carry a second factor). A break-glass login is forced through MFA regardless of `--mfa-enforcement` and writes an `auth.breakglass.login` audit row. Env: `YUZU_BREAK_GLASS_USER`. |
 | `--break-glass-window-secs` | `86400` | Seconds the break-glass account stays armed after `--break-glass-arm` (default 24h). The arm **auto-expires** (evaluated lazily at login like the lockout window) — it is never a permanent standing exemption. Env: `YUZU_BREAK_GLASS_WINDOW_SECS`. |
-| `--break-glass-arm` | off | **Break-glass.** Arms `--break-glass-user` for the configured window and exits **without starting the server** — the recovery path when the IdP is down under `--auth-mode=sso-only`. Run on the server host as the service account (arming deliberately does **not** require a session). Validates the account (exists + MFA), verifies the audit store is writable **before** arming, and writes an `auth.breakglass.armed` audit row (principal = the OS account that ran the CLI). Requires `--break-glass-user` + `--data-dir`. Refuses (exit non-zero) if any check fails. |
+| `--break-glass-arm` | off | **Break-glass.** Arms `--break-glass-user` for the configured window and exits **without starting the server** — the recovery path when the IdP is down under `--auth-mode=sso-only`. Run on the server host as the service account (arming deliberately does **not** require a session). Validates the account (exists + MFA), verifies the audit store is writable **before** arming, and writes an `auth.breakglass.armed` audit row (principal = the OS account that ran the CLI). Requires `--break-glass-user` + the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`), and the same `--config` caveat as `--mfa-reset` above. Refuses (exit non-zero) if any check fails. |
 | `--principal-max-concurrency` | `16` | **Engine principals** (ADR-1005 class, PR 4.4). Maximum in-flight requests for a single engine principal at any instant, checked at the server's single pre-routing chokepoint on both REST and MCP. A streaming/SSE request holds its slot for the stream's lifetime, not just until routing hands off. Exceeding it returns HTTP `429`. Human, device-agent, and anonymous traffic is never gated by this cap. See `docs/user-manual/engine-principals.md` "Per-principal quota cap" for tuning guidance. Env: `YUZU_PRINCIPAL_MAX_CONCURRENCY`. |
 | `--principal-rate-limit` | `20.0` | **Engine principals** (ADR-1005 class, PR 4.4). Sustained request rate cap (requests/second, token bucket, burst = 2x the configured rate) for a single engine principal. Exceeding it returns HTTP `429`. Independent of `--principal-max-concurrency` — either dimension alone can reject a request. See `docs/user-manual/engine-principals.md` "Per-principal quota cap" for tuning guidance. Env: `YUZU_PRINCIPAL_RATE_LIMIT`. |
 | `--ota-max-concurrent-per-peer` | `2` | **Agent OTA pulls (#913).** Maximum parallel `DownloadUpdate` streams a single peer may hold. This is the PRIMARY bound on the OTA path: the attack it closes is one authenticated agent opening many concurrent streams, each pinning a gRPC thread on blocking disk and network I/O. Exceeding it returns gRPC `RESOURCE_EXHAUSTED` (rejected, never queued). Admission keys on the peer's certificate identity, falling back to peer IP when no client certificate is presented. Env: `YUZU_OTA_MAX_CONCURRENT_PER_PEER`. |
@@ -194,18 +194,26 @@ When the server starts for the first time and no `yuzu-server.cfg` exists, it en
 
 After setup completes, the server writes `yuzu-server.cfg` and starts normally. Subsequent restarts skip the setup prompt.
 
-> **Headless deployment:** For automated or containerized deployments, pre-create `yuzu-server.cfg` with PBKDF2-hashed password entries before starting the server for the first time. A sample config with default credentials is provided below for quick evaluation.
+> **Headless deployment:** For automated or containerized deployments, pre-create `yuzu-server.cfg` with PBKDF2-hashed password entries before starting the server for the first time — first-run setup is interactive and will exit without a TTY.
 
-### Default Credentials (Evaluation Only)
+### Seeded credentials
 
-For Docker, automated, and quick-start deployments, the following `yuzu-server.cfg` ships with pre-hashed credentials so the server starts without interactive setup:
+**No image or installer provisions a default account.** No image `COPY`s a
+`yuzu-server.cfg`, and there is no built-in account: a server started without a
+config runs interactive first-run setup, which prompts for an administrator
+**and** a second user account.
 
-| Username | Password | Role |
-|---|---|---|
-| `admin` | `administrator` | Admin (full access) |
-| `user` | `useroperator` | User (read-only) |
+One checked-in file, `deploy/config/uat/yuzu-server.cfg`, does hold a single
+`admin` entry — with a **fixed salt and a fixed PBKDF2 digest committed to git**,
+for the known password `adminpassword1`. It is orphaned: no script, compose file
+or image reads it (the UAT rigs each generate their own config at a temp path
+with a fresh random salt per run). Never copy it into a deployment, and do not
+read its presence as a supported default — removing it from the tree is tracked
+separately.
 
-> **WARNING: Change these credentials immediately after first login.** These defaults are published in documentation and are not suitable for production. Use the Settings page (User Management) to change passwords and create new accounts. For enterprise deployments, integrate OIDC SSO and disable local accounts.
+> **If you seed an account yourself, change its password before exposing the
+> server.** For enterprise deployments, integrate OIDC SSO and disable local
+> accounts.
 
 ---
 
@@ -269,6 +277,33 @@ catching only success responses on this route should add handling for the new `4
 reason=parent_gone` case: create a fresh result set from the intended parent instead of
 re-evaluating the orphaned one. A genuinely parentless original (no `parent_id` was ever supplied
 at creation) still broadcasts on re-eval, unchanged.
+
+### vNEXT — `GET /api/v1/result-sets` can now answer `503`; the async result-set producers' post-dispatch fault code changes from `400` to `500` on REST (#4306, breaking)
+
+**What changed.** `GET /api/v1/result-sets` previously always answered `200`, even when the
+underlying store read was degraded — `ResultSetStore::list_by_owner` returned a plain (possibly
+empty) container rather than surfacing the failure, so a degraded Postgres read answered `200`
+with an empty `result_sets` array indistinguishable from a genuinely-empty owner. It now answers
+`503 RESULT_SET_STORE_UNAVAILABLE` (`Retry-After` present) on a genuine store-level read failure.
+Separately, on REST, the three async result-set producers (`POST /api/v1/result-sets/from-tar-query`,
+`/from-instruction-result`, and `/{id}/re-eval`) previously mapped a post-dispatch store fault —
+the pending result-set row failing to persist *after* a real command had already dispatched to
+agents — to `400`. That was a client-error status for a server-side fault; it is now
+`500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH`, matching MCP's `rs_run_async`, which already used its
+`kInternalError` branch for the identical case (the JSON-RPC error type is unchanged). The same
+three REST routes also gained a new PRE-dispatch `503 RESULT_SET_STORE_UNAVAILABLE` when the
+per-owner quota cannot be verified before dispatch — nothing is sent in that case, and the request
+is safe to retry.
+
+**Who this affects.** Any REST caller that treats `GET /api/v1/result-sets` as never-erroring, or
+that pattern-matches the old `400` on the three async producers' post-dispatch failure path. A
+`503` should be retried (`Retry-After` header present); a `500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH`
+means a command already dispatched — do not re-send, poll `GET /api/v1/executions/{id}` for its
+outcome instead. MCP's error *type* (`kInternalError`) is unchanged, but the embedded fault-message
+token was also renamed to `RESULT_SET_STORE_FAULT_AFTER_DISPATCH` for the same reason as REST — any
+MCP caller pattern-matching the old `RESULT_SET_STORE_UNAVAILABLE` token string on this specific
+post-dispatch branch should update to the new token (the 3 MCP tool descriptions in `kTools[]`
+document both tokens explicitly).
 
 ### vNEXT — server TLS listeners now pin a fixed TLS 1.2 cipher allow-list; a previously-set `GRPC_SSL_CIPHER_SUITES` no longer applies (#4722; breaking)
 
@@ -412,6 +447,75 @@ See `docs/user-manual/authentication.md` "Rotating a Token" for the full
 operator-facing detail, and
 `docs/security-reviews/2963-token-rotation-default-permission-2026-09-17.md`
 for the decision record.
+
+### vNEXT — CRL publishing is serialised in Postgres, and a missed CRL now republishes itself (HA WS-6 6.1, #4126; NOT breaking)
+
+Every CRL publish (startup, an operator revoke, a subordinate-CA import, and the
+freshness re-publish) now runs as one Postgres transaction under a lock on the
+`ca_store.ca_crl_versions` table, instead of behind a lock inside one server
+process. The `ca_store` schema migrates to v4: v3 adds a nullable
+`revoked_count` column on `ca_crl_versions` (nothing is backfilled), v4 adds a
+trigger that refuses to delete or change a revoked `ca_issued` row. A
+subordinate-CA import (`POST /api/v1/ca/import-chain`) now waits for any CRL
+publish already in progress before it swaps the root; if that takes longer than
+the database's lock timeout (10 s by default) the import fails with a
+database error and can simply be retried.
+
+What changes on **every** deployment, including single-server:
+
+- **A CRL publish can now fail on lock contention.** A publish that waits more
+  than 5 s for the table lock gives up. On `POST /api/v1/ca/revoke` and MCP
+  `revoke_certificate` that shows as `crl_republished:false` plus a
+  `ca.crl.published` failure audit; every trigger increments
+  `yuzu_server_ca_crl_publish_failures_total`. The revocation itself still
+  takes effect immediately server-side.
+- **A revocation missing from the served CRL is now republished automatically.**
+  Previously, if a revoke's own CRL publish failed, the revocation stayed out of
+  `GET /api/v1/ca/crl` until the next revoke or until the CRL was within 24 h of
+  its `nextUpdate` (up to ~6 days); retrying the revoke returns "already
+  revoked" and does not publish. The freshness pass now also republishes, on its
+  next 15 s tick, whenever the latest CRL was not built from the current revoked
+  set (after a failed attempt it waits 5 minutes before trying again). You may
+  occasionally see a redundant CRL version shortly after a revoke.
+- **A revoked default server certificate now stays revoked.** Previously,
+  regenerating the built-in default certificates (for example after changing
+  `--cert-san`) deleted their old inventory rows, including revoked ones, so a
+  revoked default leaf was accepted again and dropped from the CRL. Revoked rows
+  are now kept, and the database now refuses to delete them (migration v4
+  trigger) — during a rolling upgrade an older server's default-cert purge fails
+  with "failed to purge prior default-cert inventory rows" instead. **This does not restore a revocation already lost that way:** the
+  purged serial is no longer in the inventory, so revoking it again returns
+  `404`. This only affects you if you revoked a default server certificate (for
+  example because its key may have leaked) **and** the default certificates were
+  regenerated **before you upgraded to this release**. Check first: find the
+  serial in the audit log (the `ca.cert.revoked` event for that revocation; if
+  that event has aged out of audit retention — 365 days by default — and you
+  cannot establish the serial another way, you cannot tell whether it was lost:
+  treat it as lost), then
+  page through `GET /api/v1/ca/issued` (follow `offset` until `has_more` is
+  false) or decode the CRL (`curl … /api/v1/ca/crl | openssl crl -inform DER
+  -noout -text`). If the serial is still listed as revoked, nothing was lost. If
+  it is missing, re-root
+  the internal CA with the clean re-root in `docs/pki-architecture.md`
+  ("Deliberate clean re-root") — `POST /api/v1/ca/import-chain` is not enough,
+  because it keeps the issuing key the leaked certificate chains to. A re-root
+  re-enrolls the whole fleet.
+
+Single-server remains the only supported topology. If you nevertheless run two
+server versions against one database during an upgrade, a publish from the
+**older** binary does not take the lock and can still publish a CRL that omits a
+revocation the newer binary just recorded; the newer binary's freshness pass
+republishes to cover it (and can do so on every tick for as long as the older
+binary keeps publishing).
+
+**Rollback** to the previous release is safe: an older binary boots against the
+v4 schema and ignores the new column. It will not self-heal a missed CRL (rolling
+forward again republishes once), and its default-cert inventory purge fails
+while any revoked default leaf exists (logged, harmless) because the trigger stays
+in place — which is the point: it cannot un-revoke anything. Multi-replica PKI also still
+needs WS-6 slices 6.2 (enrollment) and 6.3 (CA key and KEK custody): today the
+freshness pass runs only on the elected leader, and a leader whose CA directory
+lacks the CA key can never publish.
 
 ### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
 
@@ -2378,7 +2482,12 @@ issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
 2. Optionally type a **reason** (e.g. `key compromise`, `decommissioned`) — it is
    stored on the revocation record and audited.
 3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
-   *Revoked* and the public CRL is republished automatically.
+   *Revoked* and the public CRL is republished automatically. If that publish
+   fails (the panel does not show this; the REST/MCP revoke response returns
+   `crl_republished:false` and a `ca.crl.published` failure is audited), the
+   server republishes it on its own: on the next
+   15-second freshness tick once the cause clears, or up to about 5 minutes later
+   if that attempt fails too. You do not need to revoke again.
 
 Revocation takes effect **immediately server-side**: the agent is refused on its
 next connection, and any already-open command stream is torn down by the
@@ -4252,7 +4361,7 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 | Path | Use case | Body | Draining-aware |
 |---|---|---|---|
 | `/livez` | Kubernetes liveness probe — fast check that the HTTP listener is up. | `{"status":"ok"}` | No |
-| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["api_token_store", ...]}` (503) when a store's database failed to open at startup. A non-critical store that's on but degraded (currently: `analytics_event_store`, ADR-0049) is reported via a non-gating `"degraded":[...]` array alongside either `status` value, rather than flipping the node to not-ready. | **Yes** |
+| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["api_token_store", ...]}` (503) when a store's database failed to open at startup. A non-critical store that's on but degraded (currently: `analytics_event_store`, ADR-0049, and the NVD CVE cache `nvd_db`, whose failure leaves vulnerability matching empty) is reported via a non-gating `"degraded":[...]` array alongside either `status` value, rather than flipping the node to not-ready. | **Yes** |
 | `/health` | Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version. | Structured JSON — see [REST API: Health](rest-api.md#health). | No |
 | `/api/health` | Identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Restored in v0.12.0 (issue #620). | Identical to `/health`. | No |
 
