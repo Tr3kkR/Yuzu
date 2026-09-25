@@ -257,6 +257,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::agent {
@@ -650,5 +651,11 @@ private:
 /// full null-safety and concurrent-teardown contract. Never blocks longer than `wait`
 /// in the ordinary (non-racing-a-concurrent-teardown) case.
 YUZU_EXPORT bool drain_log_bounded(std::chrono::milliseconds wait);
+
+/// TEST-ONLY. Emits an spdlog::info() call that executes INSIDE THIS LIBRARY'S IMAGE --
+/// used by a later macOS multi-image test fixture to prove a library-originated log call
+/// reaches the same sink a same-process exe-image caller does (or doesn't, if the platform
+/// has separate spdlog registries per image). Not called anywhere in production code.
+YUZU_EXPORT void log_handoff_emit_probe_for_test(std::string_view message);
 
 } // namespace yuzu::agent

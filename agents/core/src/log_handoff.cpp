@@ -271,6 +271,8 @@ bool drain_log_bounded(std::chrono::milliseconds wait) {
     // a concurrently-waiting teardown()'s wait_for_drain_quiescence().
 }
 
+void log_handoff_emit_probe_for_test(std::string_view message) { spdlog::info("{}", message); }
+
 // ---------------------------------------------------------------------------
 // LogHandoff
 // ---------------------------------------------------------------------------
