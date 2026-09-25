@@ -14,8 +14,11 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -47,8 +50,8 @@ inline constexpr std::array<TccService, 3> kTccServices{{
 /// Commonly-documented `auth_value` mapping across recent macOS releases (0=denied, 2=allowed,
 /// 3=limited); any other value is a visible prompt_undetermined rather than a guess. A NULL or
 /// non-integer column (nullopt) is `unreadable` -- sqlite3_column_int would silently read it as
-/// 0, i.e. a fabricated `denied`.
-[[nodiscard]] constexpr PermissionState decode_auth_value(std::optional<int> v) noexcept {
+/// 0, i.e. a fabricated `denied`. 64-bit: a value past int32 must not wrap onto 0/2/3.
+[[nodiscard]] constexpr PermissionState decode_auth_value(std::optional<std::int64_t> v) noexcept {
     if (!v) return PermissionState::unreadable;
     switch (*v) {
     case 0: return PermissionState::denied;
@@ -72,13 +75,13 @@ struct SourceFailure {
     std::string cause; // empty for `absent` (no token -- not a failure)
 };
 
-/// The lstat() pre-check on a TCC.db path, run BEFORE sqlite3_open_v2 so a missing file is
-/// told apart from a refused one (sqlite reports both as SQLITE_CANTOPEN). `lstat_errno` is 0
-/// on success. nullopt = a regular file is there, go ahead and open it.
+/// The lstat() pre-check on a TCC.db path, run BEFORE the open so a missing file is told apart
+/// from a refused one. `lstat_errno` is 0 on success. nullopt = a regular file is there, go
+/// ahead and open it.
 /// `missing_is_absent`: a per-user TCC.db that does not exist is an honest "this user has no
 /// TCC records" (absent); the SYSTEM TCC.db is always present on a supported macOS, so its
 /// absence is `unreadable`, never absent. A symlink or other non-regular final component is
-/// refused as `unreadable` (the open itself also passes SQLITE_OPEN_NOFOLLOW).
+/// refused as `unreadable` (the open itself uses O_NOFOLLOW_ANY).
 [[nodiscard]] inline std::optional<SourceFailure>
 classify_tcc_presence(int lstat_errno, bool is_regular_file, bool missing_is_absent) {
     if (lstat_errno == 0) {
@@ -132,6 +135,95 @@ enum class SqliteStage { open, query_only, prepare };
     return {outcome, std::string{prefix}.append(errmsg)};
 }
 
+// ── bounded, immutable read of one source ───────────────────────────────
+
+// A per-user TCC.db belongs to the user it describes, so it is hostile input: read by descriptor
+// through an immutable URI (no lock, no -journal/-wal/-shm opened or created), refused unless it
+// is one quiescent rollback-mode SQLite file, and bounded on every axis.
+inline constexpr std::size_t kMaxRowsPerService = 1024; // real max: 6
+inline constexpr int kMaxValueBytes = 4096;             // real max record: a few hundred bytes
+inline constexpr std::int64_t kMaxDbBytes = 256LL << 20;
+inline constexpr std::chrono::milliseconds kRunBudget{10'000};
+inline constexpr std::chrono::milliseconds kSourceBudget{2'000};
+
+struct ReadBounds {
+    std::chrono::steady_clock::time_point run_end = std::chrono::steady_clock::now() + kRunBudget;
+    std::chrono::steady_clock::duration source_budget = kSourceBudget;
+    std::size_t row_cap = kMaxRowsPerService;
+};
+
+// Why a category's read stopped short: the token suffix after `<source>:<category>:`.
+inline constexpr std::string_view kCutRowCap = "row_cap";
+inline constexpr std::string_view kCutTimeout = "timeout";
+inline constexpr std::string_view kCutValueTooLong = "value_too_long";
+
+inline constexpr std::array<std::string_view, 3> kSidecarSuffixes{"-journal", "-wal", "-shm"};
+
+/// sqlite's URI for `path`: immutable=1 takes no lock and touches no sidecar; `%`, `?` and `#` are
+/// the only characters a URI path reads specially.
+[[nodiscard]] inline std::string immutable_uri(std::string_view path) {
+    std::string out{"file:"};
+    for (const char c : path)
+        out.append(c == '%' ? "%25" : c == '?' ? "%3F" : c == '#' ? "%23" : std::string_view{&c, 1});
+    return out += "?immutable=1";
+}
+
+/// A failed open(2) of a file the lstat pre-check saw as present: EPERM/EACCES is the TCC/SIP
+/// refusal (denied); ELOOP is O_NOFOLLOW_ANY refusing a symlink anywhere in the path.
+[[nodiscard]] inline SourceFailure classify_tcc_open_errno(int err) {
+    if (err == ELOOP) return {SourceOutcome::unreadable, "open_failed:symlink"};
+    return {err == EPERM || err == EACCES ? SourceOutcome::denied : SourceOutcome::unreadable,
+            "open_failed:errno_" + std::to_string(err)};
+}
+
+/// The opened descriptor's own fstat: a regular file of plausible size.
+[[nodiscard]] inline std::optional<SourceFailure> classify_tcc_file(bool is_regular,
+                                                                    std::int64_t size) {
+    if (!is_regular) return SourceFailure{SourceOutcome::unreadable, "not_regular_file"};
+    if (size <= 0 || size > kMaxDbBytes)
+        return SourceFailure{SourceOutcome::unreadable, "size_out_of_range"};
+    return std::nullopt;
+}
+
+inline constexpr std::size_t kSqliteHeaderBytes = 100;
+inline constexpr std::string_view kSqliteMagic{"SQLite format 3\0", 16};
+
+/// Refuses what an immutable read would silently misread: not SQLite at all, or WAL mode (header
+/// bytes 18/19 == 2), whose committed state lives in a -wal this read ignores.
+[[nodiscard]] inline std::optional<SourceFailure>
+classify_tcc_header(std::span<const unsigned char> h) {
+    if (h.size() < kSqliteHeaderBytes ||
+        !std::equal(kSqliteMagic.begin(), kSqliteMagic.end(), h.begin(),
+                    [](char a, unsigned char b) { return static_cast<unsigned char>(a) == b; }))
+        return SourceFailure{SourceOutcome::unreadable, "not_sqlite"};
+    if (h[18] == 2 || h[19] == 2) return SourceFailure{SourceOutcome::unreadable, "wal_mode"};
+    return std::nullopt;
+}
+
+/// The header's file change counter (bytes 24..27, big-endian): bumped by every rollback commit.
+[[nodiscard]] constexpr std::uint32_t
+header_change_counter(std::span<const unsigned char> h) noexcept {
+    std::uint32_t v = 0;
+    for (std::size_t i = 24; i < 28 && i < h.size(); ++i) v = v << 8 | h[i];
+    return v;
+}
+
+/// What identifies the file's state to the read: taken from the descriptor before the first query
+/// and again after the last.
+struct FileStamp {
+    std::uint64_t inode = 0;
+    std::int64_t size = 0;
+    std::int64_t mtime_sec = 0;
+    std::int64_t mtime_nsec = 0;
+    std::uint32_t change_counter = 0;
+    friend bool operator==(const FileStamp&, const FileStamp&) = default;
+};
+
+[[nodiscard]] constexpr bool read_unchanged(const FileStamp& before,
+                                            const FileStamp& after) noexcept {
+    return before == after;
+}
+
 // ── /Users home enumeration ─────────────────────────────────────────────
 
 /// The autoruns collect_user_launchagents rule: a real home is uid 500 or above (below is a
@@ -179,8 +271,15 @@ inline constexpr std::uint32_t kMinUserHomeUid = 500;
 
 struct TccGrant {
     std::string client;
-    std::optional<int> auth_value; // nullopt = NULL / non-integer column
+    std::optional<std::int64_t> auth_value; // nullopt = NULL / non-integer column
 };
+
+/// Deterministic row order (the query has no ORDER BY: on a hostile view it would sort every row
+/// before returning the first, defeating the row cap).
+inline void sort_grants(std::vector<TccGrant>& grants) {
+    std::stable_sort(grants.begin(), grants.end(),
+                     [](const TccGrant& a, const TccGrant& b) { return a.client < b.client; });
+}
 
 /// One mapped TCC service's query result from one source.
 struct TccServiceRead {
@@ -188,13 +287,14 @@ struct TccServiceRead {
     std::vector<TccGrant> grants;
     bool step_failed = false; // sqlite3_step returned something other than ROW/DONE
     bool bind_failed = false; // sqlite3_bind_text failed -- the query never ran
+    std::string_view cut{};   // a kCut* bound stopped the read; `grants` keeps what came before
 };
 
 /// Appends one successfully-opened source's rows: every decoded grant; an `unreadable` row
-/// (token `<source_key>:<category>:query_bind_failed` / `...:query_step_failed`) for a category
-/// whose query could not be bound or whose step failed -- even when some of its rows were
-/// already read, since the set is incomplete; and an `absent` row for a category the source
-/// cleanly holds nothing for. A grant whose auth_value could not
+/// (token `<source_key>:<category>:query_bind_failed` / `...:query_step_failed` / `...:<kCut*>`)
+/// for a category whose query could not be bound, whose step failed or that hit a bound -- even
+/// when some of its rows were already read, since the set is incomplete; and an `absent` row for
+/// a category the source cleanly holds nothing for. A grant whose auth_value could not
 /// be read is an `unreadable` row with token `<source_key>:<category>:auth_value_unreadable`.
 inline void append_tcc_source_rows(std::string_view owner, std::span<const TccServiceRead> reads,
                                    std::vector<PermissionRow>& rows,
@@ -221,7 +321,12 @@ inline void append_tcc_source_rows(std::string_view owner, std::span<const TccSe
                             decode_auth_value(g.auth_value), std::to_string(*g.auth_value), "-", "-",
                             false});
         }
-        if (read.step_failed) {
+        if (!read.cut.empty()) {
+            rows.push_back(failure_row("macos", tcc_row_app_id(owner, "-"), read.category, false,
+                                       key + ":" + std::string{read.category} + ":" +
+                                           std::string{read.cut},
+                                       acc));
+        } else if (read.step_failed) {
             rows.push_back(failure_row("macos", tcc_row_app_id(owner, "-"), read.category, false,
                                        key + ":" + std::string{read.category} +
                                            ":query_step_failed",

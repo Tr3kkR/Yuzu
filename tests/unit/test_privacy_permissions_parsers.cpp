@@ -207,6 +207,31 @@ TEST_CASE("format_row: Windows row carries real last-used fields", "[privacy_per
          "permissions|windows|C:/App/app.exe|microphone|denied|Deny|1700000000000|1700000100000");
 }
 
+TEST_CASE("sanitize_utf8: valid UTF-8 is unchanged, every invalid byte becomes U+FFFD, and a "
+          "row never carries invalid UTF-8",
+          "[privacy_permissions][parsers]") {
+    for (const std::string_view ok : {"", "plain", "caf\xC3\xA9", "\xE2\x82\xAC", "\xF0\x9F\x98\x80",
+                                      "\xED\x9F\xBF", "\xF4\x8F\xBF\xBF"})
+        CHECK(sanitize_utf8(ok) == ok);
+    const std::string bad = "\xEF\xBF\xBD";
+    CHECK(sanitize_utf8("a\xC3(b") == "a" + bad + "(b");           // truncated 2-byte sequence
+    CHECK(sanitize_utf8("\xC0\x80") == bad + bad);                 // overlong NUL
+    CHECK(sanitize_utf8("\xED\xA0\x80") == bad + bad + bad);       // surrogate
+    CHECK(sanitize_utf8("\xF4\x90\x80\x80") == bad + bad + bad + bad); // above U+10FFFF
+    CHECK(sanitize_utf8("\xE2\x82") == bad + bad);                 // cut at the end
+
+    const PermissionRow r{"macos", "u\\\xFF", "camera", PermissionState::unreadable,
+                          "t:\xC3",   "-",        "-",      false};
+    CHECK(format_row(r) == "permissions|macos|u/" + bad + "|camera|unreadable|t:" + bad + "|-|-");
+}
+
+TEST_CASE("kInternalErrorRow*: the allocation-free literals equal the formatter, one per OS",
+          "[privacy_permissions][parsers]") {
+    CHECK(kInternalErrorRowLinux == format_internal_error_row("linux"));
+    CHECK(kInternalErrorRowMacos == format_internal_error_row("macos"));
+    CHECK(kInternalErrorRowWindows == format_internal_error_row("windows"));
+}
+
 TEST_CASE("select_status: denied wins over a mere failure token", "[privacy_permissions][parsers]") {
     yuzu::shared::ConstraintAccumulator acc;
     acc.add_failure("x:y");
@@ -234,6 +259,7 @@ TEST_CASE("select_status: no failure, no denial, unavailable mechanism is UNAVAI
     const auto st = select_status(acc, false, true);
     CHECK(st.status == YUZU_RESULT_STATUS_UNAVAILABLE);
     CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(st.provenance == kUnavailableProvenance);
 }
 
 TEST_CASE("any_denied: true iff at least one row's read was refused", "[privacy_permissions][parsers]") {
@@ -661,6 +687,10 @@ TEST_CASE("macos::decode_auth_value: 0 denied, 2/3 allowed, other prompt_undeter
     CHECK(macos::decode_auth_value(3) == PermissionState::allowed);
     CHECK(macos::decode_auth_value(1) == PermissionState::prompt_undetermined);
     CHECK(macos::decode_auth_value(std::nullopt) == PermissionState::unreadable);
+    // Past int32: the low bits must not wrap onto 0/2/3.
+    CHECK(macos::decode_auth_value(4294967296) == PermissionState::prompt_undetermined);
+    CHECK(macos::decode_auth_value(4294967298) == PermissionState::prompt_undetermined);
+    CHECK(macos::decode_auth_value(-2) == PermissionState::prompt_undetermined);
 }
 
 TEST_CASE("macos::classify_tcc_presence: a missing per-user db is absent, a missing system db "
@@ -731,6 +761,59 @@ TEST_CASE("macos::classify_tcc_sqlite_failure: the stage names the cause; a fail
     CHECK(row.state == PermissionState::unreadable);
     CHECK(row.raw == "alice:tcc_db:query_only_failed:unable to open database file");
     CHECK(acc.reason() == row.raw);
+}
+
+TEST_CASE("macos::immutable_uri: only % ? # are encoded, so every hostile spelling round-trips",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::immutable_uri("/Users/Jane Doe/TCC.db") ==
+          "file:/Users/Jane Doe/TCC.db?immutable=1");
+    CHECK(macos::immutable_uri("/Users/a%20b/q?x#h/TCC.db") ==
+          "file:/Users/a%2520b/q%3Fx%23h/TCC.db?immutable=1");
+}
+
+TEST_CASE("macos::classify_tcc_open_errno: a refused open is denied, a symlink and every other "
+          "errno unreadable",
+          "[privacy_permissions][macos_parsers]") {
+    for (const int e : {EPERM, EACCES})
+        CHECK(macos::classify_tcc_open_errno(e).outcome == macos::SourceOutcome::denied);
+    CHECK(macos::classify_tcc_open_errno(ELOOP).cause == "open_failed:symlink");
+    CHECK(macos::classify_tcc_open_errno(ENOENT).outcome == macos::SourceOutcome::unreadable);
+}
+
+TEST_CASE("macos::classify_tcc_header: WAL is either version byte; the change counter is bytes "
+          "24..27 big-endian",
+          "[privacy_permissions][macos_parsers]") {
+    std::array<unsigned char, macos::kSqliteHeaderBytes> h{};
+    for (std::size_t i = 0; i < macos::kSqliteMagic.size(); ++i)
+        h[i] = static_cast<unsigned char>(macos::kSqliteMagic[i]);
+    h[18] = h[19] = 1;
+    CHECK_FALSE(macos::classify_tcc_header(h));
+    h[24] = 1, h[27] = 4;
+    CHECK(macos::header_change_counter(h) == 0x01000004u);
+    for (const std::size_t i : {18, 19}) {
+        auto wal = h;
+        wal[i] = 2;
+        CHECK(macos::classify_tcc_header(wal)->cause == "wal_mode");
+    }
+    CHECK(macos::classify_tcc_header(std::span{h}.first(99))->cause == "not_sqlite");
+    h[0] = 'X';
+    CHECK(macos::classify_tcc_header(h)->cause == "not_sqlite");
+}
+
+TEST_CASE("macos::read_unchanged: every field of the file stamp matters",
+          "[privacy_permissions][macos_parsers]") {
+    const macos::FileStamp base{7, 4096, 1700000000, 500, 12};
+    CHECK(macos::read_unchanged(base, base));
+    const auto changed = [&](auto mutate) {
+        auto other = base;
+        mutate(other);
+        return !macos::read_unchanged(base, other);
+    };
+    CHECK(changed([](auto& s) { s.inode += 1; }));
+    CHECK(changed([](auto& s) { s.size += 1; }));
+    CHECK(changed([](auto& s) { s.mtime_sec += 1; }));
+    CHECK(changed([](auto& s) { s.mtime_nsec += 1; }));
+    CHECK(changed([](auto& s) { s.change_counter += 1; }));
 }
 
 TEST_CASE("macos::is_user_home_entry: a real home is a non-dot name, a directory seen without "

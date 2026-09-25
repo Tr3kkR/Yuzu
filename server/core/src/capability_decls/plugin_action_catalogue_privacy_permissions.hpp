@@ -11,9 +11,10 @@
 /// (`agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp`). Classified by
 /// READING the implementation, per this package's spec.
 ///
-/// `permissions` is ReadOnly/None -- the plugin only ever reads TCC.db, the ConsentStore
-/// registry subtree, or the xdg-desktop-portal permission store and never mutates host state
-/// on any platform.
+/// `permissions` is ReadOnly/None -- the plugin never requests, revokes or modifies a permission
+/// grant on any platform. It reads TCC.db (opened immutable: no lock taken, no sidecar file
+/// created), the ConsentStore registry subtree (an offline profile hive is mounted for the read
+/// and unloaded before return), or the xdg-desktop-portal permission store.
 ///
 /// Grouped under the SAME `Forensics` securable execution_artifacts uses (`rbac_store.cpp`'s
 /// seeded `types[]` entry; the string below MUST equal that seed literal byte-for-byte,

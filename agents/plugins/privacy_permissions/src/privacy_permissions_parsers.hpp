@@ -110,13 +110,44 @@ struct PermissionRow {
     return out.append(app_id);
 }
 
+/// `s` with every byte that is not part of a well-formed UTF-8 sequence (no overlong forms, no
+/// surrogates, nothing above U+10FFFF) replaced by U+FFFD: a hostile source value must never reach
+/// a proto3 string field invalid, or the receiver rejects the whole chunk, other rows included.
+[[nodiscard]] inline std::string sanitize_utf8(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size();) {
+        const auto at = [&](std::size_t k) -> unsigned {
+            return k < s.size() ? static_cast<unsigned char>(s[k]) : 0u;
+        };
+        const unsigned c = at(i);
+        const std::size_t len = c < 0x80                 ? 1
+                                : c >= 0xC2 && c <= 0xDF ? 2
+                                : c >= 0xE0 && c <= 0xEF ? 3
+                                : c >= 0xF0 && c <= 0xF4 ? 4
+                                                         : 0;
+        const unsigned lo = c == 0xE0 ? 0xA0 : c == 0xF0 ? 0x90 : 0x80; // first continuation byte
+        const unsigned hi = c == 0xED ? 0x9F : c == 0xF4 ? 0x8F : 0xBF;
+        bool ok = len == 1 || (len > 1 && at(i + 1) >= lo && at(i + 1) <= hi);
+        for (std::size_t k = 2; ok && k < len; ++k) ok = (at(i + k) & 0xC0) == 0x80;
+        if (ok) {
+            out.append(s.substr(i, len));
+            i += len;
+        } else {
+            out += "\xEF\xBF\xBD";
+            ++i;
+        }
+    }
+    return out;
+}
+
 [[nodiscard]] inline std::string format_row(const PermissionRow& r) {
     std::string out{kRowKindPermissions};
     (out += '|').append(r.os) += '|';
-    (out += yuzu::util::safe_output_field(r.app_id)) += '|';
+    (out += yuzu::util::safe_output_field(sanitize_utf8(r.app_id))) += '|';
     (out += r.category) += '|';
     (out += state_token(r.state)) += '|';
-    (out += yuzu::util::safe_output_field(r.raw)) += '|';
+    (out += yuzu::util::safe_output_field(sanitize_utf8(r.raw))) += '|';
     (out += r.last_used_start) += '|';
     return out.append(r.last_used_stop);
 }
@@ -130,6 +161,15 @@ struct PermissionRow {
     out += state_token(PermissionState::unreadable);
     return out += "|internal_error|-|-";
 }
+
+// The same row as constexpr literals: the catch-all must not allocate (pinned equal to
+// format_internal_error_row by the unit test).
+inline constexpr std::string_view kInternalErrorRowLinux =
+    "constrained|linux|-|-|unreadable|internal_error|-|-";
+inline constexpr std::string_view kInternalErrorRowMacos =
+    "constrained|macos|-|-|unreadable|internal_error|-|-";
+inline constexpr std::string_view kInternalErrorRowWindows =
+    "constrained|windows|-|-|unreadable|internal_error|-|-";
 
 /// A row whose READ failed: `denied` (the read was refused -- promotes PERMISSION_DENIED) or
 /// `unreadable` (any other failure -- CONSTRAINED). Never `absent`. The failure token is both
@@ -181,6 +221,9 @@ inline void fill_uncovered_categories(std::string_view os, std::vector<Permissio
     return false;
 }
 
+/// Provenance of an UNAVAILABLE result (no session bus, or no portal backend on it).
+inline constexpr std::string_view kUnavailableProvenance = "portal:unavailable";
+
 struct PermissionStatus {
     YuzuResultStatus status;
     YuzuResultCompleteness completeness;
@@ -198,7 +241,8 @@ struct PermissionStatus {
     if (acc.any_failure())
         return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL, acc.reason()};
     if (unavailable)
-        return {YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_FULL, {}};
+        return {YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_FULL,
+                std::string{kUnavailableProvenance}};
     return {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, {}};
 }
 

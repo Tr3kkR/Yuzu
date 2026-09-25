@@ -40,11 +40,11 @@
 namespace {
 
 #if defined(_WIN32)
-constexpr std::string_view kOsName = "windows";
+constexpr std::string_view kInternalErrorRow = yuzu::privacy_permissions::kInternalErrorRowWindows;
 #elif defined(__APPLE__)
-constexpr std::string_view kOsName = "macos";
+constexpr std::string_view kInternalErrorRow = yuzu::privacy_permissions::kInternalErrorRowMacos;
 #else
-constexpr std::string_view kOsName = "linux";
+constexpr std::string_view kInternalErrorRow = yuzu::privacy_permissions::kInternalErrorRowLinux;
 #endif
 
 const YuzuActionDescriptor kActionDescriptors[] = {
@@ -53,16 +53,19 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      {YUZU_SUPPORT_CONSTRAINED, 1,
       "xdg-desktop-portal org.freedesktop.impl.portal.PermissionStore.Lookup over the agent "
       "process's own session bus (sd_bus_open_user)",
-      "never another user's session: a system-service agent normally has no session bus and "
-      "reports unavailable, which says nothing about interactive users' grants; "
-      "full_disk_access is unsupported (no portal equivalent)"},
+      "never another user's session: a system-service agent has no session bus in every shipped "
+      "deployment and reports unavailable, which says nothing about interactive users' grants; "
+      "only portal-mediated grants are visible (an app opening the device directly never "
+      "appears); full_disk_access is unsupported (no portal equivalent)"},
      /* macos_leg   = */
      {YUZU_SUPPORT_CONSTRAINED, 1,
-      "TCC.db read-only, in-process sqlite3: the system /Library/Application Support/"
+      "TCC.db read-only, in-process sqlite3 over one descriptor with an immutable URI (no lock, "
+      "no -journal/-wal/-shm ever opened or created; a WAL-mode, journal-bearing or changing "
+      "file is refused, never read): the system /Library/Application Support/"
       "com.apple.TCC/TCC.db plus each /Users/<home> (uid >= 500) per-user "
       "Library/Application Support/com.apple.TCC/TCC.db",
       "every TCC.db is TCC-protected: without Full Disk Access each read is denied; camera and "
-      "microphone grants live only in the per-user dbs; location is unsupported (locationd, "
+      "microphone grants normally live in the per-user dbs; location is unsupported (locationd, "
       "outside TCC)"},
      /* windows_leg = */
      {YUZU_SUPPORT_SUPPORTED, 1,
@@ -121,10 +124,11 @@ public:
             return 1;
         } catch (...) {
             // Same 8-field shape as a data row (row_kind `constrained`), so the YAML columns
-            // still line up on the one row a consumer is most likely to be puzzled by.
+            // still line up on the one row a consumer is most likely to be puzzled by. A literal:
+            // nothing here may allocate.
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "internal_error");
-            ctx.write_output(pp::format_internal_error_row(kOsName));
+            ctx.write_output(kInternalErrorRow);
             return 1;
         }
     }

@@ -1,21 +1,21 @@
 /**
- * privacy_permissions_macos.cpp -- macOS leg: TCC.db read-only, in-process (sqlite3_open_v2
- * SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX|SQLITE_OPEN_NOFOLLOW + PRAGMA query_only, the
- * app_usage_plugin.cpp precedent) -- never a `sqlite3` CLI shellout.
+ * privacy_permissions_macos.cpp -- macOS leg: TCC.db read-only, in-process: opened once by
+ * descriptor, then sqlite3 over /dev/fd/N with immutable=1 (no lock, no -journal/-wal/-shm ever
+ * opened or created) + PRAGMA query_only -- never a `sqlite3` CLI shellout.
  *
  * TWO KINDS OF SOURCE, both read the same way:
  *   - the SYSTEM db, /Library/Application Support/com.apple.TCC/TCC.db -- machine-wide
  *     services (full_disk_access); rows unqualified.
  *   - one PER-USER db per real home, /Users/<name>/Library/Application Support/com.apple.TCC/
- *     TCC.db -- camera and microphone grants live HERE, not in the system db (empirically
- *     confirmed on this Mac, 2026-09-23: the per-user db held kTCCServiceMicrophone rows the
- *     system db never has). Rows are qualified `<name>\<client>` (qualify_app_id, the same
+ *     TCC.db -- camera and microphone grants normally live HERE, not in the system db (measured
+ *     on this Mac, 2026-09-23: the per-user db held kTCCServiceMicrophone rows the system db
+ *     never has; an MDM PPPC payload can add rows to the system db). Rows are qualified `<name>\<client>` (qualify_app_id, the same
  *     shape the Windows leg uses per profile). Homes are enumerated the autoruns_macos.cpp
  *     collect_user_launchagents way: directories directly under /Users, not followed through a
  *     symlink, owned by uid >= 500, the directory name as the user name (no Open Directory call).
  * A per-user db that does not exist is `absent` for that user; a refusal (EPERM/EACCES on the
- * lstat, SQLITE_AUTH/PERM, or SQLITE_CANTOPEN whose underlying syscall failed EPERM/EACCES on a
- * file that IS there) is `denied`; anything else -- including a failed `PRAGMA query_only` or
+ * lstat or the open, SQLITE_AUTH/PERM, or SQLITE_CANTOPEN whose underlying syscall failed
+ * EPERM/EACCES on a file that IS there) is `denied`; anything else -- including a failed `PRAGMA query_only` or
  * query bind -- is `unreadable` with a `<source>:<cause>` token (macos_parsers.hpp decides; this
  * file only reads).
  *
@@ -25,11 +25,11 @@
  *     honestly; the production LaunchDaemon (root) is not known to hold FDA today.
  *   - A home outside /Users (a relocated or network home) is not read, and a user whose home
  *     directory is directly under /Users but owned by a uid < 500 is skipped as a system entry.
- *   - SQLITE_OPEN_NOFOLLOW refuses a symbolic link ANYWHERE in the path (SQLITE_CANTOPEN_SYMLINK,
- *     reported `unreadable`, never `denied`), but it checks by path before the open, so a user
- *     who controls their home can race it and make their own rows come from a different file.
- *     Attribution of per-user rows is therefore best-effort against that user; confinement of
- *     the READ is unaffected (read-only, query_only, no write).
+ *   - A per-user db is hostile input (its user owns it). It is REFUSED, never guessed, when it is
+ *     not a regular file of plausible size, not SQLite, WAL-mode, has a -journal/-wal/-shm beside
+ *     it, or changes while read (an immutable read ignores exactly that state): so a concurrent
+ *     tccd commit reads `unreadable`. O_NOFOLLOW_ANY refuses a symlink anywhere in the path.
+ *     Rows per service, value size and time (per source and per run) are bounded.
  *   - The `access` schema and `auth_value` mapping (0=denied/2=allowed/3=limited) are the
  *     commonly-documented shape, proven on macOS 26.6.2 only; any other value is
  *     prompt_undetermined, never guessed.
@@ -50,8 +50,11 @@
 #include "privacy_permissions_macos_parsers.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -83,59 +86,20 @@ constexpr std::string_view kUserTccRelPath = "/Library/Application Support/com.a
 // walk; a host with more than this many entries reports `users:truncated`, never silently.
 constexpr std::size_t kMaxUserHomes = 4096;
 
-class DbHandle {
-public:
-    DbHandle() noexcept = default;
-    explicit DbHandle(sqlite3* db) noexcept : db_(db) {}
-    ~DbHandle() {
-        if (db_) sqlite3_close(db_);
-    }
-    DbHandle(const DbHandle&) = delete;
-    DbHandle& operator=(const DbHandle&) = delete;
-    DbHandle(DbHandle&& o) noexcept : db_(o.db_) { o.db_ = nullptr; }
-    DbHandle& operator=(DbHandle&& o) noexcept {
-        if (this != &o) {
-            if (db_) sqlite3_close(db_);
-            db_ = o.db_;
-            o.db_ = nullptr;
-        }
-        return *this;
-    }
-    [[nodiscard]] sqlite3* get() const noexcept { return db_; }
-    [[nodiscard]] explicit operator bool() const noexcept { return db_ != nullptr; }
-
-private:
-    sqlite3* db_{nullptr};
+struct DbCloser {
+    void operator()(sqlite3* db) const noexcept { sqlite3_close(db); }
 };
+struct StmtFinalizer {
+    void operator()(sqlite3_stmt* stmt) const noexcept { sqlite3_finalize(stmt); }
+};
+using DbPtr = std::unique_ptr<sqlite3, DbCloser>;
+using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtFinalizer>;
 
-/// RAII owner for a prepared statement -- CDX-P1-007: the previous manual
-/// `sqlite3_finalize` only at the end of the success path leaked `raw_stmt` (and left the
-/// connection outstanding when `DbHandle::~DbHandle` ran `sqlite3_close`) on any exception
-/// thrown while building a row between prepare and that single finalize call. Same shape as
-/// `DbHandle` in this file and `detail::Stmt` in app_usage_parsers.hpp/`StmtPtr` in tar_db.cpp.
-class StmtHandle {
-public:
-    StmtHandle() noexcept = default;
-    explicit StmtHandle(sqlite3_stmt* stmt) noexcept : stmt_(stmt) {}
-    ~StmtHandle() {
-        if (stmt_) sqlite3_finalize(stmt_);
-    }
-    StmtHandle(const StmtHandle&) = delete;
-    StmtHandle& operator=(const StmtHandle&) = delete;
-    StmtHandle(StmtHandle&& o) noexcept : stmt_(o.stmt_) { o.stmt_ = nullptr; }
-    StmtHandle& operator=(StmtHandle&& o) noexcept {
-        if (this != &o) {
-            if (stmt_) sqlite3_finalize(stmt_);
-            stmt_ = o.stmt_;
-            o.stmt_ = nullptr;
-        }
-        return *this;
-    }
-    [[nodiscard]] sqlite3_stmt* get() const noexcept { return stmt_; }
-    [[nodiscard]] explicit operator bool() const noexcept { return stmt_ != nullptr; }
-
-private:
-    sqlite3_stmt* stmt_{nullptr};
+/// The sqlite progress handler's state; it must outlive the connection it is installed on.
+struct Deadline {
+    std::chrono::steady_clock::time_point end;
+    bool fired = false;
+    bool expired() noexcept { return fired = fired || std::chrono::steady_clock::now() >= end; }
 };
 
 /// sqlite3_errmsg, or a fixed literal when sqlite3 could not even allocate a handle.
@@ -143,36 +107,41 @@ std::string sqlite_errmsg(sqlite3* db) {
     return db ? std::string{sqlite3_errmsg(db)} : std::string{"no_handle"};
 }
 
-/// Opens `db_path` (default: the system TCC.db) read-only and makes the connection query-only.
-/// On failure returns an empty handle and sets `failure` -- classified by
+/// Opens `db_path` (default: the system TCC.db) read-only through an immutable URI (no lock, so no
+/// busy timeout either) and makes the connection query-only. `deadline`, when given, is installed
+/// before the first prepare. On failure returns an empty handle and sets `failure` -- classified by
 /// macos::classify_tcc_sqlite_failure from the real result code, the VFS's own failed-syscall
 /// errno (sqlite3_system_errno) and sqlite3_errmsg, never a guessed diagnostic. A failed
 /// `PRAGMA query_only=1` is a failure too: the source is never read without it. `db_path` is a
 /// parameter so a unit test can force the exact open-failure branch deterministically against a
 /// path this process genuinely cannot open, without a non-FDA identity or the real TCC.db.
-DbHandle open_readonly(std::optional<macos::SourceFailure>& failure,
-                       std::string_view db_path = kTccDbPath) {
+DbPtr open_readonly(std::optional<macos::SourceFailure>& failure,
+                    std::string_view db_path = kTccDbPath, Deadline* deadline = nullptr) {
     sqlite3* raw = nullptr;
-    const int rc =
-        sqlite3_open_v2(std::string{db_path}.c_str(), &raw,
-                        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_NOFOLLOW, nullptr);
-    DbHandle db{raw}; // owns `raw` even on failure -- sqlite3 may allocate a handle just to
-                      // carry the error message; RAII from here regardless of `rc`.
+    const int rc = sqlite3_open_v2(macos::immutable_uri(db_path).c_str(), &raw,
+                                   SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX,
+                                   nullptr);
+    DbPtr db{raw}; // owns `raw` even on failure -- sqlite3 may allocate a handle just to
+                   // carry the error message; RAII from here regardless of `rc`.
     if (rc != SQLITE_OK) {
-        // The EXTENDED code: sqlite3_open_v2 returns only the primary one, and the
-        // classifier must tell SQLITE_CANTOPEN_SYMLINK from a refused open.
+        // The EXTENDED code: sqlite3_open_v2 returns only the primary one.
         failure = macos::classify_tcc_sqlite_failure(
             macos::SqliteStage::open, db ? sqlite3_extended_errcode(db.get()) : rc,
             db ? sqlite3_system_errno(db.get()) : 0, sqlite_errmsg(db.get()));
-        return DbHandle{};
+        return {};
     }
-    sqlite3_busy_timeout(db.get(), 2000);
+    if (deadline) {
+        const auto check = +[](void* d) noexcept -> int {
+            return static_cast<Deadline*>(d)->expired();
+        };
+        sqlite3_progress_handler(db.get(), 1000, check, deadline);
+    }
     const int pragma_rc = sqlite3_exec(db.get(), "PRAGMA query_only=1", nullptr, nullptr, nullptr);
     if (pragma_rc != SQLITE_OK) {
         failure = macos::classify_tcc_sqlite_failure(macos::SqliteStage::query_only, pragma_rc,
                                                      sqlite3_system_errno(db.get()),
                                                      sqlite_errmsg(db.get()));
-        return DbHandle{};
+        return {};
     }
     return db;
 }
@@ -195,73 +164,142 @@ private:
     DIR* dir_;
 };
 
-/// Reads ONE TCC.db source (`owner` empty = the system db) into `rows`. Every outcome lands as
-/// rows: a whole-source row when the file is missing/refused/unopenable/unpreparable, else
-/// every mapped category's rows (macos::append_tcc_source_rows).
-void read_tcc_source(std::string_view owner, const std::string& path, bool missing_is_absent,
-                     std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc) {
+/// One descriptor's state: fstat, and the SQLite header when it is a regular file.
+struct FdSnapshot {
+    macos::FileStamp stamp;
+    bool regular = false;
+    std::array<unsigned char, macos::kSqliteHeaderBytes> header{};
+    std::size_t header_len = 0;
+};
+
+std::optional<FdSnapshot> snapshot_fd(int fd) {
     struct stat st{};
-    const int lstat_errno = (::lstat(path.c_str(), &st) == 0) ? 0 : errno;
-    if (const auto f = macos::classify_tcc_presence(lstat_errno, lstat_errno == 0 && S_ISREG(st.st_mode),
-                                                    missing_is_absent)) {
-        rows.push_back(macos::tcc_source_failed_row(owner, *f, acc));
-        return;
+    if (::fstat(fd, &st) != 0) return std::nullopt;
+    FdSnapshot s;
+    if ((s.regular = S_ISREG(st.st_mode))) {
+        const ssize_t n = ::pread(fd, s.header.data(), s.header.size(), 0);
+        if (n < 0) return std::nullopt;
+        s.header_len = static_cast<std::size_t>(n);
     }
+    s.stamp = {st.st_ino, st.st_size, st.st_mtimespec.tv_sec, st.st_mtimespec.tv_nsec,
+               macos::header_change_counter({s.header.data(), s.header_len})};
+    return s;
+}
 
-    std::optional<macos::SourceFailure> open_failure;
-    DbHandle db = open_readonly(open_failure, path);
-    if (!db) {
-        rows.push_back(macos::tcc_source_failed_row(
-            owner,
-            open_failure.value_or(macos::SourceFailure{macos::SourceOutcome::unreadable,
-                                                       "open_failed:unknown"}),
-            acc));
-        return;
+/// True when a journal/WAL/shm file sits beside `path`, or its absence cannot be shown. lstat never
+/// blocks, so a planted FIFO is reported, not opened.
+bool sidecar_present(const std::string& path) {
+    for (const auto suffix : macos::kSidecarSuffixes) {
+        struct stat st{};
+        if (::lstat((path + std::string{suffix}).c_str(), &st) == 0 ||
+            (errno != ENOENT && errno != ENOTDIR))
+            return true;
     }
+    return false;
+}
 
-    sqlite3_stmt* raw_stmt = nullptr;
-    static constexpr char kQuery[] =
-        "SELECT service, client, auth_value FROM access WHERE service = ?";
-    const int prep_rc = sqlite3_prepare_v2(db.get(), kQuery, -1, &raw_stmt, nullptr);
-    StmtHandle stmt{raw_stmt}; // owns it from here -- finalized on every path, incl. an exception
-    if (prep_rc != SQLITE_OK) {
-        // 7.6: a TCC refusal can surface lazily, at the first page read, as CANTOPEN/AUTH --
-        // classified the same as an open failure, never a flat `unreadable`.
-        rows.push_back(macos::tcc_source_failed_row(
-            owner,
-            macos::classify_tcc_sqlite_failure(macos::SqliteStage::prepare,
-                                               sqlite3_extended_errcode(db.get()),
-                                               sqlite3_system_errno(db.get()),
-                                               sqlite_errmsg(db.get())),
-            acc));
-        return;
-    }
-
+/// The per-service query over one prepared statement. A read that hits a bound stops there with
+/// `cut` set and keeps what it had.
+std::vector<macos::TccServiceRead> read_services(sqlite3_stmt* stmt, Deadline& deadline,
+                                                 std::size_t row_cap) {
     std::vector<macos::TccServiceRead> reads;
     for (const auto& svc : macos::kTccServices) {
-        macos::TccServiceRead read{svc.category, {}, false, false};
-        sqlite3_reset(stmt.get()); // a prior step failure is already recorded on its own read
-        if (sqlite3_bind_text(stmt.get(), 1, svc.service.data(),
-                              static_cast<int>(svc.service.size()), SQLITE_STATIC) != SQLITE_OK) {
+        macos::TccServiceRead read{svc.category, {}, false, false, {}};
+        if (deadline.expired()) {
+            read.cut = macos::kCutTimeout;
+            reads.push_back(std::move(read));
+            continue;
+        }
+        sqlite3_reset(stmt); // a prior step failure is already recorded on its own read
+        if (sqlite3_bind_text(stmt, 1, svc.service.data(), static_cast<int>(svc.service.size()),
+                              SQLITE_STATIC) != SQLITE_OK) {
             read.bind_failed = true; // never run the statement with a stale or missing binding
             reads.push_back(std::move(read));
             continue;
         }
         for (;;) {
-            const int step_rc = sqlite3_step(stmt.get());
+            const int step_rc = sqlite3_step(stmt);
             if (step_rc == SQLITE_DONE) break;
             if (step_rc != SQLITE_ROW) {
-                read.step_failed = true;
+                if (deadline.fired) read.cut = macos::kCutTimeout;
+                else if (step_rc == SQLITE_TOOBIG) read.cut = macos::kCutValueTooLong;
+                else read.step_failed = true;
                 break;
             }
-            const auto* client = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
-            std::optional<int> auth_value;
-            if (sqlite3_column_type(stmt.get(), 2) == SQLITE_INTEGER)
-                auth_value = sqlite3_column_int(stmt.get(), 2);
+            if (read.grants.size() >= row_cap) {
+                read.cut = macos::kCutRowCap;
+                break;
+            }
+            const auto* client = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            std::optional<std::int64_t> auth_value;
+            if (sqlite3_column_type(stmt, 2) == SQLITE_INTEGER)
+                auth_value = sqlite3_column_int64(stmt, 2);
             read.grants.push_back({client ? client : "-", auth_value});
         }
+        macos::sort_grants(read.grants);
         reads.push_back(std::move(read));
     }
+    return reads;
+}
+
+/// Reads ONE TCC.db source (`owner` empty = the system db) into `rows`. Every outcome lands as
+/// rows: a whole-source row when the file is missing/refused/unopenable/unpreparable or not one
+/// quiescent rollback-mode SQLite file, else every mapped category's rows
+/// (macos::append_tcc_source_rows).
+void read_tcc_source(std::string_view owner, const std::string& path, bool missing_is_absent,
+                     std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc,
+                     const macos::ReadBounds& bounds = {}) {
+    const auto fail = [&](macos::SourceFailure f) {
+        rows.push_back(macos::tcc_source_failed_row(owner, f, acc));
+    };
+    constexpr auto unreadable = macos::SourceOutcome::unreadable;
+    struct stat st{};
+    const int lstat_errno = (::lstat(path.c_str(), &st) == 0) ? 0 : errno;
+    const bool regular = lstat_errno == 0 && S_ISREG(st.st_mode);
+    if (const auto f = macos::classify_tcc_presence(lstat_errno, regular, missing_is_absent))
+        return fail(*f);
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= bounds.run_end) return fail({unreadable, std::string{macos::kCutTimeout}});
+    if (sidecar_present(path)) return fail({unreadable, "sidecar_present"});
+
+    yuzu::agent::ScopedFd fd{
+        ::open(path.c_str(), O_RDONLY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC)};
+    if (!fd) return fail(macos::classify_tcc_open_errno(errno));
+    const auto first = snapshot_fd(fd.get());
+    if (!first) return fail({unreadable, "read_failed"});
+    if (const auto f = macos::classify_tcc_file(first->regular, first->stamp.size)) return fail(*f);
+    if (const auto f = macos::classify_tcc_header({first->header.data(), first->header_len}))
+        return fail(*f);
+
+    // Declared before `db`, so the progress handler's state outlives the connection.
+    Deadline deadline{std::min(bounds.run_end, now + bounds.source_budget)};
+    std::optional<macos::SourceFailure> open_failure;
+    const DbPtr db = open_readonly(open_failure, "/dev/fd/" + std::to_string(fd.get()), &deadline);
+    if (!db)
+        return fail(open_failure.value_or(macos::SourceFailure{unreadable, "open_failed:unknown"}));
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    static constexpr char kQuery[] =
+        "SELECT service, client, auth_value FROM access WHERE service = ?";
+    const int prep_rc = sqlite3_prepare_v2(db.get(), kQuery, -1, &raw_stmt, nullptr);
+    const StmtPtr stmt{raw_stmt}; // owns it from here -- finalized on every path
+    if (prep_rc != SQLITE_OK) {
+        // 7.6: a TCC refusal can surface lazily, at the first page read, as CANTOPEN/AUTH --
+        // classified the same as an open failure, never a flat `unreadable`.
+        if (deadline.fired) return fail({unreadable, std::string{macos::kCutTimeout}});
+        return fail(macos::classify_tcc_sqlite_failure(
+            macos::SqliteStage::prepare, sqlite3_extended_errcode(db.get()),
+            sqlite3_system_errno(db.get()), sqlite_errmsg(db.get())));
+    }
+    // Only now: the real schema text is one value too, and must still load.
+    sqlite3_limit(db.get(), SQLITE_LIMIT_LENGTH, macos::kMaxValueBytes);
+
+    const auto reads = read_services(stmt.get(), deadline, bounds.row_cap);
+    const auto last = snapshot_fd(fd.get());
+    if (!last) return fail({unreadable, "read_failed"});
+    if (!macos::read_unchanged(first->stamp, last->stamp))
+        return fail({unreadable, "changed_during_read"});
+    if (sidecar_present(path)) return fail({unreadable, "sidecar_present"});
     macos::append_tcc_source_rows(owner, reads, rows, acc);
 }
 
