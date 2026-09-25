@@ -2610,6 +2610,18 @@ test('issue lifecycle docs',
   timeout: 10,
 )
 
+# RBAC doc/seed parity (#480): rbac.md's system-role, securable-type, operation
+# and authorization-topology-floor tables must match rbac_store.cpp's seed
+# arrays and authz_topology_floor.hpp's kTopologyFloor. Also runs in
+# .github/workflows/docs-lint.yml on every PR; registered here for local
+# `meson test --suite docs` parity with the sibling python doc-tests.
+test('rbac doc counts',
+  _python3_test,
+  args: [files('test_rbac_doc_counts.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
 # ADR-0032 split interlock merge-gate: the tripwire (no engine-path symbol may
 # merge while the gate is red) and its self-test (the ledger's load-bearing
 # constants are pinned so the gate cannot be silently neutered). Both also run in
