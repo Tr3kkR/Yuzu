@@ -143,8 +143,8 @@ enum class ReadOutcome { ok, absent, denied, failed };
 /// proxy-blanket stage (CoSetProxyBlanket, after connect and before the query) carries no WBEM
 /// schema answer, so it never reads `absent`. A damaged repository that presents AS one of the two
 /// answers is indistinguishable from a real absence (README caveat 4; decision in #4900).
-[[nodiscard]] inline ReadOutcome classify_wmi_error_token(std::string_view token,
-                                                          std::size_t rows_before_error = 0) noexcept {
+[[nodiscard]] inline ReadOutcome
+classify_wmi_error_token(std::string_view token, std::size_t rows_before_error = 0) noexcept {
     const auto hr = hresult_from_token(token);
     const ReadOutcome o = hr ? classify_hresult(*hr) : ReadOutcome::failed;
     if (o != ReadOutcome::absent) return o == ReadOutcome::ok ? ReadOutcome::failed : o;
@@ -658,9 +658,10 @@ inline void record_dmi_read_error(FirmwareReport& report, std::vector<std::strin
 /// (classify_wmi_error_token, given the rows read before the failure) and maps it onto the report.
 /// `absent` writes the explicit absent rows with NO token (a definitive absence is a row, never
 /// silence); a refusal or any other failure writes an `unreadable` vendor row plus
-/// `wmi:<token>`, and a refusal sets the denial flag.
+/// `wmi:<token>`, and a refusal sets the denial flag. `rows_before_error` has no default: a call
+/// that left it out would read a fault after a returned row as an absence.
 inline void apply_wmi_error_token(FirmwareReport& report, std::string_view token,
-                                  std::size_t rows_before_error = 0) {
+                                  std::size_t rows_before_error) {
     const ReadOutcome o = classify_wmi_error_token(token, rows_before_error);
     if (o == ReadOutcome::absent) {
         report.add_all(wmi_bios_rows({}));

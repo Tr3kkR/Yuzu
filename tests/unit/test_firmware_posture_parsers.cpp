@@ -553,7 +553,8 @@ TEST_CASE("hresult_from_token: extracts only a trailing 0x<8 hex digits>", "[fir
 // and, in the other direction, under losing the `absent` the earlier governance contract
 // (FV-CODEX-01) requires for a MISSING namespace (INVALID_NAMESPACE at connect) or class
 // (INVALID_CLASS at query, or at the first Next(): the query is semisynchronous, see
-// tests/unit/test_wmi_bounded.cpp, so a missing class can arrive there).
+// tests/unit/test_wmi_bounded.cpp, so a missing class can arrive there); and under granting
+// `absent` to INVALID_CLASS at a Next() that follows a returned row.
 TEST_CASE("classify_wmi_error_token: absent only for the two answers WMI gives when something is missing",
           "[firmware_posture]") {
     // exactly three cells read absent
@@ -596,13 +597,13 @@ TEST_CASE("classify_wmi_error_token: absent only for the two answers WMI gives w
 
 // The Windows failed-WMI mapping the leg applies. Fails under: a runtime fault (NOT_FOUND at any
 // stage) writing the explicit absent rows with no token (the false absence the governance review
-// found), a missing namespace or class no longer writing them (FV-CODEX-01), or a refusal not
-// setting the denial flag.
+// found), a missing namespace or class no longer writing them (FV-CODEX-01), a class error after
+// a returned row writing them, or a refusal not setting the denial flag.
 TEST_CASE("apply_wmi_error_token: absent rows only for a missing namespace or class; else unreadable plus a token",
           "[firmware_posture]") {
     {   // a missing CLASS arrives at the first Next() as INVALID_CLASS: explicit absent rows, OK
         FirmwareReport rep;
-        apply_wmi_error_token(rep, "wmi_next_failed_0x80041010");
+        apply_wmi_error_token(rep, "wmi_next_failed_0x80041010", 0);
         REQUIRE(rep.rows.size() == 3);
         CHECK(row_str(rep.rows[0]) == "firmware|vendor|absent|wmi");
         CHECK_FALSE(rep.constraints.any_failure());
@@ -620,21 +621,21 @@ TEST_CASE("apply_wmi_error_token: absent rows only for a missing namespace or cl
     }
     {   // a missing namespace at connect: explicit absent rows, OK
         FirmwareReport rep;
-        apply_wmi_error_token(rep, "wmi_connect_failed_0x8004100e");
+        apply_wmi_error_token(rep, "wmi_connect_failed_0x8004100e", 0);
         REQUIRE(rep.rows.size() == 3);
         CHECK_FALSE(rep.constraints.any_failure());
         CHECK_FALSE(rep.denied);
     }
     {   // NOT_FOUND at connect (a repository-corruption symptom): one unreadable row and a token
         FirmwareReport rep;
-        apply_wmi_error_token(rep, "wmi_connect_failed_0x80041002");
+        apply_wmi_error_token(rep, "wmi_connect_failed_0x80041002", 0);
         REQUIRE(rep.rows.size() == 1);
         CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|wmi");
         CHECK(select_verdict(rep.constraints, rep.denied).reason == "wmi:wmi_connect_failed_0x80041002");
     }
     {   // a runtime fault at enumeration: one unreadable row and a token, never absent
         FirmwareReport rep;
-        apply_wmi_error_token(rep, "wmi_next_failed_0x80041002");
+        apply_wmi_error_token(rep, "wmi_next_failed_0x80041002", 0);
         REQUIRE(rep.rows.size() == 1);
         CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|wmi");
         const auto v = select_verdict(rep.constraints, rep.denied);
@@ -644,7 +645,7 @@ TEST_CASE("apply_wmi_error_token: absent rows only for a missing namespace or cl
     }
     {   // a refusal at any stage sets the denial flag and keeps its token
         FirmwareReport rep;
-        apply_wmi_error_token(rep, "wmi_next_failed_0x80041003");
+        apply_wmi_error_token(rep, "wmi_next_failed_0x80041003", 0);
         CHECK(rep.denied);
         const auto v = select_verdict(rep.constraints, rep.denied);
         CHECK(v.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
@@ -652,7 +653,7 @@ TEST_CASE("apply_wmi_error_token: absent rows only for a missing namespace or cl
     }
     {   // a deadline overrun carries no HRESULT: failed
         FirmwareReport rep;
-        apply_wmi_error_token(rep, "wmi_deadline_exceeded");
+        apply_wmi_error_token(rep, "wmi_deadline_exceeded", 0);
         CHECK(row_str(rep.rows.at(0)) == "firmware|vendor|unreadable|wmi");
         CHECK(select_verdict(rep.constraints, rep.denied).reason == "wmi:wmi_deadline_exceeded");
     }
@@ -696,7 +697,7 @@ TEST_CASE("apply_smbios_call_failed: no RSMB provider is an explicit absent row;
 TEST_CASE("FirmwareReport: a refusal stays sticky across a later non-refusal failure", "[firmware_posture]") {
     FirmwareReport rep;
     rep.fail("vendor", kSrcSmbios, "smbios:win32_5", true);
-    apply_wmi_error_token(rep, "wmi_next_failed_0x80041002"); // a non-refusal fault afterwards
+    apply_wmi_error_token(rep, "wmi_next_failed_0x80041002", 0); // a non-refusal fault afterwards
     CHECK(rep.denied);
     const auto v = select_verdict(rep.constraints, rep.denied);
     CHECK(v.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);

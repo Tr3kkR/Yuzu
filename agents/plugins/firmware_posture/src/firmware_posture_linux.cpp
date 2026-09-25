@@ -103,9 +103,9 @@
 #include <utility>
 #include <vector>
 
-// classify_errno (parsers header) spells EPERM/ENOENT/EACCES as the bare integers 1/2/13 so the pure
-// layer needs no OS header, and lets ENOTDIR (20) deliberately fall through to `failed`; pin all four
-// to this platform's real values, as the Windows leg does for its constants.
+// classify_errno (parsers header) spells EPERM/ENOENT/EACCES as the bare integers 1/2/13 so the
+// pure layer needs no OS header, and lets ENOTDIR (20) deliberately fall through to `failed`; pin
+// all four to this platform's real values, as the Windows leg does for its constants.
 static_assert(EPERM == 1 && ENOENT == 2 && EACCES == 13 && ENOTDIR == 20,
               "classify_errno's integer literals (EPERM 1, ENOENT 2, EACCES 13) must match this "
               "platform's errno values, and ENOTDIR (20) must stay a non-absent fall-through");
