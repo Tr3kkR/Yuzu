@@ -97,6 +97,11 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_policy.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -115,17 +120,30 @@ FRAGMENT_FILES = [
 # Wave 7b PR7b.1: +3 execution_artifacts (shimcache/amcache/prefetch).
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
 # Wave 9 PR9.1a: +3 peripherals (usb/pci/thunderbolt).
-# Wave 9 PR9.1b: +2 printing (printers/jobs) — clear_queue follows in a
-# focused follow-up PR on top of this one.
+# Wave 9 PR9.1b: +2 printing (printers/jobs).
+# Wave 9 PR9.1b (follow-up): +1 printing.clear_queue (merged to dev as PR #4616).
+# Wave 8 PR8.4: +1 firmware_posture (firmware).
+# Wave 10 P2a-3: +2 browser_inventory (browsers/profiles); its extensions action follows as its own PR (+1 then).
+# Wave 8 PR8.6: +2 app_control (wdac_policy/applocker_policy) — read-only
+# posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
+# Wave 8 PR8.1-a1: +2 platform_security (secure_boot/code_integrity).
+# Wave 10 PR10.1-b: +2 runtimes (dotnet/jvm).
 # Wave 10 PR10.2-b: +1 browser_policy (policies).
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
-# 1 (browser_policy) = 210.
-# NOTE for the integrator: every other Wave 10/Wave 8 PR adds its own rows to
-# this same total. This PR states base + 1 only; after merging fresh dev,
-# re-sum the fragments above and set the final value (do not trust this line).
-EXPECTED_TOTAL_ROWS = 210
+# 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
+# 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) +
+# 1 (browser_policy) = 220.
+# This constant has been bumped independently on both sides of a merge several times
+# (PR #4719 CI is the trail; #4721 tracks deriving it per fragment). The rule is
+# always the same: find the shared baseline both sides agree on and add EVERY side's new
+# plugin on top of it, never pick one side's total. Dev is at 219 here (216 baseline +
+# firmware_posture 1 + runtimes 2, per that merge's own resolution); this branch's own
+# browser_policy (+1) lands on top of dev's 219: 219 + 1 = 220. Verified directly against
+# the merged fragment files (not by combining these two stale totals) before landing —
+# see the merge commit for the confirming test run.
+EXPECTED_TOTAL_ROWS = 220
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
