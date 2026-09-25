@@ -128,6 +128,11 @@ Source of truth: `docs/ha-delivery-matrix.md`. Read it before this skill
 claims a status. WS-0…WS-10 come from ADR-2002 §Decomposition; WS-11…WS-14 are
 delivery/ops workstreams the three-model review surfaced as missing.
 
+**WS-6 re-stamped 2026-09-23 (PR #4833):** slice 6.1 (cross-replica CRL publication, #4126) in
+review; 6.1b / 6.2 / 6.3 planned; the operator decisions (shared CA key custody, not
+`SecretCodec`; a one-time `.cfg` enrollment import) are recorded in ADR-2002 §8 "Update
+(2026-09-23)".
+
 **Verified 2026-09-21 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
 WS-2a (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4 — #4011/#4134/#4169/#4194), WS-4 4.1 +
 4.2a + 4.2b Tasks A–D (#4245/#4299/#4344/#4355, merged) + `#4324` per-home
@@ -348,7 +353,7 @@ Next gate items: WS-5, WS-6, WS-8-readyz. Also open: `#4669`, `#4672`.**
 | **WS-3** | Coordination seam: **fenced `LeaderElector`** (monotonic epoch in claim txn) + leader/**transactional-outbox**/receiver-idempotency worker refactor incl. policy remediation | **WS-0, WS-1, WS-2(2a)** | **Y** | `architect`+`cpp-safety`+`security-guardian` | P1 | **3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 done (#4194)** |
 | **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **4.1 + 4.2a + 4.2b Tasks A–D + `#4324` per-home stream-generation fence + `#4555` cluster formation + 4.3a intra-cluster lookup + 4.4 (`gateway_node` convergence + `#4246` #6 writeback) all MERGED to `origin/dev`; rest of 4.3 (cross-cluster fan-out) / WS-5 cross-replica lookup remain — see `docs/ha-delivery-matrix.md`** |
 | **WS-5** | Shared agent presence / health / **scope-eval population** across core replicas | **WS-4, WS-1, WS-3, WS-10** | **Y** | `security-guardian`+`architect`+`sre`+`docs-writer` | P1 | planned |
-| **WS-6** | PKI/CA HA: CA key → `SecretCodec` blob in PG, `CaStore` → PG, **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG | **WS-1(`ca_store`), WS-3** | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` | P1 | planned |
+| **WS-6** | PKI/CA HA: shared CA key custody + node admission (**NOT** a `SecretCodec` blob — ADR-2002 §8 Update 2026-09-23, keeps ADR-0010 Decision 6), `CaStore` → PG (**already done**, ADR-0053), **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG (one-time `.cfg` import) | WS-3 (freshness pass); `ca_store` migration done | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` (+`authdb` on 6.2) | P1 | **6.1 CRL publication (#4126, PR #4833); 6.1b / 6.2 / 6.3 planned** — see `docs/ha-delivery-matrix.md` |
 | **WS-7** | **HA-PG delivery**: Patroni+etcd+HAProxy Compose profile, selectable durability (3-node quorum default, distinct failure domains), operator-plane LB profile | — (storage axis; parallel) | **N** | `release-deploy`+`build-ci`+`sre` | P1 | **done (PR #3627 merged to dev)** |
 | **WS-8** | Per-tier health contract (`/livez` vs `/readyz`; presentation→operator LB, core→presentation routing). **BYO-LB doc** + LB/session semantics | conceptual on WS-1/WS-2; readyz before LB fronts replicas | **Y** (readyz) | `docs-writer`+`release-deploy`+`sre` | P0 readyz / P2 doc | planned |
 | **WS-9** | **Failover test harness** — continuous, incremental scenarios added as each feature lands (not a final gate): session survival, no double-dispatch, effectively-once, cursor-poll no-loss, re-home races, quorum-degrade, standby loss | scenarios track WS-0…WS-7 as they land | N | `build-ci`+`release-deploy`; scenarios by `chaos-injector` | P1 (continuous) | planned |

@@ -505,10 +505,11 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
 - **`--mfa-step-up-window-secs` governs the OIDC-elevation proof-freshness
   bound too.** The elevate route's shared `elevation_step_up` gate (which
   every session — local and OIDC — must additionally clear after the
-  unconditional enrolled/amr checks above) floors its window to
-  `cfg.mfa_step_up_window_secs` (default 300 s; floored to 300 s even if the
-  operator has globally disabled step-up via `<= 0`, so the privilege
-  boundary always requires a fresh proof). For an OIDC session this is the
+  unconditional enrolled/amr checks above) uses
+  `cfg.mfa_step_up_window_secs` as its window when it is positive (default
+  300 s), and 300 s when the operator has globally disabled step-up via
+  `<= 0`, so the privilege boundary always requires a fresh proof. A positive
+  value below 300 is used as-is; this is a substitution, not a floor. For an OIDC session this is the
   same `Session::mfa_verified_at` freshness check the local branch uses —
   there is no separate OIDC-specific timer; an operator narrows the window
   operator-wide with the one flag.

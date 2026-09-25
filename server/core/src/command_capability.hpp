@@ -20,7 +20,7 @@
 ///
 /// WHAT THIS IS NOT: a place that DECLARES `plugin.action` rows. The real
 /// catalogue ships as several per-group fragment headers under
-/// `capability_decls/` (this package owns only the three system-initiated
+/// `capability_decls/` (this package owns only the four system-initiated
 /// ones — see `capability_decls/core_dispatch_capabilities.hpp`); every other
 /// plugin's rows are authored elsewhere and injected into a
 /// `CommandCapabilityRegistry` instance at composition time. This header
@@ -153,7 +153,13 @@ public:
     /// programmer error — fail loud via an exception, never silently drop a
     /// fragment (a dropped fragment would make every one of its rows
     /// `Unclassified`, indistinguishable from an honest miss).
-    static constexpr std::size_t kMaxSources = 16;
+    /// Raised 16 to 24 (#4729 merge, two sibling plugins — browser_inventory
+    /// and app_control — each shipping its own fragment file landed the live
+    /// source count at 17, past the old ceiling): the prior value was already
+    /// at capacity with zero headroom, contrary to its own "generous, not a
+    /// tight fit" contract. 24 gives room for several more
+    /// individually-fragmented plugins before this needs raising again.
+    static constexpr std::size_t kMaxSources = 24;
 
     explicit CommandCapabilityRegistry(
         std::initializer_list<std::span<const CommandCapability>> sources) {
