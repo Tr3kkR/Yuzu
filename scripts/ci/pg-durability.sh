@@ -16,19 +16,20 @@
 # ensure-postgres.sh), so every `local` below is initialised on the same
 # line it is declared — an uninitialised `local rc` read before assignment
 # is silently tolerated by bash 3.2 but aborts bash 5 with "rc: unbound
-# variable" (reproduced on this Mac: /opt/homebrew/bin/bash 5.3 aborts,
-# /bin/bash 3.2 does not). No mapfile/associative-arrays/${var,,} (bash 3.2
+# variable" (reproduced: /opt/homebrew/bin/bash 5.3 aborts, /bin/bash 3.2
+# does not). No mapfile/associative-arrays/${var,,} (bash 3.2
 # has none of those).
 #
 # Fixture provenance for --selftest: verbatim captures from a throwaway
 # trust-auth PostgreSQL 18.6 cluster (Homebrew, aarch64-apple-darwin),
 # 127.0.0.1:54318, captured 2026-09-24. Query used for the multi-row
 # fixtures: SELECT name, setting, source FROM pg_settings WHERE name IN
-# ('fsync','synchronous_commit','full_page_writes') ORDER BY name -tA. Four
+# ('fsync','synchronous_commit','full_page_writes') ORDER BY name, run
+# through psql -tA. Four
 # fixtures below are NOT separate live captures, but synthetic derivatives
 # built from the real ones (the query above always returns all three rows
 # well-formed, so a malformed/short/oversized read only happens via a
-# synthetic fixture): the single-CRLF-line-endings fixture (line endings of
+# synthetic fixture): the CRLF-line-endings fixture (line endings of
 # the post-heal capture rewritten), the missing-synchronous_commit fixture
 # (the default capture's third row dropped), the 2-field-row fixture (a
 # row's own `|source` column dropped), and the 4-field-row fixture (an
@@ -121,11 +122,11 @@ pg_durability_decide() {
 #      deliberately absent: pg_dsn_parse_authority's host class
 #      [^]:/?,@[] excludes ':' and '[]', so an IPv6 DSN never parses at
 #      all — it always reads '?' here and is drift-only, never healed);
-#   $3 MUST be exactly "manifest" (the psql came from YUZU_CI_PSQL, which is
-#      only ever exported by deploy/windows/Assert-Toolchain.ps1
-#      -ExportCiEnv from a Provision-Windows-Runner.ps1 manifest — the
-#      manifest is the declaration that this cluster is disposable CI
-#      infrastructure); and
+#   $3 MUST be exactly "manifest" (the psql came from YUZU_CI_PSQL, which
+#      only deploy/windows/Assert-Toolchain.ps1 -ExportCiEnv may export,
+#      from a Provision-Windows-Runner.ps1 manifest — see the psql-resolution
+#      rule in ensure-postgres.sh — the manifest is the declaration that this
+#      cluster is disposable CI infrastructure); and
 #   $4 MUST be exactly "1" — the caller's own pg_dsn_target_provable("$dsn")
 #      result, computed BEFORE calling this function (this function does
 #      not call pg_dsn_target_provable itself, so a caller that skips that
@@ -371,8 +372,8 @@ pg_durability_selftest() {
   pg_durability_check "dsn_target_provable unparseable host not provable" "1" "$rc"
   # A '@' inside the PATH (after the first '/' following "://") is not part
   # of the authority at all — libpq ends the host at that first '/', so a
-  # naive "exactly one '@' anywhere in the string" check (the bug this
-  # replaces) misreads the path's '@...host:port' tail as the authority.
+  # naive "exactly one '@' anywhere in the string" check would misread the
+  # path's '@...host:port' tail as the authority.
   # postgresql://%2Fsock/x@127.0.0.1:5433/db: libpq treats "%2Fsock" as the
   # (percent-decoded "/sock") host up to the first '/', so it actually
   # dials a Unix-socket directory, not 127.0.0.1:5433.
@@ -381,13 +382,10 @@ pg_durability_selftest() {
   rc=0; pg_dsn_target_provable 'postgresql://foo/x@127.0.0.1:5433/db' || rc=$?
   pg_durability_check "dsn_target_provable no-userinfo path '@' not provable" "1" "$rc"
   # A WELL-FORMED single-@ authority (yuzu@notloopback.example:1234)
-  # whose PATH also contains an '@host:port/'-shaped substring. Without the
-  # path-'@' check and the pg_dsn_host_port agreement invariant, the
-  # authority-shape checks alone would call this provable while
-  # pg_dsn_host_port's greedy regex reads the PATH's host:port
-  # (127.0.0.1:5433, loopback) instead of the authority's own
-  # (notloopback.example:1234, not loopback) — vouching for a host this
-  # function never actually inspected.
+  # whose PATH also contains an '@host:port/'-shaped substring: the shared
+  # parser refuses it on the path '@' (checked before the authority's own
+  # '@'-count), so the path's loopback host:port (127.0.0.1:5433) can never be
+  # taken for the authority's own (notloopback.example:1234).
   rc=0; pg_dsn_target_provable 'postgresql://yuzu@notloopback.example:1234/dbname@127.0.0.1:5433/rest' || rc=$?
   pg_durability_check "dsn_target_provable path-embedded @host:port past a well-formed authority not provable" "1" "$rc"
   # libpq's URI-scheme match is `^postgres(ql)?://`, case-sensitive
@@ -400,16 +398,36 @@ pg_durability_selftest() {
   rc=0; pg_dsn_target_provable 'postgresql://yuzu@127.0.0.1,127.0.0.1:5433/db' || rc=$?
   pg_durability_check "dsn_target_provable comma multi-host not provable" "1" "$rc"
   # A userinfo-FREE plain URI (at_count=0) is accepted too — the grammar is
-  # "AT MOST one '@'", not "exactly one"; this is the fixture the `-le 1` ->
-  # `-eq 1` mutation (CR5-5a) survived both suites without.
+  # "AT MOST one '@'", not "exactly one"; this fixture pins it (`-le 1` must
+  # not become `-eq 1`).
   rc=0; pg_dsn_target_provable 'postgresql://127.0.0.1:5433/yuzu_test' || rc=$?
   pg_durability_check "dsn_target_provable userinfo-free uri provable" "0" "$rc"
+
+  # Grammar members that gate ALTER SYSTEM (the port is spliced into the heal
+  # SQL): each shape below must be refused, and a refusal must clear all five
+  # PG_DSN_* fields (the documented failure contract).
+  local _np=''
+  for _np in \
+    'postgresql://yuzu@127.0.0.1:5433x/db' \
+    'postgresql://yuzu@127.0.0.1:/db' \
+    'postgresql://yuzu@127.0.0.1:5433 OR true/db' \
+    'postgresql://yuzu@127.0.0.1:5433,evil.example:5434/db' \
+    'host=evil.example dbname=postgresql://yuzu@127.0.0.1:5433/db' \
+    'postgresql://yuzu@:5433/db' \
+    'postgresql://yuzu@::1:5433/db' \
+    'postgresql://yuzu@127.0.0.1:5433/db@x' \
+    'postgresql://a@b@127.0.0.1:5433/db' \
+    'host=127.0.0.1 port=5433'; do
+    pg_dsn_parse_authority 'postgresql://yuzu:pw@127.0.0.1:5433/db' || true
+    rc=0; pg_dsn_parse_authority "$_np" || rc=$?
+    pg_durability_check "parse_authority refuses and clears all five: $_np" "1|" "${rc}|${PG_DSN_SCHEME}${PG_DSN_USERINFO}${PG_DSN_HOST}${PG_DSN_PORT}${PG_DSN_REST}"
+  done
 
   out="$(pg_dsn_host_port 'postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test')"; pg_durability_check "dsn_host_port uri" "127.0.0.1:5433" "$out"
   out="$(pg_dsn_host_port 'postgresql://127.0.0.1:5433/yuzu_test')"; pg_durability_check "dsn_host_port userinfo-free uri" "127.0.0.1:5433" "$out"
   out="$(pg_dsn_host_port 'host=127.0.0.1 port=5433 user=yuzu')"; pg_durability_check "dsn_host_port keyword-form" "?" "$out"
   out="$(pg_dsn_host_port 'postgresql://yuzu@[::1]:5433/db')"; pg_durability_check "dsn_host_port ipv6" "?" "$out"
-  # A greedy whole-string regex reads the password fragment "vault:2024"
+  # A whole-string '@' match would read the password fragment "vault:2024"
   # as host:port for both these DSNs; the authority-only parser must
   # refuse them outright.
   out="$(pg_dsn_host_port 'host=127.0.0.1 port=5433 user=yuzu password=S3cr3t@vault:2024/x dbname=yuzu_test')"
@@ -424,6 +442,8 @@ pg_durability_selftest() {
   # A numeral INSIDE the password field must never be mistaken for the port
   # by anything that rewrites the string in place — this is rebuilt from
   # the parsed authority parts, never regex-substituted.
+  out="$(pg_dsn_rebuild_port 'postgresql://yuzu:5433x@127.0.0.1:5433/db' 5434)"
+  pg_durability_check "dsn_rebuild_port shifts only the port, not a password that starts with the base port" "postgresql://yuzu:5433x@127.0.0.1:5434/db" "$out"
   out="$(pg_dsn_rebuild_port 'postgresql://yuzu:p5433x@127.0.0.1:5433/db' 5434)"
   pg_durability_check "dsn_rebuild_port shifts only the port, not a numeral in the password" "postgresql://yuzu:p5433x@127.0.0.1:5434/db" "$out"
   rc=0; out="$(pg_dsn_rebuild_port 'host=127.0.0.1 port=5433 user=yuzu' 5434)" || rc=$?

@@ -12,9 +12,10 @@
   affects $fail; SELECT 1 remains the health gate.
 
   Run it (a) at the end of provisioning, (b) as a registration / preflight
-  gate, and (c) by Start-PinnedRunner.ps1 at runner start (where the
-  fingerprint above also prints, without -ExportCiEnv), so a mis-provisioned
-  box fails in SECONDS rather than 90 minutes into a build. This is the catch
+  gate, (c) by Start-PinnedRunner.ps1 at runner start (where the
+  fingerprint above also prints, without -ExportCiEnv), and (d) by the
+  'Assert toolchain manifest (self-hosted)' step of ci.yml's windows job, so
+  a mis-provisioned box fails in SECONDS rather than 90 minutes into a build. This is the catch
   for the cutover faults (toolchain off PATH, MSYS2 /usr/bin missing, gateway
   escript/rebar3 unresolved).
 
@@ -285,7 +286,7 @@ if(-not $hasClusterContract){
         Add-Content -LiteralPath $env:GITHUB_ENV -Value "YUZU_CI_PSQL=$($own.psql)"
         Write-Host ("  [OK]   exported YUZU_CI_PSQL for agent {0} ({1})" -f $idx, $own.psql) -ForegroundColor Green
       } else {
-        Write-Host "  [warn] no manifest psql for agent $idx — YUZU_CI_PSQL not exported; ensure-postgres.sh will report durability UNVERIFIED" -ForegroundColor Yellow
+        Write-Host "  [warn] no manifest psql for agent $idx — YUZU_CI_PSQL not exported; ensure-postgres.sh will fall back to a PATH psql (report-only) or report durability UNVERIFIED" -ForegroundColor Yellow
       }
     }
   }

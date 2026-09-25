@@ -876,14 +876,15 @@ Check 'the fingerprint SQL carries all six expected field tokens' {
     Measure-Object | ForEach-Object { $_.Count -eq 0 }
 }
 Check 'Format-YuzuDurabilityFingerprint classifies an all-off real capture as info' {
-  # Real PostgreSQL 18.6 capture (orchestrator probe, 2026-09-24) of the
-  # fingerprint SQL against a freshly-provisioned, durability-off cluster.
+  # Real PostgreSQL 18.6 capture (2026-09-24) of the fingerprint SQL against
+  # a freshly-provisioned, durability-off cluster; data_directory is
+  # substituted with a representative Windows path.
   $r = Format-YuzuDurabilityFingerprint -Agent 1 -Port 5434 `
     -FingerprintLine 'fsync=off synchronous_commit=off full_page_writes=off data_directory=D:\ci\pg\agent-1 databases=3 active_backends=0'
   $r.Color -eq 'Cyan' -and $r.Text -eq '[info] agent 1 :5434 fsync=off synchronous_commit=off full_page_writes=off data_directory=D:\ci\pg\agent-1 databases=3 active_backends=0'
 }
 Check 'Format-YuzuDurabilityFingerprint classifies a drifted real capture as warn' {
-  # Real PostgreSQL 18.6 capture (orchestrator probe, 2026-09-24): a
+  # Real PostgreSQL 18.6 capture (2026-09-24), data_directory substituted: a
   # synchronous_commit that drifted to 'local' (still not 'off').
   $r = Format-YuzuDurabilityFingerprint -Agent 0 -Port 5433 `
     -FingerprintLine 'fsync=off synchronous_commit=local full_page_writes=off data_directory=/tmp/x databases=3 active_backends=0'
@@ -932,6 +933,28 @@ Check 'the CI psql export is opt-in and agent-guarded' {
     $_.TypeName.Name -eq 'switch'
   }
   [bool]$isSwitch
+}
+Check 'the CI psql export condition, executed, exports only a single-line existing leaf file' {
+  # The static Check above pins the condition's TEXT; -and -> -or, or the
+  # guards moved into a comment, keep that text intact. Evaluate the
+  # extracted condition against crafted manifest entries instead.
+  $assertText = Get-Content -LiteralPath $AssertPath -Raw
+  $cm = [regex]::Match($assertText, '(?m)^\s*if\((\$own -and[^\r\n]*)\)\{\s*$')
+  if(-not $cm.Success){ return $false }
+  $cond = [scriptblock]::Create("param(`$own) [bool]($($cm.Groups[1].Value))")
+  $leaf = $AssertPath
+  $dir = Split-Path -Parent $AssertPath
+  $cases = @(
+    @{ own = [pscustomobject]@{ psql = $leaf }; want = $true }
+    @{ own = [pscustomobject]@{ psql = @($leaf, $leaf) }; want = $false }
+    @{ own = [pscustomobject]@{ psql = @($leaf, "x`nEVIL=1") }; want = $false }
+    @{ own = [pscustomobject]@{ psql = "$leaf`nEVIL=1" }; want = $false }
+    @{ own = [pscustomobject]@{ psql = "$leaf`rEVIL=1" }; want = $false }
+    @{ own = [pscustomobject]@{ psql = $dir }; want = $false }
+    @{ own = [pscustomobject]@{ psql = $null }; want = $false }
+    @{ own = $null; want = $false }
+  )
+  @($cases | Where-Object { (& $cond $_.own) -ne $_.want }).Count -eq 0
 }
 Check 'ci.yml passes the CI psql export switch to the Windows manifest assertion' {
   $ciText = Get-Content -LiteralPath $CiWorkflowPath -Raw

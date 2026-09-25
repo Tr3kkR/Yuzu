@@ -20,8 +20,7 @@
 #      provisioned with the extra clusters.
 #
 #      Durability conformance (#2167 follow-up): before exporting the DSN
-#      (agent 0's cluster included — it was not probed at all before this),
-#      path 1 reads fsync/synchronous_commit/full_page_writes from the
+#      (agent 0's cluster included), path 1 reads fsync/synchronous_commit/full_page_writes from the
 #      cluster (see pg_durability_decide in pg-durability.sh) and, only
 #      under GitHub Actions against a loopback host PROVABLE from a plain
 #      URI DSN (pg_dsn_target_provable — no query string, and its authority
@@ -158,28 +157,38 @@ tcp_probe() { # host port — pure-bash, works in MSYS2 too
 # NAME-alternation (e.g. "PGHOST|PGHOSTADDR") is EXPORTED in this process,
 # case-INSENSITIVELY and regardless of value — a set-but-empty
 # PGSERVICE="" still matches libpq's own `[]` service section, and
-# MSYS2 bash only upper-cases 10 variable names at startup, so a
+# MSYS2 bash upper-cases only a short, fixed list of variable names at startup, so a
 # lower-case copy invisible to bash's own ${VAR:-} test is still visible
 # to psql.exe's case-insensitive Windows getenv. Pure bash/builtins
 # only (compgen -e, nocasematch) — no external tr/grep pipeline, which the
 # stripped-PATH docs-suite selftest harness cannot supply. On a match, sets
-# P1_ENV_MATCH to the variable's ACTUAL (case-preserved) name, so a caller
-# that also cares about the value can read it via `${!P1_ENV_MATCH}` — the
-# PGOPTIONS gate below is the one caller that does; a caller that (like the
-# PGHOST-family gate) treats "set" as fatal regardless of value ignores it.
+# P1_ENV_MATCH to the ACTUAL (case-preserved) name of the first matching
+# variable whose value is non-empty, else of the first match at all (the scan
+# continues past an empty-valued match, so an empty PGOPTIONS cannot hide a
+# non-empty PGOptions), so a caller that also cares about the value can read
+# it via `${!P1_ENV_MATCH}` — the PGOPTIONS gate below is the one caller that
+# does; a caller that (like the PGHOST-family gate) treats "set" as fatal
+# regardless of value ignores it.
 p1_env_is_set() {
   local name='' nocase_was_on=1
   shopt -q nocasematch || nocase_was_on=0
   shopt -s nocasematch
   local found=1
   P1_ENV_MATCH=''
+  # A here-string, not a process substitution: no MSYS2 process-substitution
+  # dependency in a gate that must not fail on a shell quirk.
   while IFS= read -r name; do
     if [[ "$name" =~ ^($1)$ ]]; then
-      found=0
-      P1_ENV_MATCH="$name"
-      break
+      if [[ "$found" == "1" ]]; then
+        found=0
+        P1_ENV_MATCH="$name"
+      fi
+      if [[ -n "${!name}" ]]; then
+        P1_ENV_MATCH="$name"
+        break
+      fi
     fi
-  done < <(compgen -e)
+  done <<<"$(compgen -e)"
   [[ "$nocase_was_on" == "0" ]] && shopt -u nocasematch
   return "$found"
 }
@@ -310,9 +319,9 @@ p1_flatten() {
 # token: \"codex_secret_%ZZ\"") or force_untrusted is set (the caller
 # already knows the text isn't a clean pg_settings read, e.g. p1_conform's
 # "fail unparseable" arm). GitHub Actions' ::error::/::warning:: annotations
-# are PUBLIC and its secret masking is exact-value-only, so a credential
-# substring that isn't byte-for-byte the configured secret leaks in the
-# clear; p1_flatten alone only makes that single-line-safe, it does not
+# are PUBLIC and its secret masking is value- and URI-userinfo-pattern-
+# based, so a credential substring that isn't byte-for-byte the configured
+# secret can still leak in the clear; p1_flatten alone only makes that single-line-safe, it does not
 # remove it. rc == 0 and no force (the read succeeded and the caller knows
 # the text is a real pg_settings/ALTER SYSTEM result, which cannot contain a
 # DSN) is flattened and printed as before, on or off Actions.
@@ -351,7 +360,7 @@ p1_diag() {
 # output at all) prints a fixed "no ERROR/FATAL/WARNING/DETAIL/HINT line in
 # psql output" instead of echoing raw text. This takes only the text, never an
 # <rc> — every caller already prefixes its own message with
-# "(psql rc=${rc})", so passing rc through here used to double it up as
+# "(psql rc=${rc})", so passing rc through here would double it up as
 # "(psql rc=2): psql rc=2" when there was no server line to print.
 p1_server_diag() {
   local text="${1//$'\r'/}"
@@ -390,10 +399,11 @@ p1_server_diag() {
 # prints $dsn unredacted.
 #
 # The DSN string alone is advisory, not authoritative, for where libpq
-# actually connects (pg_dsn_target_provable's doc comment; a PGHOST-family
-# env var wins over a URI's own authority too) — so on TOP of that string
-# check, the heal session's own FIRST statement is an in-session DO block
-# that RAISEs unless the server it is actually talking to is loopback on
+# actually connects (pg_dsn_target_provable's doc comment; PGHOSTADDR, or a
+# PGSERVICE entry carrying hostaddr, redirects even a plain URI's own
+# authority) — so on TOP of that string check, the heal session's identity
+# DO block (its second statement, after the search_path pin) RAISEs unless
+# the server it is actually talking to is loopback on
 # the exact port this DSN claims. That in-session check is the
 # authoritative bound; the provable/env-override gates below only decide
 # whether we attempt a heal at all, so a refusal there is reported as
@@ -404,8 +414,7 @@ p1_conform() {
   local q="SELECT name, setting, source FROM pg_catalog.pg_settings WHERE name IN ('fsync','synchronous_commit','full_page_writes') ORDER BY name"
   local heal_refusal_reason='' final_decision='' hp_disp=''
   hp="$(pg_dsn_host_port "$dsn")"
-  hp_disp="$hp"
-  [[ "$hp_disp" == "?" ]] && hp_disp="host unparsed (keyword-form, IPv6, multi-host, or query-string DSNs are report-only)"
+  hp_disp="$(p1_hp_disp "$dsn")"
   dsn_redacted="$(pg_dsn_redact "$dsn")"
 
   if [[ "$P1_PSQL_SRC" == "none" ]]; then
@@ -457,13 +466,12 @@ p1_conform() {
       return 0
       ;;
     drift*)
-      # The per-agent derivation (pg_dsn_rebuild_port) and pg_dsn_host_port
-      # only ever yield a real host:port for a URI-form DSN with a literal
-      # loopback host — a keyword-form, IPv6, multi-host, or query-string
-      # DSN reads as "?" (hp_disp, computed above) and is drift-only by
-      # construction (pg_heal_allowed can never see a loopback host for
-      # one). Say so plainly rather than printing the confusing literal
-      # "on ?".
+      # pg_dsn_host_port yields a real host:port only for a plain URI DSN
+      # (any literal host); a keyword-form, IPv6, multi-host, or query-string
+      # DSN reads as "?" (hp_disp, computed above), so pg_heal_allowed can
+      # never see a loopback host for one and it is drift-only by
+      # construction. Say so plainly rather than printing the confusing
+      # literal "on ?".
       if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
         if [[ -n "$heal_refusal_reason" ]]; then
           echo "::warning::ensure-postgres: ${decision#drift } not off on ${hp_disp} — NOT healing (${heal_refusal_reason})." >&2
@@ -489,9 +497,11 @@ p1_conform() {
       # NULL`; (2) a config-parse guard that refuses a RELOAD-ABORTING
       # pg_file_settings error (which would make pg_reload_conf() apply
       # NOTHING) but is fail-open on an APPLY-PHASE row (Postgres applies
-      # every other change on those regardless). Full rationale, including
-      # the non-English lc_messages caveat, is in docs/ci-architecture.md
-      # "Postgres for server tests".
+      # every other change on those regardless). On PG 18.6 an apply-phase
+      # (restart-pending) row reads 'setting could not be applied'; the second
+      # NOT LIKE clause is a harmless cross-version belt (unverified on other
+      # majors). Full rationale is in docs/ci-architecture.md "Postgres for
+      # server tests".
       # The session's FIRST statement pins search_path so a planted
       # public.string_agg/inet-operator function (the yuzu role is
       # SUPERUSER) can never intercept this session's unqualified calls —
@@ -500,7 +510,7 @@ p1_conform() {
       rows="$(p1_psql "$dsn" -q -v ON_ERROR_STOP=1 -tA \
         -c 'SET search_path = pg_catalog, pg_temp' \
         -c "DO \$\$ BEGIN IF pg_catalog.inet_server_addr() IS NULL OR pg_catalog.inet_server_port() IS NULL OR NOT ((pg_catalog.inet_server_addr() << '127.0.0.0/8' OR pg_catalog.inet_server_addr() = '::1') AND pg_catalog.inet_server_port() = ${hp##*:}) THEN RAISE EXCEPTION 'yuzu-heal-identity-guard: connected server % port % is not loopback:${hp##*:}', pg_catalog.inet_server_addr(), pg_catalog.inet_server_port(); END IF; END \$\$" \
-        -c "DO \$\$ DECLARE bad_errors text; BEGIN SELECT string_agg(DISTINCT error, '; ') INTO bad_errors FROM pg_catalog.pg_file_settings WHERE error IS NOT NULL AND error <> 'setting could not be applied' AND error NOT LIKE '%cannot be changed without restarting the server'; IF bad_errors IS NOT NULL THEN RAISE EXCEPTION 'yuzu-heal-config-parse-guard: pg_file_settings has reload-aborting error(s) - pg_reload_conf() would apply nothing and may leave an unrelated staged change (e.g. pg_hba.conf) live; check pg_file_settings and the server log: %', bad_errors; END IF; END \$\$" \
+        -c "DO \$\$ DECLARE bad_errors text; BEGIN SELECT pg_catalog.string_agg(DISTINCT error, '; ') INTO bad_errors FROM pg_catalog.pg_file_settings WHERE error IS NOT NULL AND error <> 'setting could not be applied' AND error NOT LIKE '%cannot be changed without restarting the server'; IF bad_errors IS NOT NULL THEN RAISE EXCEPTION 'yuzu-heal-config-parse-guard: pg_file_settings has reload-aborting error(s) - pg_reload_conf() would apply nothing and may leave an unrelated staged change (e.g. pg_hba.conf) live; check pg_file_settings and the server log: %', bad_errors; END IF; END \$\$" \
         -c 'ALTER SYSTEM SET fsync = off' \
         -c 'ALTER SYSTEM SET synchronous_commit = off' \
         -c 'ALTER SYSTEM SET full_page_writes = off' \
@@ -566,8 +576,9 @@ p1_conform() {
 # branch (path 1 below). Matched case-insensitively via p1_env_is_set (see
 # its doc comment) — deliberate for MSYS2/Windows psql.exe's
 # case-insensitive getenv; real POSIX getenv is case-sensitive, so a
-# non-canonical-case match there is a harmless, merely conservative false
-# trigger, never a false negative. An EMPTY value is exempt either way:
+# non-canonical-case match there is a conservative false trigger (it fails
+# the job although libpq would ignore the variable — unset or rename it),
+# never a false negative. An EMPTY value is exempt either way:
 # pg_pool.cpp/leader_elector.cpp only read PGOPTIONS when it is non-empty
 # (`env_options[0] != '\0'`), so a set-but-empty PGOPTIONS disables
 # nothing and must not be fatal.
@@ -684,8 +695,7 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   # The derived DSN is trusted only when pg_dsn_parse_authority accepts
   # the pre-set DSN (called DIRECTLY here, not via its pg_dsn_target_provable
   # alias, since this call site needs the PG_DSN_HOST/PG_DSN_PORT fields the
-  # parse sets as its documented side channel — pg_dsn_target_provable's own
-  # doc comment is silent on that channel), then rebuilt via
+  # parse sets as its documented side channel), then rebuilt via
   # pg_dsn_rebuild_port — see that function's own doc comment for why. A
   # DSN this cannot derive from is the same no-fallback contract as a
   # failed probe below: fatal with a manifest-vouched psql, a loud warning
@@ -695,7 +705,7 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
       PA_HOST="$PG_DSN_HOST"
       # 10# forces base-10: a leading-zero port (e.g. "08") would otherwise
       # read as invalid octal under `set -e` and abort path 1 (the same
-      # trap documented at :99 for YUZU_CI_PG_SLEEP_SCALE).
+      # trap the YUZU_CI_PG_SLEEP_SCALE check above guards against).
       PA_PORT=$((10#$PG_DSN_PORT + AGENT_IDX))
       PA_DSN="$(pg_dsn_rebuild_port "$YUZU_TEST_POSTGRES_DSN" "$PA_PORT")"
       PA_HOW=""
@@ -705,7 +715,7 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
         if p1_probe_manifest "$PA_DSN"; then
           PA_HOW="psql SELECT 1 verified"
         elif [[ "$P1_PSQL_SRC" == "manifest" ]]; then
-          echo "::error::ensure-postgres: per-agent Postgres on ${PA_HOST}:${PA_PORT} for ${RUNNER_NAME} failed 'psql SELECT 1' (psql rc=${P1_PROBE_RC}$(p1_rc_hint "$P1_PROBE_RC")) although the toolchain manifest declares it (Assert-Toolchain proved it earlier in this same job) — NOT falling back to the shared agent-0 cluster (cross-job contention, #2094). Check the service/orphaned backends; see docs/ci-architecture.md 'Postgres for server tests'." >&2
+          echo "::error::ensure-postgres: per-agent Postgres on ${PA_HOST}:${PA_PORT} for ${RUNNER_NAME} failed 'psql SELECT 1' (psql rc=${P1_PROBE_RC}$(p1_rc_hint "$P1_PROBE_RC")) although the toolchain manifest declares it (Assert-Toolchain proved the manifest's own cluster and credential earlier in this same job) — NOT falling back to the shared agent-0 cluster (cross-job contention, #2094). Check the service/orphaned backends (or, on rc 2, a pre-set DSN whose credential/database differs from the manifest's — Assert-Toolchain proves only the manifest's own credential); see docs/ci-architecture.md 'Postgres for server tests'." >&2
           exit "$SOFT_EXIT"
         fi
       elif tcp_probe "$PA_HOST" "$PA_PORT"; then
@@ -728,15 +738,13 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   fi
   P1_DSN="$YUZU_TEST_POSTGRES_DSN"
   P1_HOW="pre-set runner env"
-  # Agent 0 (or a single-agent box) had NO probe-with-retry at
-  # all before this — its first contact with the cluster was the
-  # conformance read itself. Give it the same bounded retry + no-fallback
+  # Agent 0 (or a single-agent box) gets the same bounded retry + no-fallback
   # rule the per-agent branch above has, so a manifest-vouched transient
   # gets the same short grace and a genuine fault fails with the same
   # loud, specific wording instead of surfacing only as a generic read
   # failure inside p1_conform.
   if [[ "$P1_PSQL_SRC" == "manifest" ]] && ! p1_probe_manifest "$P1_DSN"; then
-    echo "::error::ensure-postgres: Postgres on $(p1_hp_disp "$P1_DSN") (agent 0 / base cluster for ${RUNNER_NAME:-this runner}) failed 'psql SELECT 1' (psql rc=${P1_PROBE_RC}$(p1_rc_hint "$P1_PROBE_RC")) although the toolchain manifest declares it (Assert-Toolchain proved it earlier in this same job) — refusing to proceed. Check the service/orphaned backends; see docs/ci-architecture.md 'Postgres for server tests'." >&2
+    echo "::error::ensure-postgres: Postgres on $(p1_hp_disp "$P1_DSN") (agent 0 / base cluster for ${RUNNER_NAME:-this runner}) failed 'psql SELECT 1' (psql rc=${P1_PROBE_RC}$(p1_rc_hint "$P1_PROBE_RC")) although the toolchain manifest declares it (Assert-Toolchain proved the manifest's own cluster and credential earlier in this same job) — refusing to proceed. Check the service/orphaned backends (or, on rc 2, a pre-set DSN whose credential/database differs from the manifest's — Assert-Toolchain proves only the manifest's own credential); see docs/ci-architecture.md 'Postgres for server tests'." >&2
     exit "$SOFT_EXIT"
   fi
   p1_conform "$P1_DSN" || exit "$SOFT_EXIT"

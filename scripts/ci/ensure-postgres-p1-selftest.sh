@@ -185,7 +185,7 @@ CAP_NOSUPER='ERROR:  permission denied to set parameter "fsync"'
 # under Actions (p1_server_diag), plus one non-server sentinel line that
 # MUST NOT (proves the filter is selective, not just "print everything").
 FAKE_FAIL_OUT=$'ERROR:  permission denied to set parameter "fsync"\nDETAIL:  fake DETAIL line for the p1_server_diag filter\nHINT:  fake HINT line for the p1_server_diag filter\nfake-psql-sentinel-should-not-appear'
-# Real PostgreSQL 18.6 capture (orchestrator probe, 2026-09-24): a TCP
+# Real PostgreSQL 18.6 capture (2026-09-24): a TCP
 # connection to the WRONG expected port makes the in-session identity
 # guard RAISE with a CONTEXT line PL/pgSQL always attaches to a RAISE.
 # Ports adjusted to this harness's own DSN0 (:5433) and derived per-agent
@@ -194,9 +194,8 @@ FAKE_FAIL_OUT=$'ERROR:  permission denied to set parameter "fsync"\nDETAIL:  fak
 # that the filter is selective, not "print everything after the first
 # match" (case 6b below asserts CONTEXT: is withheld).
 FAKE_GUARD_FAIL_OUT=$'ERROR:  yuzu-heal-identity-guard: connected server 127.0.0.1 port 5433 is not loopback:5434\nCONTEXT:  PL/pgSQL function inline_code_block line 1 at RAISE\nfake-psql-sentinel-should-not-appear'
-# Real PostgreSQL 18.6 capture (orchestrator probe, 2026-09-24, re-captured
-# against the LANDED config-parse guard's exact RAISE text — the prior
-# fixture here was stale pre-change wording): an unrecognized-parameter
+# Real PostgreSQL 18.6 capture (2026-09-24) of the config-parse guard's exact
+# RAISE text: an unrecognized-parameter
 # line appended to a running cluster's postgresql.auto.conf (so it reaches
 # pg_file_settings without aborting startup) makes the guard RAISE, CONTEXT
 # line included, before any ALTER SYSTEM.
@@ -293,6 +292,15 @@ port_open() {
 
 DSN0='postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test'
 
+# Golden text of the heal's two DO blocks, in full. The fake psql cannot
+# parse SQL, so a syntax or placeholder break after any shorter prefix pin
+# (a dropped END IF/DECLARE, a RAISE one argument short) would only surface
+# in a real heal. $1 = the cluster's port.
+golden_identity_do() {
+  printf '%s' "DO \$\$ BEGIN IF pg_catalog.inet_server_addr() IS NULL OR pg_catalog.inet_server_port() IS NULL OR NOT ((pg_catalog.inet_server_addr() << '127.0.0.0/8' OR pg_catalog.inet_server_addr() = '::1') AND pg_catalog.inet_server_port() = $1) THEN RAISE EXCEPTION 'yuzu-heal-identity-guard: connected server % port % is not loopback:$1', pg_catalog.inet_server_addr(), pg_catalog.inet_server_port(); END IF; END \$\$"
+}
+GOLDEN_CONFIG_DO="DO \$\$ DECLARE bad_errors text; BEGIN SELECT pg_catalog.string_agg(DISTINCT error, '; ') INTO bad_errors FROM pg_catalog.pg_file_settings WHERE error IS NOT NULL AND error <> 'setting could not be applied' AND error NOT LIKE '%cannot be changed without restarting the server'; IF bad_errors IS NOT NULL THEN RAISE EXCEPTION 'yuzu-heal-config-parse-guard: pg_file_settings has reload-aborting error(s) - pg_reload_conf() would apply nothing and may leave an unrelated staged change (e.g. pg_hba.conf) live; check pg_file_settings and the server log: %', bad_errors; END IF; END \$\$"
+
 # ── 1. ok ────────────────────────────────────────────────────────────────
 N=$((N + 1))
 state="$(new_state 0 "$CAP_OFF" '' '' '')"
@@ -343,12 +351,8 @@ expect "heal" "search_path pin precedes the identity guard" "true" \
 # fail this case. The fake psql cannot evaluate the SQL, so its text is
 # the only thing a harness can pin.
 expect_contains "heal" "heal call" "-X -w --dbname=${DSN0} -q -v ON_ERROR_STOP=1 -tA" "$heal_call_line"
-expect_contains "heal" "heal call (identity guard, full predicate)" \
-  "pg_catalog.inet_server_addr() IS NULL OR pg_catalog.inet_server_port() IS NULL OR NOT ((pg_catalog.inet_server_addr() << '127.0.0.0/8' OR pg_catalog.inet_server_addr() = '::1') AND pg_catalog.inet_server_port() = 5433) THEN RAISE EXCEPTION" \
-  "$heal_call_line"
-expect_contains "heal" "heal call (config-parse guard, refined predicate)" \
-  "error IS NOT NULL AND error <> 'setting could not be applied' AND error NOT LIKE '%cannot be changed without restarting the server'; IF bad_errors IS NOT NULL THEN RAISE EXCEPTION" \
-  "$heal_call_line"
+expect_contains "heal" "heal call (identity DO block, in full)" "$(golden_identity_do 5433)" "$heal_call_line"
+expect_contains "heal" "heal call (config-parse DO block, in full)" "$GOLDEN_CONFIG_DO" "$heal_call_line"
 
 # ── 3. drift, not healed (psql from PATH, not the manifest) ────────────────
 N=$((N + 1))
@@ -486,9 +490,10 @@ expect_not_contains "heal-config-guard-fails" "stderr" "CONTEXT" "$err"
 
 # ── 6b. the heal's own in-session identity guard fires (simulated: the
 #        fake exits 1 on the heal call without ever writing "ALTER SYSTEM
-#        issued") — the heal-failed arm names the guard, no ALTER lands,
-#        and the real capture's CONTEXT: line is WITHHELD (p1_server_diag's
-#        allowlist is ERROR/FATAL/WARNING/DETAIL/HINT only). ──────────────
+#        issued") — the heal-failed arm names the guard, and the real
+#        capture's CONTEXT: line is WITHHELD (p1_server_diag drops
+#        everything but server-labelled lines, the guard's own marker and
+#        connection-phase failures). ─────────────────────────────────────
 N=$((N + 1))
 # rc 1, not 3 — same real-psql correction as case 6a above.
 state="$(new_state 0 "$CAP_DEFAULT" '' '' '' "$FAKE_GUARD_FAIL_OUT" '' 1)"
@@ -620,8 +625,7 @@ expect_contains "manifest-no-fallback" "stderr" "psql rc=1" "$err"
 
 # ── 8b. manifest-vouched AGENT-0 (base cluster) probe fails — refuses to
 #          proceed, same bound as case 8's per-agent arm but the
-#          agent-0/base-cluster code path (ensure-postgres.sh:599-602),
-#          which had NO probe-with-retry at all before this guard. ────────
+#          agent-0/base-cluster code path. ────────────────────────────────
 N=$((N + 1))
 state="$(new_state '' '' '' '' '')"
 printf '1' > "$state/select1_rc"
@@ -758,8 +762,8 @@ expect_not_contains "qport-not-provable" "calls.log" "ALTER SYSTEM issued" "$cal
 
 # ── 14b. A DSN whose only '@' sits in the PATH (after the first '/'
 #          following "://"), not the authority, is never provable either —
-#          drift-only, no ALTER — even though pg_dsn_host_port's own
-#          greedy regex misreads its host:port as 127.0.0.1:5433 (libpq
+#          drift-only, no ALTER — even though a whole-string '@' match would
+#          misread its host:port as 127.0.0.1:5433 (libpq
 #          itself ends the host at the first '/', so it actually dials the
 #          Unix-socket directory "%2Fsock"). ───────────────────────────────
 N=$((N + 1))
@@ -777,8 +781,8 @@ expect_not_contains "path-at-not-provable" "calls.log" "ALTER SYSTEM issued" "$c
 # ── 14c. A WELL-FORMED single-@ authority (yuzu@notloopback.example:1234)
 #          whose PATH also contains a second '@host:port/'-shaped substring
 #          is never provable either — drift-only, no ALTER — even though
-#          the authority alone parses cleanly and pg_dsn_host_port's own
-#          greedy regex anchors on the PATH's '@' instead, misreading the
+#          the authority alone parses cleanly, but a whole-string '@' match
+#          anchors on the PATH's '@' instead, misreading the
 #          host:port as the loopback 127.0.0.1:5433 the path names rather
 #          than the authority's own non-loopback notloopback.example:1234.
 #          (An authority-only '@'-count alone misses this shape, since the
@@ -906,12 +910,8 @@ expect "per-agent-heal-port" "search_path pin precedes the identity guard" "true
   "$([[ "$per_agent_heal_call_line" == *'SET search_path = pg_catalog, pg_temp'*'yuzu-heal-identity-guard'* ]] && echo true || echo false)"
 # The same argv pins as case 2, for the derived :5434 DSN and port.
 expect_contains "per-agent-heal-port" "heal call" "-X -w --dbname=${DSN1} -q -v ON_ERROR_STOP=1 -tA" "$per_agent_heal_call_line"
-expect_contains "per-agent-heal-port" "heal call (identity guard, full predicate)" \
-  "pg_catalog.inet_server_addr() IS NULL OR pg_catalog.inet_server_port() IS NULL OR NOT ((pg_catalog.inet_server_addr() << '127.0.0.0/8' OR pg_catalog.inet_server_addr() = '::1') AND pg_catalog.inet_server_port() = 5434) THEN RAISE EXCEPTION" \
-  "$per_agent_heal_call_line"
-expect_contains "per-agent-heal-port" "heal call (config-parse guard, refined predicate)" \
-  "error IS NOT NULL AND error <> 'setting could not be applied' AND error NOT LIKE '%cannot be changed without restarting the server'; IF bad_errors IS NOT NULL THEN RAISE EXCEPTION" \
-  "$per_agent_heal_call_line"
+expect_contains "per-agent-heal-port" "heal call (identity DO block, in full)" "$(golden_identity_do 5434)" "$per_agent_heal_call_line"
+expect_contains "per-agent-heal-port" "heal call (config-parse DO block, in full)" "$GOLDEN_CONFIG_DO" "$per_agent_heal_call_line"
 
 # ── 19. AGENT_IDX="">9 parity: a runner name suffix of 10+ digits is NOT
 #          treated as a pool agent index — the base DSN is exported as-is,
@@ -935,6 +935,8 @@ err="$(cat "$state/stderr")"
 expect "reread-unparseable" "rc" "1" "$RC"
 expect_contains "reread-unparseable" "stderr" "durability settings unreadable on 127.0.0.1:5433 after heal" "$err"
 expect_contains "reread-unparseable" "stderr" "unparseable" "$err"
+expect_contains "reread-unparseable" "stderr" "diagnostic withheld under Actions" "$err"
+expect_not_contains "reread-unparseable" "stderr" "permission denied" "$err"
 expect_not_contains "reread-unparseable" "stdout" "YUZU_TEST_POSTGRES_DSN=" "$OUT"
 
 # ── 21. YUZU_CI_PG_SLEEP_SCALE with a leading zero ("08") is rejected as
@@ -961,6 +963,11 @@ expect_contains "sleep-scale-leading-zero" "stdout" "YUZU_TEST_POSTGRES_DSN=${DS
 N=$((N + 1))
 expect "p1-timeout-static-pin" "exactly one absolute /usr/bin/timeout wrapper" "1" \
   "$(grep -c '^\[\[ -x /usr/bin/timeout \]\] && P1_TIMEOUT=(/usr/bin/timeout 30)$' "$ENSURE")"
+# A later P1_TIMEOUT=() reset, or a p1_psql that drops the wrapper or
+# PGCONNECT_TIMEOUT, would leave the wrapper defined but never applied.
+expect "p1-timeout-static-pin" "P1_TIMEOUT is assigned once at top level" "1" "$(grep -c '^P1_TIMEOUT=' "$ENSURE")"
+P1PSQL_LINE=$'  PGCONNECT_TIMEOUT=10 MSYS2_ARG_CONV_EXCL=\'*\' "${P1_TIMEOUT[@]+"${P1_TIMEOUT[@]}"}" "$P1_PSQL" -X -w --dbname="$dsn" "$@"'
+expect "p1-timeout-static-pin" "the exact p1_psql exec line" "1" "$(grep -cxF -- "$P1PSQL_LINE" "$ENSURE")"
 # The step's timeout-minutes (ci.yml, pinned by Test-ToolchainContract.ps1)
 # is sized from these literals: the bounded post-heal re-read loop (5
 # attempts), its 1 s sleep, and the probe retry's 2 s sleep. Changing any
@@ -976,9 +983,8 @@ expect "p1-timeout-static-pin" "probe retry sleep is 2 x scale" "1" \
 
 # ── 23. a keyword-form DSN is never provable, so pg_dsn_host_port reads
 #          "?" — every operator-facing message must show a readable "host
-#          unparsed" note instead of the confusing literal "on ?" (this
-#          covers the "ok" arm too, which raw ${hp} interpolation missed
-#          before hp_disp was hoisted to the top of p1_conform). ──────────
+#          unparsed" note instead of the confusing literal "on ?" (the "ok"
+#          arm here; cases 28-29 cover the other arms). ───────────────────
 N=$((N + 1))
 DSN_KW='host=127.0.0.1 port=5433 user=yuzu dbname=yuzu_test'
 state="$(new_state 0 "$CAP_OFF" '' '' '')"
@@ -1056,7 +1062,78 @@ expect "pg-catalog-static-pin" "read query qualifies pg_settings via pg_catalog"
 expect "pg-catalog-static-pin" "config-parse guard qualifies pg_file_settings via pg_catalog" "1" \
   "$(grep -c 'FROM pg_catalog\.pg_file_settings' "$ENSURE")"
 expect "pg-catalog-static-pin" "config-parse guard uses pg_catalog-qualified string_agg" "1" \
-  "$(grep -c 'string_agg(DISTINCT error' "$ENSURE")"
+  "$(grep -c 'pg_catalog\.string_agg(DISTINCT error' "$ENSURE")"
+
+# ── 28/29. the display form on EVERY reachable arm (a keyword DSN reads "?"),
+#          not just the "ok" arm of case 23 — each arm shares p1_hp_disp. ───
+KWDSN='host=127.0.0.1 port=5433 user=yuzu dbname=yuzu_test'
+hp_arm() { # <label> <github_actions> <ci_psql> <rows_rc> <rows_out> [select1_rc]
+  N=$((N + 1)); state="$(new_state "$4" "$5" '' '' '')"
+  [[ -n "${6:-}" ]] && printf '%s' "$6" > "$state/select1_rc"
+  invoke "$state" 'yuzu-fake-windows-0' "$2" "$KWDSN" "$3" 0; err="$(cat "$state/stderr")"
+  expect_contains "hp-$1" "stderr" "host unparsed" "$err"
+  expect_not_contains "hp-$1" "stderr" " on ?" "$err"
+}
+hp_arm read-actions true "$FAKEBIN/psql" 2 "$CAP_REFUSED"
+hp_arm read-local '' "$FAKEBIN/psql" 2 "$CAP_REFUSED"
+hp_arm drift-actions true "$FAKEBIN/psql" 0 "$CAP_DEFAULT"
+hp_arm drift-local '' "$FAKEBIN/psql" 0 "$CAP_DEFAULT"
+hp_arm unreadable true "$FAKEBIN/psql" 0 "$CAP_NOSUPER"
+hp_arm no-psql true '' '' ''
+hp_arm agent0-probe true "$FAKEBIN/psql" '' '' 1
+# The rc 124 hint also shows on p1_diag's non-Actions arm.
+N=$((N + 1)); state="$(new_state 124 "$CAP_REFUSED" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' '' "$DSN0" "$FAKEBIN/psql" 0; err="$(cat "$state/stderr")"
+expect_contains "rc124-local" "stderr" "timed out after 30s" "$err"
+
+# ── 30. p1_server_diag is SELECTIVE: credential-bearing lines that merely
+#          contain 'yuzu', 'connection' or 'failed:' are dropped; only the
+#          server's own ERROR: line reaches the annotation. ─────────────────
+N=$((N + 1))
+FAKE_LEAK_OUT=$'ERROR:  permission denied to set parameter "fsync"\nDSN echo postgresql://yuzu:s3cretpw@127.0.0.1:5433/yuzu_test\nconnection pool note s3cretpw\noperation failed: s3cretpw'
+state="$(new_state 0 "$CAP_DEFAULT" 1 '' '' "$FAKE_LEAK_OUT")"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0; err="$(cat "$state/stderr")"
+expect_contains "sd-selective" "stderr" 'ERROR:  permission denied to set parameter "fsync"' "$err"
+expect_not_contains "sd-selective" "stderr" "s3cretpw" "$err"
+
+# ── 31. the per-agent derivation for agents 2 and 3 (a constant offset would
+#          pass agents 0/1/10) and a leading-zero port (10# keeps it decimal;
+#          without it 05433 reads as octal 2843). ───────────────────────────
+for _r in 2:5435 3:5436; do
+  N=$((N + 1)); state="$(new_state 0 "$CAP_OFF" '' '' '')"
+  invoke "$state" "yuzu-fake-windows-${_r%%:*}" true "$DSN0" "$FAKEBIN/psql" 0
+  expect_contains "agent-${_r%%:*}" "stdout" "127.0.0.1:${_r##*:}/yuzu_test" "$OUT"
+done
+N=$((N + 1)); state="$(new_state 0 "$CAP_OFF" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-1' true 'postgresql://yuzu:yuzu@127.0.0.1:05433/yuzu_test' "$FAKEBIN/psql" 0
+expect "leading-zero-port" "rc" "0" "$RC"
+expect_contains "leading-zero-port" "stdout" "127.0.0.1:5434/yuzu_test" "$OUT"
+
+# ── 32. the options= gate in the shapes libpq honours: a leading keyword, a
+#          '&' query separator, and whitespace before '='. ──────────────────
+for _d in "options='-c statement_timeout=0' host=127.0.0.1 port=5433 user=yuzu dbname=yuzu_test" \
+          "host=127.0.0.1 port=5433 options = '-c statement_timeout=0' user=yuzu dbname=yuzu_test" \
+          "postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test?connect_timeout=5&options=-c%20statement_timeout%3D0"; do
+  N=$((N + 1)); state="$(new_state 0 "$CAP_OFF" '' '' '')"
+  invoke "$state" 'yuzu-fake-windows-0' true "$_d" "$FAKEBIN/psql" 0; err="$(cat "$state/stderr")"
+  expect "options-gate-shape" "rc" "1" "$RC"; expect_contains "options-gate-shape" "stderr" "must not set options=" "$err"
+done
+
+# ── 33. p1_env_is_set: nocasematch must not leak out (GITHUB_ACTIONS=True is
+#          not "true", so no heal); look-alike names neither refuse the heal
+#          nor trip the PGOPTIONS gate; an EMPTY canonical PGOPTIONS must not
+#          hide a non-empty case variant (the scan continues past it). ──────
+N=$((N + 1)); state="$(new_state 0 "$CAP_DEFAULT" 0 0 "$CAP_OFF")"
+invoke "$state" 'yuzu-fake-windows-0' True "$DSN0" "$FAKEBIN/psql" 0; calls="$(cat "$state/calls.log")"
+expect_not_contains "nocase-no-leak" "calls.log" "ALTER SYSTEM issued" "$calls"
+N=$((N + 1)); state="$(new_state 0 "$CAP_DEFAULT" 0 0 "$CAP_OFF")"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0 PGSERVICEFILE=/x X_PGPORT=1 PGOPTIONS_EXTRA=-cx XPGOPTIONS=-cx
+calls="$(cat "$state/calls.log")"
+expect "lookalike-env" "rc" "0" "$RC"; expect_contains "lookalike-env" "calls.log" "ALTER SYSTEM issued" "$calls"
+N=$((N + 1)); state="$(new_state 0 "$CAP_OFF" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0 PGOPTIONS= PGOptions=-cx; err="$(cat "$state/stderr")"
+expect "pgoptions-empty-canonical-hides-variant" "rc" "1" "$RC"
+expect_contains "pgoptions-empty-canonical-hides-variant" "stderr" "PGOPTIONS must not be set" "$err"
 
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ensure-postgres-p1-selftest: all $N cases ok"
