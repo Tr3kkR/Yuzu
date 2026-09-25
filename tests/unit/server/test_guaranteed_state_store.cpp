@@ -1543,8 +1543,14 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
     // No live rig needed for this one (deliberately NOT gated behind
     // YUZU_REQUIRE_PG_DB_TPL) — an unroutable address fails fast everywhere.
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    // metrics is declared BEFORE bad so it outlives the store: bad only holds
+    // a borrowed MetricsRegistry* (set_metrics), and C++ destroys locals in
+    // reverse declaration order — declaring metrics first means bad's
+    // destructor runs while metrics is still alive, never after.
+    yuzu::MetricsRegistry metrics;
     GuaranteedStateStore bad(bad_pool);
     CHECK_FALSE(bad.is_open());
+    bad.set_metrics(&metrics);
 
     CHECK_FALSE(bad.create_rule(make_rule("x", "x")));
     CHECK_FALSE(bad.update_rule(make_rule("x", "x")));
@@ -1580,6 +1586,85 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
     auto empty_scope = bad.errored_rule_count(std::vector<std::string>{});
     REQUIRE(empty_scope.has_value());
     CHECK(*empty_scope == 0);
+
+    // #4856: the AUTHORITATIVE rule/status reads must ALSO bump the shared
+    // yuzu_server_guardian_read_degrade_total counter, distinguished by
+    // source="guardian_rules" from the DEX/observation family's
+    // source="guardian_state" (query_events above) — previously these seven
+    // reads surfaced a typed error WITHOUT bumping anything, so a sustained
+    // read degrade on the catastrophic-read set was invisible on /metrics.
+    CHECK_FALSE(bad.agent_rule_statuses("").has_value());
+    CHECK_FALSE(bad.agent_rule_statuses_for_agent("agent-a").has_value());
+    CHECK_FALSE(bad.rule_names().has_value());
+    CHECK_FALSE(bad.rule_names_for(std::vector<std::string>{"r1"}).has_value());
+    // rule_names_for's own empty-input short-circuit (success, not degrade —
+    // mirrored by errored_rule_count's empty-scope case above) must NOT
+    // increment either.
+    auto empty_names = bad.rule_names_for(std::vector<std::string>{});
+    REQUIRE(empty_names.has_value());
+    CHECK(empty_names->empty());
+    // 8 authoritative-read degrades total: get_rule, list_rules,
+    // agent_rule_statuses, agent_rule_statuses_for_agent, rule_names,
+    // rule_names_for, and errored_rule_count's two non-empty-scope calls
+    // above — the metric label itself, not just the typed-error return, is
+    // what a regression here would silently drop.
+    CHECK(metrics
+              .counter("yuzu_server_guardian_read_degrade_total",
+                       {{"reason", "store_not_open"}, {"source", "guardian_rules"}})
+              .value() == 8.0);
+    // The DEX/observation family's own store_not_open degrade (query_events
+    // above) stays on the ORIGINAL source — proof the two families are
+    // counted separately rather than merged into one undifferentiated total.
+    CHECK(metrics
+              .counter("yuzu_server_guardian_read_degrade_total",
+                       {{"reason", "store_not_open"}, {"source", "guardian_state"}})
+              .value() == 1.0);
+    // #4855: dex_device_signal_summary_checked is the type-distinguishable
+    // twin — a closed store degrades to std::nullopt, never a silent empty
+    // vector indistinguishable from "no signals" (that indistinguishability
+    // is exactly what fabricated the healthy score-100 bug this twin fixes).
+    CHECK_FALSE(bad.dex_device_signal_summary_checked("a1").has_value());
+    // The plain form stays #2659-style empty-on-degrade (unchanged, byte-
+    // identical to every other DEX/analytics read on a closed store).
+    CHECK(bad.dex_device_signal_summary("a1").empty());
+}
+
+// #4855: dex_device_signal_summary_checked must distinguish a genuine
+// QUERY-LEVEL failure (not just store-not-open above) from "no signals" —
+// dropping the underlying table mid-test (guardian_agent_rule_status's own
+// degrade tests use the identical DROP-TABLE-on-a-second-connection
+// technique) forces exactly that failure mode while the store itself stays
+// open (every OTHER table is intact).
+TEST_CASE("GuaranteedStateStore: dex_device_signal_summary_checked distinguishes a query-level "
+          "degrade from genuinely no signals",
+          "[pg][guaranteed_state_store][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    // Baseline: a real (empty) result is Some(empty), not None — the ONLY
+    // thing this twin exists to distinguish is the degrade case below.
+    {
+        auto ok = store.dex_device_signal_summary_checked("no-such-agent");
+        REQUIRE(ok.has_value());
+        CHECK(ok->empty());
+    }
+
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    auto degraded = store.dex_device_signal_summary_checked("no-such-agent");
+    CHECK_FALSE(degraded.has_value());
+    // The plain form still collapses the SAME degrade to empty (#2659
+    // posture, unchanged) — the two forms must read the identical failure
+    // differently ONLY at the type level, not the underlying query.
+    CHECK(store.dex_device_signal_summary("no-such-agent").empty());
 }
 
 TEST_CASE("GuaranteedStateStore: migration is idempotent across re-open",
