@@ -1,0 +1,1184 @@
+/**
+ * test_privacy_permissions_parsers.cpp -- pure tests for privacy_permissions_parsers.hpp,
+ * privacy_permissions_win_parsers.hpp, privacy_permissions_macos_parsers.hpp and
+ * privacy_permissions_linux_parsers.hpp. No OS call, no platform guard. The one file read is the committed YAML definition (the row_kind/column pin).
+ */
+#include <catch2/catch_test_macros.hpp>
+
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "privacy_permissions_linux_parsers.hpp"
+#include "privacy_permissions_macos_parsers.hpp"
+#include "privacy_permissions_parsers.hpp"
+#include "privacy_permissions_win_parsers.hpp"
+
+using namespace yuzu::privacy_permissions;
+
+namespace {
+
+std::size_t field_count(const std::string& row) {
+    std::size_t n = 1;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') ++i;
+        else if (row[i] == '|') ++n;
+    }
+    return n;
+}
+
+/// The `- name:` entries under `result:` -> `columns:` in the committed YAML definition, in
+/// order. Deliberately naive (this one file has exactly one document and one columns list).
+std::vector<std::string> yaml_result_column_names() {
+    // YUZU_TEST_FIXTURE_DIR is "<source_root>/tests/unit/fixtures" (tests/meson.build).
+    const auto path = std::filesystem::path{YUZU_TEST_FIXTURE_DIR} / ".." / ".." / ".." /
+                      "content" / "definitions" / "privacy_permissions.yaml";
+    std::ifstream in(path);
+    REQUIRE(in.is_open());
+    std::vector<std::string> names;
+    bool in_result = false, in_columns = false;
+    for (std::string line; std::getline(in, line);) {
+        if (line.rfind("  result:", 0) == 0) { in_result = true; continue; }
+        if (in_result && line.rfind("    columns:", 0) == 0) { in_columns = true; continue; }
+        if (!in_columns) continue;
+        if (!line.empty() && line.find_first_not_of(' ') < 4 && line.find_first_not_of(' ') != std::string::npos)
+            break; // left the columns block
+        const auto pos = line.find("- name: ");
+        if (pos != std::string::npos) names.push_back(line.substr(pos + 8));
+    }
+    return names;
+}
+
+} // namespace
+
+TEST_CASE("state_token: order pinned, matches kStateTokens", "[privacy_permissions][parsers]") {
+    CHECK(state_token(PermissionState::allowed) == "allowed");
+    CHECK(state_token(PermissionState::denied) == "denied");
+    CHECK(state_token(PermissionState::prompt_undetermined) == "prompt_undetermined");
+    CHECK(state_token(PermissionState::absent) == "absent");
+    CHECK(state_token(PermissionState::unreadable) == "unreadable");
+    CHECK(state_token(PermissionState::unsupported) == "unsupported");
+}
+
+TEST_CASE("kCategories: exactly the four charter categories, in order", "[privacy_permissions][parsers]") {
+    CHECK(kCategories == std::array<std::string_view, 4>{"camera", "microphone", "location",
+                                                         "full_disk_access"});
+}
+
+TEST_CASE("format_row: 8 fields, always, Windows fields default to '-'", "[privacy_permissions][parsers]") {
+    PermissionRow r{"macos", "com.example.App", "camera", PermissionState::allowed, "2", "-", "-", false};
+    const auto row = format_row(r);
+    CHECK(row == "permissions|macos|com.example.App|camera|allowed|2|-|-");
+    CHECK(field_count(row) == 8);
+}
+
+TEST_CASE("kColumns equals the YAML definition's result.columns, row_kind first, and every "
+          "formatted row -- data and internal_error alike -- has exactly that many fields",
+          "[privacy_permissions][parsers][columns]") {
+    const auto yaml = yaml_result_column_names();
+    REQUIRE(yaml.size() == kColumns.size());
+    for (std::size_t i = 0; i < kColumns.size(); ++i) {
+        INFO("column " << i);
+        CHECK(yaml[i] == kColumns[i]);
+    }
+    CHECK(kColumns.front() == "row_kind");
+
+    const auto data = format_row(
+        {"windows", "alice\\C:\\App\\app.exe", "camera", PermissionState::denied, "Deny", "1", "2", false});
+    CHECK(field_count(data) == kColumns.size());
+    CHECK(data.rfind(std::string{kRowKindPermissions} + "|windows|", 0) == 0);
+
+    for (const char* os : {"windows", "macos", "linux"}) {
+        const auto err = format_internal_error_row(os);
+        INFO(err);
+        CHECK(field_count(err) == kColumns.size());
+        CHECK(err == std::string{"constrained|"} + os + "|-|-|unreadable|internal_error|-|-");
+    }
+}
+
+TEST_CASE("qualify_app_id: <owner>\\<app_id>; an unresolved owner renders '-', never an empty "
+          "prefix that would read as an unqualified machine-wide row",
+          "[privacy_permissions][parsers]") {
+    CHECK(qualify_app_id("alice", "com.example.App") == "alice\\com.example.App");
+    CHECK(qualify_app_id("alice", "-") == "alice\\-");
+    CHECK(qualify_app_id("", "x") == "-\\x");
+    // On the wire the row sanitizer folds the separator to '/', like every path.
+    CHECK(format_row({"macos", qualify_app_id("alice", "com.x"), "camera",
+                      PermissionState::allowed, "2", "-", "-", false}) ==
+          "permissions|macos|alice/com.x|camera|allowed|2|-|-");
+}
+
+TEST_CASE("failure_row: denied promotes read_denied, unreadable does not; both carry the token "
+          "in raw and in the accumulator, never absent",
+          "[privacy_permissions][parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto d = failure_row("linux", "-", "camera", true, "camera:access_denied", acc);
+    CHECK(d.state == PermissionState::denied);
+    CHECK(d.read_denied);
+    CHECK(d.category == "camera");
+    CHECK(d.raw == "camera:access_denied");
+    const auto u = failure_row("linux", "-", "microphone", false, "microphone:shape", acc);
+    CHECK(u.state == PermissionState::unreadable);
+    CHECK_FALSE(u.read_denied);
+    CHECK(acc.reason() == "camera:access_denied,microphone:shape");
+}
+
+TEST_CASE("fill_uncovered_categories: absent for every uncovered category unless a whole-source "
+          "failure row covers it -- a token-only failure never suppresses coverage",
+          "[privacy_permissions][parsers]") {
+    SECTION("clean read: every uncovered category becomes absent") {
+        std::vector<PermissionRow> rows{
+            {"windows", "alice\\-", "camera", PermissionState::allowed, "Allow", "-", "-", false}};
+        fill_uncovered_categories("windows", rows);
+        REQUIRE(rows.size() == 4);
+        for (std::size_t i = 1; i < rows.size(); ++i) {
+            CHECK(rows[i].state == PermissionState::absent);
+            CHECK(rows[i].category != "camera");
+        }
+    }
+    SECTION("a whole-source unreadable row: nothing is filled") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows{failure_row("windows", "alice\\-", "-", false,
+                                                    "alice:hive_mount_failed", acc)};
+        fill_uncovered_categories("windows", rows);
+        CHECK(rows.size() == 1);
+    }
+    SECTION("a whole-source refused row: nothing is filled") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows{
+            failure_row("windows", "-", "-", true, "hklm:access_denied", acc)};
+        fill_uncovered_categories("windows", rows);
+        CHECK(rows.size() == 1);
+    }
+    SECTION("zero profiles + a token-only failure (hive_unload_failed): a row per category") {
+        yuzu::shared::ConstraintAccumulator acc;
+        acc.add_failure("alice:hive_unload_failed");
+        std::vector<PermissionRow> rows;
+        fill_uncovered_categories("windows", rows);
+        REQUIRE(rows.size() == kCategories.size());
+        for (std::size_t i = 0; i < kCategories.size(); ++i) {
+            CHECK(rows[i].category == kCategories[i]);
+            CHECK(rows[i].state == PermissionState::absent);
+        }
+    }
+    SECTION("a per-category failure row covers only its own category") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows{
+            failure_row("windows", "-", "camera", false, "hklm\\-:camera:capability:win32_1", acc)};
+        fill_uncovered_categories("windows", rows);
+        CHECK(rows.size() == 4);
+    }
+    SECTION("a whole-source ABSENT row (no per-user TCC.db) is not a failure: filling proceeds") {
+        std::vector<PermissionRow> rows{
+            {"macos", "bob\\-", "-", PermissionState::absent, "-", "-", "-", false}};
+        CHECK_FALSE(is_whole_source_failure(rows[0]));
+        fill_uncovered_categories("macos", rows);
+        CHECK(rows.size() == 5);
+    }
+}
+
+TEST_CASE("classify_session_bus_open: no session is unavailable, a refused socket is denied, "
+          "anything else is a failure -- never all folded into 'no session'",
+          "[privacy_permissions][parsers][linux]") {
+    using portal::BusOpenOutcome;
+    using portal::classify_session_bus_open;
+    CHECK(classify_session_bus_open(ENOENT) == BusOpenOutcome::unavailable);
+    CHECK(classify_session_bus_open(ECONNREFUSED) == BusOpenOutcome::unavailable);
+#if defined(ENOMEDIUM)
+    CHECK(classify_session_bus_open(ENOMEDIUM) == BusOpenOutcome::unavailable);
+#endif
+    CHECK(classify_session_bus_open(EACCES) == BusOpenOutcome::denied);
+    CHECK(classify_session_bus_open(EPERM) == BusOpenOutcome::denied);
+    CHECK(classify_session_bus_open(ENOMEM) == BusOpenOutcome::failed);
+    CHECK(classify_session_bus_open(0) == BusOpenOutcome::failed);
+}
+
+TEST_CASE("format_row: Windows row carries real last-used fields", "[privacy_permissions][parsers]") {
+    // safe_output_field maps '\' -> '/' (it doubles as the pipe-delimited row's separator
+    // sanitizer) -- app_id is checked post-sanitization, matching every other row this
+    // plugin's siblings emit.
+    PermissionRow r{"windows", "C:\\App\\app.exe", "microphone", PermissionState::denied, "Deny",
+                    "1700000000000", "1700000100000", false};
+    CHECK(format_row(r) ==
+         "permissions|windows|C:/App/app.exe|microphone|denied|Deny|1700000000000|1700000100000");
+}
+
+TEST_CASE("sanitize_utf8: valid UTF-8 is unchanged, every invalid byte becomes U+FFFD, and a "
+          "row never carries invalid UTF-8",
+          "[privacy_permissions][parsers]") {
+    for (const std::string_view ok : {"", "plain", "caf\xC3\xA9", "\xE2\x82\xAC", "\xF0\x9F\x98\x80",
+                                      "\xED\x9F\xBF", "\xF4\x8F\xBF\xBF"})
+        CHECK(sanitize_utf8(ok) == ok);
+    const std::string bad = "\xEF\xBF\xBD";
+    CHECK(sanitize_utf8("a\xC3(b") == "a" + bad + "(b");           // truncated 2-byte sequence
+    CHECK(sanitize_utf8("\xC0\x80") == bad + bad);                 // overlong NUL
+    CHECK(sanitize_utf8("\xED\xA0\x80") == bad + bad + bad);       // surrogate
+    CHECK(sanitize_utf8("\xF4\x90\x80\x80") == bad + bad + bad + bad); // above U+10FFFF
+    CHECK(sanitize_utf8("\xE2\x82") == bad + bad);                 // cut at the end
+
+    const PermissionRow r{"macos", "u\\\xFF", "camera", PermissionState::unreadable,
+                          "t:\xC3",   "-",        "-",      false};
+    CHECK(format_row(r) == "permissions|macos|u/" + bad + "|camera|unreadable|t:" + bad + "|-|-");
+}
+
+TEST_CASE("kInternalErrorRow*: the allocation-free literals equal the formatter, one per OS",
+          "[privacy_permissions][parsers]") {
+    CHECK(kInternalErrorRowLinux == format_internal_error_row("linux"));
+    CHECK(kInternalErrorRowMacos == format_internal_error_row("macos"));
+    CHECK(kInternalErrorRowWindows == format_internal_error_row("windows"));
+}
+
+TEST_CASE("select_status: denied wins over a mere failure token", "[privacy_permissions][parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    acc.add_failure("x:y");
+    const auto st = select_status(acc, true, false);
+    CHECK(st.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+    CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+}
+
+TEST_CASE("select_status: a failure token with no denial is CONSTRAINED", "[privacy_permissions][parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    acc.add_failure("x:y");
+    const auto st = select_status(acc, false, false);
+    CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
+}
+
+TEST_CASE("select_status: no failure, no denial, reachable mechanism is OK/FULL",
+          "[privacy_permissions][parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    CHECK(select_status(acc, false, false).status == YUZU_RESULT_STATUS_OK);
+}
+
+TEST_CASE("select_status: no failure, no denial, unavailable mechanism is UNAVAILABLE/FULL",
+          "[privacy_permissions][parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto st = select_status(acc, false, true);
+    CHECK(st.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(st.provenance == kUnavailableProvenance);
+}
+
+TEST_CASE("any_denied: true iff at least one row's read was refused", "[privacy_permissions][parsers]") {
+    std::vector<PermissionRow> rows{
+        {"macos", "-", "camera", PermissionState::allowed, "-", "-", "-", false},
+        {"macos", "-", "microphone", PermissionState::denied, "-", "-", "-", true},
+    };
+    CHECK(any_denied(rows));
+    rows.pop_back();
+    CHECK_FALSE(any_denied(rows));
+}
+
+// ── Windows-specific pure layer ──────────────────────────────────────────
+
+TEST_CASE("win::kCapabilities: the four mapped CapabilityName keys, one per category",
+          "[privacy_permissions][win_parsers]") {
+    REQUIRE(win::kCapabilities.size() == kCategories.size());
+    CHECK(win::kCapabilities[0].capability_name == "webcam");
+    CHECK(win::kCapabilities[3].capability_name == "broadFileSystemAccess");
+    for (std::size_t i = 0; i < kCategories.size(); ++i)
+        CHECK(win::kCapabilities[i].category == kCategories[i]);
+}
+
+TEST_CASE("win::decode_consent_value: Allow/Deny decode, wrong type or empty is unreadable, "
+          "an unknown literal is prompt_undetermined (never silently allowed/denied)",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::decode_consent_value("Allow", true) == PermissionState::allowed);
+    CHECK(win::decode_consent_value("Deny", true) == PermissionState::denied);
+    CHECK(win::decode_consent_value("Allow", false) == PermissionState::unreadable); // wrong type
+    CHECK(win::decode_consent_value("", true) == PermissionState::unreadable);       // empty
+    CHECK(win::decode_consent_value("Prompt", true) == PermissionState::prompt_undetermined);
+}
+
+TEST_CASE("win::unescape_nonpackaged_app_id: '#' is the path separator and nothing else is "
+          "rewritten (the drive colon is literal; a `#3A` stays as written)",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::unescape_nonpackaged_app_id("C:#Program Files#App.exe") ==
+          "C:\\Program Files\\App.exe");
+    CHECK(win::unescape_nonpackaged_app_id("C#3AUsers#name#app.exe") ==
+          "C\\3AUsers\\name\\app.exe");
+}
+
+TEST_CASE("win::filetime_to_epoch_ms_string: zero and pre-epoch are '-', a real value converts",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::filetime_to_epoch_ms_string(0) == "-");
+    CHECK(win::filetime_to_epoch_ms_string(1) == "-"); // far before the Unix epoch
+    // The 1601->1970 epoch boundary itself: exactly epoch_ms=0, and one more 100ns-tick
+    // interval (10000 ticks = 1ms) past it converts to exactly 1ms -- both self-verifying
+    // (derived from the function's own documented constant, not a separately hand-computed
+    // calendar date, which is the trap the first version of this test fell into).
+    constexpr std::uint64_t kEpochDiff100ns = 116444736000000000ULL;
+    CHECK(win::filetime_to_epoch_ms_string(kEpochDiff100ns) == "0");
+    CHECK(win::filetime_to_epoch_ms_string(kEpochDiff100ns + 10000) == "1");
+    CHECK(win::filetime_to_epoch_ms_string(kEpochDiff100ns + 86400ULL * 10000000ULL) == "86400000"); // +1 day
+}
+
+TEST_CASE("win::decode_last_used: only a REG_QWORD of exactly 8 bytes converts; not-found is "
+          "'-'; every other outcome is a visible `unreadable` with a cause",
+          "[privacy_permissions][win_parsers]") {
+    constexpr std::uint64_t kEpochDiff100ns = 116444736000000000ULL;
+    const auto ok = win::decode_last_used(win::kErrorSuccess, win::kRegQword, 8, kEpochDiff100ns + 10000);
+    CHECK(ok.value == "1");
+    CHECK(ok.cause.empty());
+
+    const auto missing = win::decode_last_used(win::kErrorFileNotFound, 0, 0, 0);
+    CHECK(missing.value == "-");
+    CHECK(missing.cause.empty());
+
+    const auto short_q = win::decode_last_used(win::kErrorSuccess, win::kRegQword, 4, 0);
+    CHECK(short_q.value == "unreadable");
+    CHECK(short_q.cause == "size_4");
+
+    const auto wrong_t = win::decode_last_used(win::kErrorSuccess, win::kRegSz, 8, 0);
+    CHECK(wrong_t.value == "unreadable");
+    CHECK(wrong_t.cause == "type_1");
+
+    const auto denied = win::decode_last_used(win::kErrorAccessDenied, 0, 0, 0);
+    CHECK(denied.value == "unreadable");
+    CHECK(denied.cause == "access_denied");
+    CHECK(denied.denied);
+
+    const auto more_data = win::decode_last_used(234, 3 /* REG_BINARY */, 16, 0);
+    CHECK(more_data.cause == "win32_234");
+    CHECK_FALSE(more_data.denied);
+}
+
+TEST_CASE("win::merge_with_hklm: most restrictive wins -- a successfully read HKLM Deny overrides "
+          "the profile, an HKLM Allow never overrides a user Deny/Prompt nor invents a grant, a "
+          "failed HKLM read never overrides, and a failed profile entry is never hidden",
+          "[privacy_permissions][win_parsers]") {
+    using win::RawGrant;
+    const auto grant = [](std::string app, PermissionState st, std::string raw,
+                          bool read_denied = false, std::string cause = {}) {
+        RawGrant g{std::move(app), "camera", st, std::move(raw)};
+        g.read_denied = read_denied;
+        g.cause = std::move(cause);
+        return g;
+    };
+    const auto merged_state = [&](const RawGrant& user, const RawGrant& machine) {
+        const std::vector<RawGrant> profile{user};
+        const std::vector<RawGrant> hklm{machine};
+        const auto m = win::merge_with_hklm(profile, hklm);
+        REQUIRE(m.size() == 1);
+        return std::pair{m[0].state, m[0].raw_value};
+    };
+    const auto allow = grant("app", PermissionState::allowed, "Allow");
+    const auto deny = grant("app", PermissionState::denied, "Deny");
+    const auto prompt = grant("app", PermissionState::prompt_undetermined, "Prompt");
+
+    SECTION("HKLM Deny (read OK) wins over every successfully read user value") {
+        for (const auto& user : {allow, deny, prompt})
+            CHECK(merged_state(user, deny) == std::pair{PermissionState::denied, std::string{"Deny"}});
+    }
+    SECTION("HKLM Allow defers to the user's own value") {
+        CHECK(merged_state(deny, allow) == std::pair{PermissionState::denied, std::string{"Deny"}});
+        CHECK(merged_state(prompt, allow) ==
+              std::pair{PermissionState::prompt_undetermined, std::string{"Prompt"}});
+        CHECK(merged_state(allow, allow) == std::pair{PermissionState::allowed, std::string{"Allow"}});
+    }
+    SECTION("an unmodelled HKLM literal overrides nothing") {
+        CHECK(merged_state(allow, prompt) == std::pair{PermissionState::allowed, std::string{"Allow"}});
+    }
+    SECTION("an absent, unreadable or refused HKLM entry overrides nothing") {
+        for (const auto& h : {grant("app", PermissionState::absent, "-"),
+                              grant("app", PermissionState::unreadable, "-", false, "value_empty"),
+                              grant("app", PermissionState::denied, "-", true, "value_access_denied")})
+            CHECK(merged_state(deny, h) == std::pair{PermissionState::denied, std::string{"Deny"}});
+    }
+    SECTION("HKLM Deny fills a key the profile lacks; HKLM Allow never invents a user grant") {
+        const std::vector<RawGrant> profile{};
+        const std::vector<RawGrant> hklm_deny{deny};
+        const auto m = win::merge_with_hklm(profile, hklm_deny);
+        REQUIRE(m.size() == 1);
+        CHECK(m[0].state == PermissionState::denied);
+        const std::vector<RawGrant> hklm_allow{allow};
+        CHECK(win::merge_with_hklm(profile, hklm_allow).empty());
+    }
+    SECTION("a failed profile entry is kept, and an overriding HKLM Deny is added beside it") {
+        const std::vector<RawGrant> profile{
+            grant("app", PermissionState::unreadable, "-", false, "value_empty")};
+        const std::vector<RawGrant> hklm{deny};
+        const auto m = win::merge_with_hklm(profile, hklm);
+        REQUIRE(m.size() == 2);
+        CHECK(m[0].state == PermissionState::unreadable);
+        CHECK(m[1].state == PermissionState::denied);
+        CHECK(m[1].raw_value == "Deny");
+    }
+}
+
+TEST_CASE("win: the three ConsentStore levels on the-rig's real shapes -- the NonPackaged toggle is "
+          "its own row, a Value-less per-app NonPackaged key is absent, `Executables` is a "
+          "container, and most-restrictive applies key by key",
+          "[privacy_permissions][win_parsers]") {
+    using win::RawGrant;
+    // Measured 2026-09-23 (HKU\<sid>\...\ConsentStore\location and HKLM\...\ConsentStore\location):
+    //   location                      Value REG_SZ Allow   (user capability toggle)
+    //   location\NonPackaged          Value REG_SZ Allow   (user "let desktop apps access")
+    //   location\NonPackaged\C:#Program Files#Mozilla Firefox#firefox.exe   LastUsedTime* only
+    //   location\NonPackaged\Executables\firefox.exe   GlobalPromptShown only (a container)
+    //   location\OpenAI.Codex_2p2nqsd0c76g0            Value REG_SZ Prompt
+    //   HKLM location Value Allow; HKLM location\NonPackaged (no Value);
+    //   HKLM location\NonPackaged\C:#Windows#System32#svchost.exe   LastUsedTime* only
+    CHECK(win::kNonPackagedToggleAppId == "NonPackaged");
+    CHECK(win::is_nonpackaged_container_key("Executables"));
+    CHECK_FALSE(win::is_nonpackaged_container_key("C:#Program Files#Mozilla Firefox#firefox.exe"));
+    const std::string firefox =
+        win::unescape_nonpackaged_app_id("C:#Program Files#Mozilla Firefox#firefox.exe");
+    CHECK(firefox == "C:\\Program Files\\Mozilla Firefox\\firefox.exe");
+    CHECK(win::unescape_nonpackaged_app_id("C:#PROGRA~2#Citrix#ICACLI~1#HdxRtcEngine.exe") ==
+          "C:\\PROGRA~2\\Citrix\\ICACLI~1\\HdxRtcEngine.exe");
+
+    const auto g = [](std::string app, PermissionState st, std::string raw) {
+        return RawGrant{std::move(app), "location", st, std::move(raw)};
+    };
+    const std::string toggle{win::kNonPackagedToggleAppId};
+    const std::vector<RawGrant> profile{
+        g("-", PermissionState::allowed, "Allow"), g(toggle, PermissionState::allowed, "Allow"),
+        g(firefox, PermissionState::absent, "-"),
+        g("OpenAI.Codex_2p2nqsd0c76g0", PermissionState::prompt_undetermined, "Prompt")};
+    const std::vector<RawGrant> hklm{
+        g("-", PermissionState::allowed, "Allow"), g(toggle, PermissionState::absent, "-"),
+        g("C:\\Windows\\System32\\svchost.exe", PermissionState::absent, "-")};
+
+    SECTION("the real host: nothing overrides, every profile level survives as stored") {
+        const auto m = win::merge_with_hklm(profile, hklm);
+        REQUIRE(m.size() == profile.size());
+        for (const auto& row : m) {
+            INFO(row.app_id);
+            const auto it = std::find_if(profile.begin(), profile.end(),
+                                         [&](const RawGrant& p) { return p.app_id == row.app_id; });
+            REQUIRE(it != profile.end());
+            CHECK(row.state == it->state);
+        }
+        // Every HKLM level is reported once as HKLM's own row (the device toggle included);
+        // none was applied into the profile.
+        for (const auto& h : hklm) CHECK(win::hklm_emitted_once(h, true));
+    }
+    SECTION("an HKLM NonPackaged Deny overrides only the user's NonPackaged toggle") {
+        const std::vector<RawGrant> hklm_deny{g(toggle, PermissionState::denied, "Deny")};
+        const auto m = win::merge_with_hklm(profile, hklm_deny);
+        REQUIRE(m.size() == profile.size());
+        for (const auto& row : m) {
+            INFO(row.app_id);
+            if (row.app_id == toggle) {
+                CHECK(row.state == PermissionState::denied);
+                CHECK(row.raw_value == "Deny");
+            } else {
+                CHECK(row.state != PermissionState::denied);
+            }
+        }
+        CHECK_FALSE(win::hklm_emitted_once(hklm_deny[0], true)); // carried by the profile row
+    }
+    SECTION("on the wire the toggle is qualified like every per-user row") {
+        CHECK(format_row({"windows", qualify_app_id("jsmith", toggle), "location",
+                          PermissionState::allowed, "Allow", "-", "-", false}) ==
+              "permissions|windows|jsmith/NonPackaged|location|allowed|Allow|-|-");
+        CHECK(format_row({"windows", qualify_app_id("jsmith", firefox), "location",
+                          PermissionState::absent, "-", "1783980629480", "1783980638651", false}) ==
+              "permissions|windows|jsmith/C:/Program Files/Mozilla Firefox/firefox.exe|location|"
+              "absent|-|1783980629480|1783980638651");
+    }
+}
+
+TEST_CASE("win::hklm_emitted_once: an overriding Deny is HKLM's own row only with no reachable "
+          "profile; Allow, failures, app-level entries and a capability-level absent always",
+          "[privacy_permissions][win_parsers]") {
+    win::RawGrant deny{"-", "camera", PermissionState::denied, "Deny"};
+    win::RawGrant allow{"-", "camera", PermissionState::allowed, "Allow"};
+    win::RawGrant absent_cap{"-", "camera", PermissionState::absent, "-"};
+    win::RawGrant absent_app{"C:\\app.exe", "camera", PermissionState::absent, "-"};
+    win::RawGrant refused{"-", "camera", PermissionState::denied, "-"};
+    refused.read_denied = true;
+    refused.cause = "value_access_denied";
+    CHECK(win::hklm_overrides_profile(deny));
+    CHECK_FALSE(win::hklm_overrides_profile(refused));
+    CHECK_FALSE(win::hklm_emitted_once(deny, true));
+    CHECK(win::hklm_emitted_once(deny, false));
+    CHECK(win::hklm_emitted_once(allow, true));
+    CHECK(win::hklm_emitted_once(refused, true));
+    CHECK(win::hklm_emitted_once(absent_app, true));
+    CHECK(win::hklm_emitted_once(absent_cap, true));
+    CHECK(win::hklm_emitted_once(absent_cap, false));
+}
+
+TEST_CASE("win: failed profile discovery never suppresses HKLM's definitive capability-level "
+          "absences -- they are HKLM's own rows, not left to the backstop",
+          "[privacy_permissions][win_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PermissionRow> rows{
+        failure_row("windows", "-", "-", false, "profiles:profile_list_unreadable", acc)};
+    for (const auto& cap : win::kCapabilities) { // HKLM ConsentStore root: ERROR_FILE_NOT_FOUND
+        const win::RawGrant g{"-", cap.category, PermissionState::absent, "-"};
+        if (win::hklm_emitted_once(g, false))
+            rows.push_back({"windows", g.app_id, g.category, g.state, g.raw_value, "-", "-", false});
+    }
+    fill_uncovered_categories("windows", rows); // suppressed by the whole-source row
+    REQUIRE(rows.size() == 1 + kCategories.size());
+    for (std::size_t i = 0; i < kCategories.size(); ++i) {
+        CHECK(rows[i + 1].category == kCategories[i]);
+        CHECK(rows[i + 1].state == PermissionState::absent);
+    }
+}
+
+TEST_CASE("win::profile_discovery_failure: a refused root or mid-walk enumeration is denied; any "
+          "other root failure, terminating error or cap overflow is unreadable; only a clean end "
+          "(or exactly the cap) is complete",
+          "[privacy_permissions][win_parsers]") {
+    const long ok = win::kErrorSuccess, done = win::kErrorNoMoreItems, refused = win::kErrorAccessDenied;
+    const auto check = [](std::optional<win::EnumFailure> f, std::string cause, bool denied) {
+        REQUIRE(f);
+        CHECK(f->cause == cause);
+        CHECK(f->denied == denied);
+    };
+    check(win::profile_discovery_failure(refused, ok, done), "profiles:profile_list_access_denied", true);
+    check(win::profile_discovery_failure(2, ok, done), "profiles:profile_list_unreadable", false);
+    CHECK_FALSE(win::profile_discovery_failure(ok, done, done));       // walk ended cleanly
+    CHECK_FALSE(win::profile_discovery_failure(ok, ok, done));         // exactly the cap
+    check(win::profile_discovery_failure(ok, ok, ok), "profiles:truncated", false);
+    check(win::profile_discovery_failure(ok, refused, done), "profiles:enum_access_denied", true);
+    check(win::profile_discovery_failure(ok, 1018, done), "profiles:enum_win32_1018", false);
+    check(win::profile_discovery_failure(ok, ok, refused), "profiles:enum_access_denied", true);
+    const auto key = win::profile_record_failure(true, refused);
+    CHECK(key.cause == "profiles:profile_key_access_denied");
+    CHECK(key.denied);
+    const auto path = win::profile_record_failure(false, 1018);
+    CHECK(path.cause == "profiles:profile_image_path_win32_1018");
+    CHECK_FALSE(path.denied);
+}
+
+TEST_CASE("win::RetentionBudget: refuses the grant that would cross either run-wide bound, stays "
+          "refused; the ConsentStore Value cap fits every measured literal",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::kMaxConsentValueBytes == 64);
+    CHECK(win::kMaxConsentValueBytes >= (std::string_view{"Prompt"}.size() + 1) * 2);
+    win::RetentionBudget defaults;
+    CHECK(defaults.max_grants == win::kMaxRetainedGrants);
+    CHECK(defaults.max_bytes == win::kMaxRetainedBytes);
+    SECTION("grant count: the cap-th grant fits, one more is refused") {
+        win::RetentionBudget b{3, 1000};
+        CHECK(b.charge(1));
+        CHECK(b.charge(1));
+        CHECK(b.charge(1));
+        CHECK_FALSE(b.charge(0));
+        CHECK(b.exhausted);
+        CHECK(b.grants == 3);
+    }
+    SECTION("bytes: exactly the cap fits, one byte over is refused, and refusal is sticky") {
+        win::RetentionBudget b{100, 10};
+        CHECK(b.charge(6));
+        CHECK(b.charge(4));
+        CHECK(b.bytes == 10);
+        CHECK_FALSE(b.charge(1));
+        CHECK_FALSE(b.charge(0)); // sticky: nothing more is retained once exhausted
+        CHECK(b.grants == 2);
+    }
+    SECTION("one oversized grant is refused without wrapping the arithmetic") {
+        win::RetentionBudget b{100, 10};
+        CHECK_FALSE(b.charge(static_cast<std::size_t>(-1)));
+        CHECK(b.exhausted);
+    }
+    const win::RawGrant g{"C:\\a.exe", "camera", PermissionState::allowed, "Allow"};
+    CHECK(win::retained_bytes(g) == std::string_view{"C:\\a.exe"}.size() + 5);
+    CHECK(win::kBudgetExceededToken == "collection:budget_exceeded");
+}
+
+TEST_CASE("win::RetentionBudget: one source at its own cap stops only its own walk -- the next "
+          "profile, its Deny included, is still retained; the run-wide cap still stops the run",
+          "[privacy_permissions][win_parsers]") {
+    const win::RetentionBudget defaults;
+    CHECK(defaults.max_profile_grants == 8192);
+    CHECK(defaults.max_profile_bytes == 2u * 1024u * 1024u);
+
+    win::RetentionBudget b;
+    b.max_profile_grants = 2;
+    b.max_grants = 4;
+    b.begin_profile();
+    CHECK(b.charge(1));
+    CHECK(b.charge(1));
+    CHECK_FALSE(b.charge(1));
+    CHECK(b.profile_exhausted);
+    CHECK_FALSE(b.exhausted);
+    CHECK(b.walk_stopped());
+    CHECK_FALSE(b.charge(0)); // sticky for the rest of this profile
+
+    b.begin_profile();
+    CHECK_FALSE(b.walk_stopped());
+    const win::RawGrant deny{"-", "camera", PermissionState::denied, "Deny"};
+    CHECK(b.charge(win::retained_bytes(deny)));
+    CHECK(b.charge(1));
+    CHECK(b.grants == 4);
+
+    b.begin_profile();
+    CHECK_FALSE(b.charge(1));
+    CHECK(b.exhausted);
+    CHECK_FALSE(b.profile_exhausted);
+    CHECK(b.walk_stopped());
+
+    win::RetentionBudget bytes;
+    bytes.max_profile_bytes = 10;
+    CHECK(bytes.charge(6));
+    CHECK_FALSE(bytes.charge(5));
+    CHECK(bytes.profile_exhausted);
+    bytes.begin_profile();
+    CHECK(bytes.charge(10));
+    CHECK_FALSE(bytes.exhausted);
+}
+
+TEST_CASE("win::RetentionBudget: the run deadline is injectable, inclusive and sticky",
+          "[privacy_permissions][win_parsers]") {
+    using Clock = std::chrono::steady_clock;
+    CHECK(win::kRunBudget == std::chrono::seconds{15});
+    CHECK(win::kTimeoutToken == "collection:timeout");
+
+    win::RetentionBudget b;
+    b.deadline = Clock::time_point::max();
+    CHECK_FALSE(b.walk_stopped());
+    const auto t = Clock::time_point{} + std::chrono::seconds{100};
+    b.deadline = t;
+    CHECK_FALSE(b.expired(t - std::chrono::nanoseconds{1}));
+    CHECK_FALSE(b.timed_out);
+    CHECK(b.expired(t));
+    b.deadline = Clock::time_point::max();
+    CHECK(b.expired(t - std::chrono::nanoseconds{1})); // once tripped it stays tripped
+    CHECK(b.walk_stopped());
+}
+
+TEST_CASE("macos: the documented bounds and the tokens a bound produces",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::kMaxSchemaBytes == 64 * 1024);
+    CHECK(macos::kMaxValueBytes == 1024);
+    CHECK(macos::kMaxRowsPerService == 1024);
+    CHECK(macos::kMaxSourceBytes == 1024u * 1024u);
+    CHECK(macos::kMaxDbBytes == 4LL * 1024 * 1024);
+    CHECK(macos::kSourceBudget == std::chrono::milliseconds{500});
+    CHECK(macos::kRunBudget == std::chrono::seconds{10});
+    CHECK(macos::kCutRowCap == "row_cap");
+    CHECK(macos::kCutByteCap == "byte_cap");
+    CHECK(macos::kCutValueOversized == "value_oversized");
+    CHECK(macos::kCutTimeout == "timeout");
+}
+
+TEST_CASE("win::coarse_failure_token: one token per kind of failure, however many apps share it",
+          "[privacy_permissions][win_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    for (int i = 0; i < 1000; ++i)
+        acc.add_failure(win::coarse_failure_token("alice", "camera", "value_oversized"));
+    CHECK(acc.reason() == "alice:camera:value_oversized");
+
+    // A number the ConsentStore owner chooses (a value's type, a LastUsedTime size) is not kept.
+    yuzu::shared::ConstraintAccumulator typed;
+    for (int i = 0; i < 1000; ++i) {
+        typed.add_failure(
+            win::coarse_failure_token("alice", "camera", "value_type_" + std::to_string(i)));
+        typed.add_failure(win::coarse_failure_token("alice", "camera",
+                                                    "last_used_start_size_" + std::to_string(i)));
+    }
+    CHECK(typed.reason() == "alice:camera:value_type,alice:camera:last_used_start_size");
+    CHECK(win::coarse_failure_token("alice", "camera", "value_win32_1450") ==
+          "alice:camera:value_win32_1450");
+}
+
+TEST_CASE("win::nonpackaged_open_failure: a missing NonPackaged key is the toggle row reading "
+          "absent; a refusal is denied, any other code unreadable",
+          "[privacy_permissions][win_parsers]") {
+    const auto missing = win::nonpackaged_open_failure("camera", win::kErrorFileNotFound);
+    CHECK(missing.app_id == win::kNonPackagedToggleAppId);
+    CHECK(missing.state == PermissionState::absent);
+    CHECK(missing.cause.empty());
+    CHECK_FALSE(win::grant_failed(missing));
+    const auto refused = win::nonpackaged_open_failure("camera", win::kErrorAccessDenied);
+    CHECK(refused.app_id == "-");
+    CHECK(refused.read_denied);
+    CHECK(refused.cause == "nonpackaged_container:access_denied");
+    const auto other = win::nonpackaged_open_failure("camera", 1);
+    CHECK(other.state == PermissionState::unreadable);
+    CHECK(other.cause == "nonpackaged_container:win32_1");
+}
+
+TEST_CASE("win::merge_with_hklm: two registry keys decoding to one app id keep both rows plus a "
+          "duplicate_app_id row -- neither silently replaces the other",
+          "[privacy_permissions][win_parsers]") {
+    const std::string id = "X"; // a packaged key `X` and a NonPackaged key `X`
+    const std::vector<win::RawGrant> profile{{id, "camera", PermissionState::allowed, "Allow"},
+                                             {id, "camera", PermissionState::denied, "Deny"}};
+    const auto m = win::merge_with_hklm(profile, {});
+    REQUIRE(m.size() == 3);
+    CHECK(std::count_if(m.begin(), m.end(), [](const win::RawGrant& g) { return g.raw_value == "Allow"; }) == 1);
+    CHECK(std::count_if(m.begin(), m.end(), [](const win::RawGrant& g) { return g.raw_value == "Deny"; }) == 1);
+    const auto collision = std::find_if(m.begin(), m.end(), [](const win::RawGrant& g) {
+        return g.cause == "duplicate_app_id";
+    });
+    REQUIRE(collision != m.end());
+    CHECK(collision->app_id == id);
+    CHECK(collision->state == PermissionState::unreadable);
+}
+
+TEST_CASE("win::classify_subkey_enum + enum_failure: exactly the cap is complete (no token), more "
+          "than the cap is truncated, a genuine error or a failed probe is a failure",
+          "[privacy_permissions][win_parsers]") {
+    using win::EnumOutcome;
+    // Stopped on its own: NO_MORE_ITEMS is the only clean end.
+    const auto clean = win::classify_subkey_enum(win::kErrorNoMoreItems, win::kErrorSuccess);
+    CHECK(clean.outcome == EnumOutcome::complete);
+    CHECK_FALSE(win::enum_failure("packaged", clean).has_value());
+    // Exactly kMaxEnumeratedSubkeys children: the loop stops at the cap (SUCCESS) and the probe
+    // finds nothing more -- the false `packaged_enum_0` this used to emit.
+    const auto exact = win::classify_subkey_enum(win::kErrorSuccess, win::kErrorNoMoreItems);
+    CHECK(exact.outcome == EnumOutcome::complete);
+    CHECK_FALSE(win::enum_failure("packaged", exact).has_value());
+    // Over the cap: the probe finds a real next child.
+    const auto over = win::classify_subkey_enum(win::kErrorSuccess, win::kErrorSuccess);
+    CHECK(over.outcome == EnumOutcome::truncated);
+    const auto over_f = win::enum_failure("nonpackaged", over);
+    REQUIRE(over_f);
+    CHECK(over_f->cause == "nonpackaged_enum_truncated");
+    CHECK_FALSE(over_f->denied);
+    // A genuine mid-walk error, refused and otherwise.
+    const auto refused = win::enum_failure(
+        "packaged", win::classify_subkey_enum(win::kErrorAccessDenied, win::kErrorSuccess));
+    REQUIRE(refused);
+    CHECK(refused->cause == "packaged_enum_access_denied");
+    CHECK(refused->denied);
+    const auto more_data = win::enum_failure("packaged", win::classify_subkey_enum(234, 0));
+    REQUIRE(more_data);
+    CHECK(more_data->cause == "packaged_enum_win32_234");
+    CHECK_FALSE(more_data->denied);
+    // The cap-boundary probe itself failed: never read as complete.
+    const auto probe = win::enum_failure(
+        "packaged", win::classify_subkey_enum(win::kErrorSuccess, win::kErrorAccessDenied));
+    REQUIRE(probe);
+    CHECK(probe->cause == "packaged_enum_access_denied");
+    CHECK(probe->denied);
+}
+
+TEST_CASE("win::is_valid_sid_string: only an S-1-<digits>(-<digits>)* SID may be appended to "
+          "HKEY_USERS -- empty or malformed never opens the HKU root",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::is_valid_sid_string("S-1-5-21-1111111111-2222222222-3333333333-1013"));
+    CHECK(win::is_valid_sid_string("S-1-5-18"));
+    CHECK_FALSE(win::is_valid_sid_string(""));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-"));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-5-"));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-5--21"));
+    CHECK_FALSE(win::is_valid_sid_string("S-2-5-21"));
+    CHECK_FALSE(win::is_valid_sid_string("s-1-5-21"));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-5-21\\Software"));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-5-21 "));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-5-" + std::string(300, '1')));
+}
+
+// ── macOS-specific pure layer ────────────────────────────────────────────
+
+TEST_CASE("macos::decode_auth_value: 0 denied, 2/3 allowed, other prompt_undetermined, a "
+          "NULL/non-integer column unreadable (never a fabricated 0 = denied)",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::decode_auth_value(0) == PermissionState::denied);
+    CHECK(macos::decode_auth_value(2) == PermissionState::allowed);
+    CHECK(macos::decode_auth_value(3) == PermissionState::allowed);
+    CHECK(macos::decode_auth_value(1) == PermissionState::prompt_undetermined);
+    CHECK(macos::decode_auth_value(std::nullopt) == PermissionState::unreadable);
+    // Past int32: the low bits must not wrap onto 0/2/3.
+    CHECK(macos::decode_auth_value(4294967296) == PermissionState::prompt_undetermined);
+    CHECK(macos::decode_auth_value(4294967298) == PermissionState::prompt_undetermined);
+    CHECK(macos::decode_auth_value(-2) == PermissionState::prompt_undetermined);
+}
+
+TEST_CASE("macos::classify_tcc_presence: a missing per-user db is absent, a missing system db "
+          "is unreadable, a refused lstat is denied, a non-regular file is refused",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK_FALSE(macos::classify_tcc_presence(0, true, true).has_value());
+    const auto user_missing = macos::classify_tcc_presence(ENOENT, false, true);
+    REQUIRE(user_missing);
+    CHECK(user_missing->outcome == macos::SourceOutcome::absent);
+    CHECK(user_missing->cause.empty());
+    const auto sys_missing = macos::classify_tcc_presence(ENOENT, false, false);
+    REQUIRE(sys_missing);
+    CHECK(sys_missing->outcome == macos::SourceOutcome::unreadable);
+    CHECK(sys_missing->cause == "missing");
+    for (const int e : {EPERM, EACCES}) {
+        const auto d = macos::classify_tcc_presence(e, false, true);
+        REQUIRE(d);
+        CHECK(d->outcome == macos::SourceOutcome::denied);
+    }
+    const auto link = macos::classify_tcc_presence(0, false, true);
+    REQUIRE(link);
+    CHECK(link->outcome == macos::SourceOutcome::unreadable);
+    CHECK(link->cause == "not_regular");
+    const auto io = macos::classify_tcc_presence(EIO, false, true);
+    REQUIRE(io);
+    CHECK(io->cause == "lstat_errno_" + std::to_string(EIO));
+}
+
+TEST_CASE("macos::classify_tcc_sqlite_rc: AUTH/PERM denied; CANTOPEN denied only when the VFS "
+          "syscall failed EPERM/EACCES; any other code or errno unreadable",
+          "[privacy_permissions][macos_parsers]") {
+    using macos::SourceOutcome;
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, EPERM) == SourceOutcome::denied);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, EACCES) == SourceOutcome::denied);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen | (1 << 8), EACCES) ==
+          SourceOutcome::denied); // extended code, primary byte compared
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, 0) == SourceOutcome::unreadable);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, ENOENT) == SourceOutcome::unreadable);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, EMFILE) == SourceOutcome::unreadable);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteAuth, 0) == SourceOutcome::denied);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqlitePerm, 0) == SourceOutcome::denied);
+    CHECK(macos::classify_tcc_sqlite_rc(1 /* SQLITE_ERROR */, EPERM) == SourceOutcome::unreadable);
+    CHECK(macos::classify_tcc_sqlite_rc(26 /* SQLITE_NOTADB */, 0) == SourceOutcome::unreadable);
+}
+
+TEST_CASE("macos::classify_tcc_sqlite_failure: the stage names the cause; a failed PRAGMA "
+          "query_only is always unreadable, never a refusal",
+          "[privacy_permissions][macos_parsers]") {
+    using macos::SqliteStage;
+    const auto open_denied = macos::classify_tcc_sqlite_failure(
+        SqliteStage::open, macos::kSqliteCantOpen, EPERM, "unable to open database file");
+    CHECK(open_denied.outcome == macos::SourceOutcome::denied);
+    CHECK(open_denied.cause == "open_failed:unable to open database file");
+    const auto prep = macos::classify_tcc_sqlite_failure(SqliteStage::prepare, 1, 0,
+                                                         "no such table: access");
+    CHECK(prep.outcome == macos::SourceOutcome::unreadable);
+    CHECK(prep.cause == "prepare_failed:no such table: access");
+    const auto pragma = macos::classify_tcc_sqlite_failure(
+        SqliteStage::query_only, macos::kSqliteCantOpen, EPERM, "unable to open database file");
+    CHECK(pragma.outcome == macos::SourceOutcome::unreadable);
+    CHECK(pragma.cause == "query_only_failed:unable to open database file");
+    // As a whole-source row, the pragma failure is a token-bearing unreadable row.
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto row = macos::tcc_source_failed_row("alice", pragma, acc);
+    CHECK(row.state == PermissionState::unreadable);
+    CHECK(row.raw == "alice:tcc_db:query_only_failed:unable to open database file");
+    CHECK(acc.reason() == row.raw);
+}
+
+TEST_CASE("macos::immutable_uri: only % ? # are encoded, so every hostile spelling round-trips",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::immutable_uri("/Users/Jane Doe/TCC.db") ==
+          "file:/Users/Jane Doe/TCC.db?immutable=1");
+    CHECK(macos::immutable_uri("/Users/a%20b/q?x#h/TCC.db") ==
+          "file:/Users/a%2520b/q%3Fx%23h/TCC.db?immutable=1");
+}
+
+TEST_CASE("macos::classify_tcc_open_errno: a refused open is denied, a symlink and every other "
+          "errno unreadable",
+          "[privacy_permissions][macos_parsers]") {
+    for (const int e : {EPERM, EACCES})
+        CHECK(macos::classify_tcc_open_errno(e).outcome == macos::SourceOutcome::denied);
+    CHECK(macos::classify_tcc_open_errno(ELOOP).cause == "open_failed:symlink");
+    CHECK(macos::classify_tcc_open_errno(ENOENT).outcome == macos::SourceOutcome::unreadable);
+}
+
+TEST_CASE("macos::classify_tcc_header: WAL is either version byte; the change counter is bytes "
+          "24..27 big-endian",
+          "[privacy_permissions][macos_parsers]") {
+    std::array<unsigned char, macos::kSqliteHeaderBytes> h{};
+    for (std::size_t i = 0; i < macos::kSqliteMagic.size(); ++i)
+        h[i] = static_cast<unsigned char>(macos::kSqliteMagic[i]);
+    h[18] = h[19] = 1;
+    CHECK_FALSE(macos::classify_tcc_header(h));
+    h[24] = 1, h[27] = 4;
+    CHECK(macos::header_change_counter(h) == 0x01000004u);
+    const auto refusal = [](std::span<const unsigned char> bytes) {
+        const auto f = macos::classify_tcc_header(bytes);
+        REQUIRE(f);
+        return f->cause;
+    };
+    for (const std::size_t i : {18, 19}) {
+        auto wal = h;
+        wal[i] = 2;
+        CHECK(refusal(wal) == "wal_mode");
+    }
+    CHECK(refusal(std::span{h}.first(99)) == "not_sqlite");
+    h[0] = 'X';
+    CHECK(refusal(h) == "not_sqlite");
+}
+
+TEST_CASE("macos::read_unchanged: every field of the file stamp matters",
+          "[privacy_permissions][macos_parsers]") {
+    const macos::FileStamp base{7, 4096, 1700000000, 500, 12};
+    CHECK(macos::read_unchanged(base, base));
+    const auto changed = [&](auto mutate) {
+        auto other = base;
+        mutate(other);
+        return !macos::read_unchanged(base, other);
+    };
+    CHECK(changed([](auto& s) { s.inode += 1; }));
+    CHECK(changed([](auto& s) { s.size += 1; }));
+    CHECK(changed([](auto& s) { s.mtime_sec += 1; }));
+    CHECK(changed([](auto& s) { s.mtime_nsec += 1; }));
+    CHECK(changed([](auto& s) { s.change_counter += 1; }));
+}
+
+TEST_CASE("macos::OutputBudget: counts app_id and raw text and is spent at the cap",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::kMaxRunOutputBytes == 16u * 1024u * 1024u);
+    CHECK(macos::kBudgetExceededToken == "collection:budget_exceeded");
+    macos::OutputBudget b;
+    b.max_bytes = 10;
+    const std::vector<PermissionRow> rows{
+        {"macos", "abcd", "camera", PermissionState::allowed, "12", "-", "-", false}};
+    b.charge(rows);
+    CHECK(b.bytes == 6);
+    CHECK_FALSE(b.exhausted());
+    b.charge(rows);
+    CHECK(b.exhausted());
+}
+
+TEST_CASE("macos::is_user_home_entry: a real home is a non-dot name, a directory seen without "
+          "following a symlink, owned by uid >= 500",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::is_user_home_entry("alice", true, 501));
+    CHECK(macos::is_user_home_entry("bob", true, 500));
+    CHECK_FALSE(macos::is_user_home_entry("Shared", true, 0));      // root-owned
+    CHECK_FALSE(macos::is_user_home_entry("daemon", true, 499));    // below the user range
+    CHECK_FALSE(macos::is_user_home_entry("linked", false, 501));   // a symlink (NOFOLLOW) or file
+    CHECK_FALSE(macos::is_user_home_entry(".localized", false, 0)); // dotfile
+    CHECK_FALSE(macos::is_user_home_entry(".hidden", true, 501));
+    CHECK_FALSE(macos::is_user_home_entry("", true, 501));
+    CHECK(macos::home_name_eligible("alice"));
+    CHECK_FALSE(macos::home_name_eligible("."));
+    CHECK_FALSE(macos::home_name_eligible(".."));
+}
+
+TEST_CASE("macos::append_tcc_source_rows: per-user rows qualified; every category is a row -- "
+          "decoded grants, absent when clean and empty, unreadable when the step failed",
+          "[privacy_permissions][macos_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PermissionRow> rows;
+    // Shaped on the real per-user TCC.db rows this Mac returned on 2026-09-23
+    // (kTCCServiceMicrophone|com.microsoft.teams2|2).
+    const std::vector<macos::TccServiceRead> reads{
+        {"camera", {}, false},
+        {"microphone", {{"com.microsoft.teams2", 2}, {"com.example.Broken", std::nullopt}}, false},
+        {"full_disk_access", {}, true},
+    };
+    macos::append_tcc_source_rows("alice", reads, rows, acc);
+    REQUIRE(rows.size() == 4);
+    CHECK(format_row(rows[0]) == "permissions|macos|alice/-|camera|absent|-|-|-");
+    CHECK(format_row(rows[1]) == "permissions|macos|alice/com.microsoft.teams2|microphone|allowed|2|-|-");
+    CHECK(rows[2].state == PermissionState::unreadable);
+    CHECK(rows[2].raw == "alice:tcc_db:microphone:auth_value_unreadable");
+    CHECK(rows[3].category == "full_disk_access");
+    CHECK(rows[3].state == PermissionState::unreadable);
+    CHECK(rows[3].raw == "alice:tcc_db:full_disk_access:query_step_failed");
+    CHECK(acc.reason() ==
+          "alice:tcc_db:microphone:auth_value_unreadable,alice:tcc_db:full_disk_access:query_step_failed");
+
+    // The system db (empty owner) keeps its unqualified rows.
+    std::vector<PermissionRow> sys;
+    const std::vector<macos::TccServiceRead> sys_reads{
+        {"full_disk_access", {{"com.microsoft.VSCode", 2}}, false}};
+    macos::append_tcc_source_rows({}, sys_reads, sys, acc);
+    REQUIRE(sys.size() == 1);
+    CHECK(format_row(sys[0]) == "permissions|macos|com.microsoft.VSCode|full_disk_access|allowed|2|-|-");
+}
+
+TEST_CASE("macos::append_tcc_source_rows: a failed bind is one unreadable row for that category "
+          "and never an absent one",
+          "[privacy_permissions][macos_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PermissionRow> rows;
+    const std::vector<macos::TccServiceRead> reads{{"camera", {}, false, true}};
+    macos::append_tcc_source_rows({}, reads, rows, acc);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].category == "camera");
+    CHECK(rows[0].state == PermissionState::unreadable);
+    CHECK(rows[0].raw == "tcc_db:camera:query_bind_failed");
+    CHECK(acc.reason() == "tcc_db:camera:query_bind_failed");
+}
+
+TEST_CASE("macos::tcc_source_failed_row: absent carries no token; denied/unreadable carry "
+          "`<source>:<cause>` and are never absent",
+          "[privacy_permissions][macos_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto absent = macos::tcc_source_failed_row("bob", {macos::SourceOutcome::absent, {}}, acc);
+    CHECK(format_row(absent) == "permissions|macos|bob/-|-|absent|-|-|-");
+    CHECK_FALSE(acc.any_failure());
+
+    const auto denied = macos::tcc_source_failed_row(
+        "bob", {macos::SourceOutcome::denied, "access_denied"}, acc);
+    CHECK(denied.state == PermissionState::denied);
+    CHECK(denied.read_denied);
+    CHECK(denied.raw == "bob:tcc_db:access_denied");
+
+    const auto sys = macos::tcc_source_failed_row(
+        {}, {macos::SourceOutcome::unreadable, "open_failed:disk I/O error"}, acc);
+    CHECK(sys.app_id == "-");
+    CHECK(sys.state == PermissionState::unreadable);
+    CHECK(sys.raw == "tcc_db:open_failed:disk I/O error");
+}
+
+// ── Linux-specific pure layer (shapes from a real xdg-permission-store, see the header) ─────
+
+namespace {
+const portal::PortalTable& table_for(std::string_view category) {
+    for (const auto& t : portal::kPortalLookups)
+        if (t.category == category) return t;
+    FAIL("no portal table for " << category);
+    return portal::kPortalLookups[0];
+}
+} // namespace
+
+TEST_CASE("portal::decode_portal_permissions: devices yes/no/ask; location [accuracy, timestamp] "
+          "-- NONE denied, a known accuracy allowed; an empty list is never `denied`",
+          "[privacy_permissions][linux_parsers]") {
+    using portal::TableKind;
+    using V = std::vector<std::string>;
+    const auto state = [](TableKind k, V v) { return portal::decode_portal_permissions(k, v).state; };
+    // devices -- real reply `({'org.example.CamApp': ['yes']}, <byte 0x00>)`.
+    CHECK(state(TableKind::devices, {"yes"}) == PermissionState::allowed);
+    CHECK(state(TableKind::devices, {"no"}) == PermissionState::denied);
+    CHECK(state(TableKind::devices, {"ask"}) == PermissionState::prompt_undetermined);
+    CHECK(state(TableKind::devices, {"maybe"}) == PermissionState::prompt_undetermined);
+    CHECK(state(TableKind::devices, {"yes", "no"}) == PermissionState::prompt_undetermined);
+    // location -- real reply `({'org.example.MapApp': ['EXACT', '0']}, <byte 0x00>)`.
+    CHECK(state(TableKind::location, {"EXACT", "0"}) == PermissionState::allowed);
+    for (const char* level : {"COUNTRY", "CITY", "NEIGHBORHOOD", "STREET"})
+        CHECK(state(TableKind::location, {level, "1700000000"}) == PermissionState::allowed);
+    CHECK(state(TableKind::location, {"NONE", "0"}) == PermissionState::denied);
+    CHECK(state(TableKind::location, {"PRECISE", "0"}) == PermissionState::prompt_undetermined);
+    CHECK(state(TableKind::location, {"EXACT"}) == PermissionState::prompt_undetermined);
+    CHECK(state(TableKind::location, {"yes"}) == PermissionState::prompt_undetermined);
+    // Empty: no decision at all -- unreadable with a cause, never a refusal.
+    for (const auto k : {TableKind::devices, TableKind::location}) {
+        const auto d = portal::decode_portal_permissions(k, V{});
+        CHECK(d.state == PermissionState::unreadable);
+        CHECK(d.cause == "empty_permissions");
+    }
+    CHECK(portal::join_permissions(V{"EXACT", "0"}) == "EXACT,0");
+    CHECK(portal::join_permissions(V{}) == "-");
+}
+
+TEST_CASE("portal::append_lookup_reply_rows: the real location shape reads allowed with the raw "
+          "list kept; a partly-read reply is never absent; an empty list is a token row",
+          "[privacy_permissions][linux_parsers]") {
+    SECTION("the probe's location reply (the grant the old decode reported prompt_undetermined)") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows;
+        portal::PortalReply r{true, {{"org.example.MapApp", {"EXACT", "0"}}}, false, false};
+        portal::append_lookup_reply_rows(table_for("location"), r, rows, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(format_row(rows[0]) == "permissions|linux|org.example.MapApp|location|allowed|EXACT,0|-|-");
+        CHECK_FALSE(acc.any_failure());
+    }
+    SECTION("the probe's devices reply") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows;
+        portal::PortalReply r{true, // out of order on purpose: rows come out by app_id
+                              {{"org.example.MicApp", {"no"}}, {"org.example.CamApp", {"yes"}}},
+                              false, false};
+        portal::append_lookup_reply_rows(table_for("camera"), r, rows, acc);
+        REQUIRE(rows.size() == 2);
+        CHECK(format_row(rows[0]) == "permissions|linux|org.example.CamApp|camera|allowed|yes|-|-");
+        CHECK(format_row(rows[1]) == "permissions|linux|org.example.MicApp|camera|denied|no|-|-");
+    }
+    SECTION("an empty permission list: unreadable, `<app_id>:<category>:empty_permissions`") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows;
+        portal::PortalReply r{true, {{"org.example.CamApp", {}}}, false, false};
+        portal::append_lookup_reply_rows(table_for("camera"), r, rows, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].state == PermissionState::unreadable);
+        CHECK(rows[0].raw == "org.example.CamApp:camera:empty_permissions");
+        CHECK(acc.reason() == rows[0].raw);
+    }
+    SECTION("a cleanly empty table is absent") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows;
+        portal::append_lookup_reply_rows(table_for("microphone"), portal::PortalReply{true, {}, false, false},
+                                         rows, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(format_row(rows[0]) == "permissions|linux|-|microphone|absent|-|-|-");
+    }
+    SECTION("outer array not entered: one shape row, nothing else") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows;
+        portal::append_lookup_reply_rows(table_for("camera"), portal::PortalReply{}, rows, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].raw == "camera:shape");
+    }
+    SECTION("a walk that failed part-way and a bad entry: rows kept, failures named, never absent") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows;
+        portal::PortalReply r{true, {}, true, true};
+        portal::append_lookup_reply_rows(table_for("location"), r, rows, acc);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].raw == "location:shape");
+        CHECK(rows[1].raw == "location:entry_shape");
+        for (const auto& row : rows) CHECK(row.state != PermissionState::absent);
+    }
+}
+
+TEST_CASE("portal::classify_lookup_error + append_lookup_error_rows: NotFound absent, AccessDenied "
+          "denied, ServiceUnknown deferred (no row), anything else unreadable",
+          "[privacy_permissions][linux_parsers]") {
+    using portal::LookupError;
+    CHECK(portal::classify_lookup_error("org.freedesktop.DBus.Error.ServiceUnknown") ==
+          LookupError::service_unknown);
+    CHECK(portal::classify_lookup_error("org.freedesktop.portal.Error.NotFound") ==
+          LookupError::not_found);
+    CHECK(portal::classify_lookup_error("org.freedesktop.DBus.Error.AccessDenied") ==
+          LookupError::access_denied);
+    CHECK(portal::classify_lookup_error("org.freedesktop.DBus.Error.NoReply") == LookupError::failed);
+    CHECK(portal::classify_lookup_error("") == LookupError::failed);
+    CHECK(portal::classify_lookup_error("", ETIMEDOUT) == LookupError::timeout);
+    CHECK(portal::classify_lookup_error("org.freedesktop.DBus.Error.Timeout") == LookupError::timeout);
+
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PermissionRow> rows;
+    const auto& cam = table_for("camera");
+    CHECK(portal::append_lookup_error_rows(cam, LookupError::service_unknown, rows, acc));
+    CHECK(rows.empty());
+    CHECK_FALSE(portal::append_lookup_error_rows(cam, LookupError::not_found, rows, acc));
+    CHECK_FALSE(portal::append_lookup_error_rows(cam, LookupError::access_denied, rows, acc));
+    CHECK_FALSE(portal::append_lookup_error_rows(cam, LookupError::failed, rows, acc));
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[0].state == PermissionState::absent);
+    CHECK(rows[1].read_denied);
+    CHECK(rows[1].raw == "camera:access_denied");
+    CHECK(rows[2].state == PermissionState::unreadable);
+    CHECK(rows[2].raw == "camera:lookup_failed");
+    CHECK_FALSE(portal::append_lookup_error_rows(cam, LookupError::timeout, rows, acc));
+    REQUIRE(rows.size() == 4);
+    CHECK(rows[3].state == PermissionState::unreadable);
+    CHECK(rows[3].raw == "camera:timeout");
+}
+
+TEST_CASE("portal::remaining_budget_us: one total deadline -- the time left, 0 once spent",
+          "[privacy_permissions][linux_parsers]") {
+    CHECK(portal::kPortalTotalBudgetUs == 5'000'000);
+    CHECK(portal::remaining_budget_us(5'000'000, 0) == 5'000'000);
+    CHECK(portal::remaining_budget_us(5'000'000, 1'250'000) == 3'750'000);
+    CHECK(portal::remaining_budget_us(5'000'000, 4'999'999) == 1);
+    CHECK(portal::remaining_budget_us(5'000'000, 5'000'000) == 0);
+    CHECK(portal::remaining_budget_us(5'000'000, 9'000'000) == 0);
+}
+
+TEST_CASE("portal::finish_portal_rows: ServiceUnknown on EVERY lookup is whole-mechanism "
+          "unavailable; on only SOME it is a per-category failure, never absence",
+          "[privacy_permissions][linux_parsers]") {
+    SECTION("all three: one unsupported whole-source row, unavailable, no token") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows;
+        const std::vector<std::string_view> su{"camera", "microphone", "location"};
+        CHECK(portal::finish_portal_rows(su, rows, acc));
+        REQUIRE(rows.size() == 1);
+        CHECK(format_row(rows[0]) == "permissions|linux|-|-|unsupported|-|-|-");
+        CHECK_FALSE(acc.any_failure());
+    }
+    SECTION("only location: its own failure row, and full_disk_access is unsupported") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows{
+            {"linux", "org.example.CamApp", "camera", PermissionState::allowed, "yes", "-", "-", false}};
+        const std::vector<std::string_view> su{"location"};
+        CHECK_FALSE(portal::finish_portal_rows(su, rows, acc));
+        REQUIRE(rows.size() == 3);
+        CHECK(rows[1].category == "location");
+        CHECK(rows[1].raw == "location:service_unknown");
+        CHECK(format_row(rows[2]) == "permissions|linux|-|full_disk_access|unsupported|-|-|-");
+        CHECK(acc.reason() == "location:service_unknown");
+    }
+}
