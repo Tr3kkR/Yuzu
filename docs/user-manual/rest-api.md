@@ -1815,10 +1815,11 @@ Quarantine a device.
 > result their shared dispatch closure now carries (a separate, smaller
 > follow-up per route). The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
-> `whitelist`) are exempt so that release stays reachable, and so are three
+> `whitelist`) are exempt so that release stays reachable, and so are four
 > server-internal pushes that are not operator dispatch —
-> `tar.fleet_snapshot`, `__guard__.push_rules` and `asset_tags.sync`, a closed
-> set counted (not per-event audited) by `yuzu_server_system_reserved_push_total`.
+> `tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` and
+> `__sync__.now`, a closed set counted (not per-event audited) by
+> `yuzu_server_system_reserved_push_total`.
 > Nothing else is.
 > If containment
 > state becomes unreadable for longer than a 60-second last-known-good
@@ -6038,7 +6039,7 @@ re-eval, unchanged.
 
 | Status | Reason |
 |---|---|
-| 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent; or missing `sql` / `instruction_id` |
+| 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
@@ -6322,6 +6323,7 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 |---|---|
 | 400 | `RESULT_SET_TOO_MANY_MEMBERS` (`device_ids` exceeds the per-set cap), or another `ResultSetError` (every non-quota `create_materialized` failure — including a store-level error — maps to `400`, not `503`) |
 | 400 | `name`/`source_kind` present but not a JSON string, or over the MCP-matching length cap (`name` 256 bytes, `source_kind` 64 bytes) - checked before `create_materialized` is ever called, not a `ResultSetError` (#4373) |
+| 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but empty/non-string. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 403 | Service-scoped API token |
 | 404 | `parent_id` supplied but not owned/found |
 | 429 | `RESULT_SET_QUOTA` — owner is at the per-owner set cap |
@@ -7735,7 +7737,7 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `rule_id` | string | Yes | Stable operator-chosen id. Must match `[A-Za-z0-9._-]+`. |
+| `rule_id` | string | Yes | Stable operator-chosen id. Must match `[A-Za-z0-9._-]+`, at most 256 bytes. Enforced at creation (#4665) — a violation returns `400`, not just documented convention. |
 | `name` | string | Yes | Human-readable name (unique per server). |
 | `spark` | object | Structured | `{type, params}` trigger block, e.g. `{"type":"registry-change"}` or `{"type":"file-change"}`. |
 | `assertion` | object | Structured | `{type, params}` desired-state block, e.g. `registry-value-equals`, `file-exists`, `file-hash-equals`. |
@@ -7751,8 +7753,8 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 The catalog of valid `spark` / `assertion` / `remediation` types and their `params` (including the resilience-policy bounds) is discoverable at [`GET /api/v1/guaranteed-state/schemas`](#get-apiv1guaranteed-stateschemas).
 
 - **Response:** `201` with `data.rule_id`.
-- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
-- **Audit:** `guaranteed_state.rule.create` (`success` / `denied`).
+- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), a `rule_id` that doesn't match `[A-Za-z0-9._-]+` or exceeds 256 bytes (#4665), or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
+- **Audit:** `guaranteed_state.rule.create` (`success` / `denied`; an invalid `rule_id` is audited as `denied` too — #4665).
 - **MCP twin:** `create_guardian_rule` (#2146 Batch B1) — same store write and validation.
 
 #### `GET /api/v1/guaranteed-state/rules/{rule_id}`
@@ -8671,7 +8673,7 @@ write a `command.dispatch` audit row with `result=denied` and `detail=reason=<re
 must be a JSON object; anything else is `400`.
 
 **Destructive-class capabilities require explicit, non-empty `agent_ids` — broadcast and `scope`
-fan-out are refused (#3685).** The command catalogue currently classifies 17 `plugin.action` pairs
+fan-out are refused (#3685).** The command catalogue currently classifies 19 `plugin.action` pairs
 `Destructive` (e.g. `tar.purge_source`, `filesystem.delete_lines`, `registry.delete_key`); dispatching
 any of them with `agent_ids` omitted or empty, or with `scope` present at all — including
 `"__all__"` — is refused **before** the command reaches an agent. This is a narrower carve-out
@@ -8757,7 +8759,7 @@ A plain RBAC denial (the caller holds no grant for the pair's classified securab
 {"error": {"code": 403, "message": "permission denied: Execution:Execute"}, "meta": {"api_version": "v1"}}
 ```
 
-A caller who *does* hold the grant but is dispatching one of the ~42 `plugin.action` pairs a
+A caller who *does* hold the grant but is dispatching one of the ~50 `plugin.action` pairs a
 compiled `ExecuteGate` marks `AdminOrApproval`/`AlwaysApproval` (e.g. `script_exec.exec`,
 `filesystem.delete`, `registry.set_value`), with no approval provenance and no admin role:
 
@@ -10870,6 +10872,8 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
     "pending": 3
   },
   "stores": {
+    "pg_pool": "ok",
+    "pg_reachable": "ok",
     "responses": "ok",
     "audit": "ok",
     "instructions": "ok",
@@ -10898,7 +10902,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `uptime_seconds` | integer | Server uptime in seconds |
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
-| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
+| `stores` | object | Health status of each data store (`"ok"` or `"error"`); the example shows a subset. Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. Includes `pg_reachable` (HA WS-8) — the only RUNTIME check here: whether this replica's dedicated probe currently reaches a writable Postgres primary. The other store entries report whether each store opened at startup. `/readyz` carries the same `pg_reachable` row plus a `pg` reason field when it fails; see `docs/user-manual/server-admin.md`, "What `/readyz` checks". |
 | `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
 | `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
 | `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |

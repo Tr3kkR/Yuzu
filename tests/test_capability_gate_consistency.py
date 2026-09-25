@@ -97,6 +97,8 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp",
@@ -119,7 +121,8 @@ FRAGMENT_FILES = [
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
 # Wave 9 PR9.1a: +3 peripherals (usb/pci/thunderbolt).
 # Wave 9 PR9.1b: +2 printing (printers/jobs).
-# Wave 9 PR9.1b (follow-up): +1 printing.clear_queue.
+# Wave 9 PR9.1b (follow-up): +1 printing.clear_queue (merged to dev as PR #4616).
+# Wave 8 PR8.4: +1 firmware_posture (firmware).
 # Wave 10 P2a-3: +2 browser_inventory (browsers/profiles); its extensions action follows as its own PR (+1 then).
 # Wave 8 PR8.6: +2 app_control (wdac_policy/applocker_policy) — read-only
 # posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
@@ -129,13 +132,22 @@ FRAGMENT_FILES = [
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
 # 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
-# 2 (browser_inventory) + 1 (privacy_permissions) = 217.
-# Concurrent branches each independently bumped this constant over the same
-# 209 baseline (platform_security's own +2, browser_inventory's own +2,
-# privacy_permissions' own +1) with none aware of the others' additions --
-# merging them means adding every increment on top of the shared base, not
-# picking one side's constant.
-EXPECTED_TOTAL_ROWS = 217
+# 2 (browser_inventory) = 216 shared subtotal, then every branch's own new
+# plugin on top of it: + 1 (privacy_permissions) + 1 (firmware_posture) +
+# 2 (runtimes, dotnet/jvm) = 220.
+# This constant has been bumped independently on both sides of a merge
+# several times (PR #4719 CI is the trail; #4721 tracks deriving it per
+# fragment) — twice now the two sides' post-merge totals (217 and 219, from
+# adding only their OWN new plugin onto the 216 subtotal) each looked
+# internally consistent but were both stale the moment the other side's rows
+# were also on the tree. The rule that holds up: never trust an itemized
+# addition chain across a merge, not even this one — re-derive
+# EXPECTED_TOTAL_ROWS by literally re-running this script's own _ROW_RE/
+# _PAIR_ONLY_RE over every FRAGMENT_FILES entry and summing the matches.
+# Done for this merge (2026-09-25): 220, with gate-matches == pair-matches
+# for all 21 fragments (no parse-integrity mismatch) — agrees with the
+# itemized chain above, which is corroboration, not the source of truth.
+EXPECTED_TOTAL_ROWS = 220
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
