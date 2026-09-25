@@ -3823,6 +3823,73 @@ on the install path (`POST /api/product-packs`). List, get, and
 uninstall paths do not re-verify, so already-installed unsigned packs
 remain queryable and uninstallable after upgrade.
 
+### vNEXT — Access-review CSV export gains a leading metadata line (breaking for fixed-column-index CSV consumers)
+
+`GET /api/v1/access-reviews/export?format=csv` (SOC 2 CC6.2 evidence) now
+emits one new line before the existing header row:
+
+```
+# rbac_enforcement=enabled
+principal_type,principal_id,display_name,owner_or_email,roles,effective_permission_count,last_activity_ms,last_activity_kind,classification,lifecycle_state,source
+user,alice,...
+```
+
+This line is unconditional — present even when the grant population is
+empty — so it stamps whether RBAC was actually enforced when the file was
+pulled, travelling with the retained/offline copy an auditor keeps (see
+`rest-api.md`'s `rbac_enforcement` section for what the three values mean).
+
+**This breaks any consumer that assumes row 1 is the header.** Verified
+empirically against this exact output shape (not a blanket claim about "CSV
+tools" — the actual split matters):
+
+- **Silently WRONG output, no error, no warning:** Python's `csv.DictReader`
+  reads the new line 1 as a single-column header, then feeds the REAL header
+  row (line 2) into the result set as if it were data — every field name and
+  every row is now misaligned. The `awk -F, 'NR>1'` idiom (and any hand-rolled
+  "skip the first line" loop in another language) does the same thing: it now
+  emits the real header row as a spurious first "data" row, ahead of the
+  genuine data rows, which otherwise parse correctly.
+- **Also silently WRONG, not a loud failure:** `pandas.read_csv(path)` with
+  its default settings does **not** raise `ParserError` on this shape — do
+  not rely on pandas to "fail loud" here. Because every row past line 1 is
+  uniformly wider than the 1-field metadata line, pandas' documented
+  "extra leading columns become an implicit index" heuristic kicks in: it
+  silently produces a 1-column, tuple-indexed `DataFrame` with the metadata
+  line as the sole column name and the leading fields folded into a
+  `MultiIndex`, leaving only the last field (`source`) as the actual,
+  mislabeled `DataFrame` column — wrong, but no exception. (Verified
+  directly against pandas 3.0.6, both the `c` and `python` engines; on that
+  version, neither engine's default settings raise instead of silently
+  misparsing — untested against older pandas majors, so treat "on 3.0.6"
+  as the scope of this claim, not a guarantee for every pandas release.)
+
+**The fix is the same for every consumer class: skip exactly one line before
+treating the next line as the header**, verified working against each tool
+above:
+
+```python
+# csv.DictReader
+with open(path, newline="") as f:
+    next(f)                      # skip the metadata line
+    reader = csv.DictReader(f)   # now reads the real header correctly
+```
+
+```bash
+# awk (was NR>1 under the old format; now NR>2)
+awk -F, 'NR>2' access-review.csv
+```
+
+```python
+# pandas
+df = pd.read_csv(path, skiprows=1)
+```
+
+A consumer that already treats the file as free-form text and looks for the
+`# rbac_enforcement=` prefix, or that reads the `rbac_enforcement` field from
+the sibling **JSON** export (`GET .../export` without `?format=csv`, or the
+frozen campaign row's `rbac_enforcement` field), is unaffected either way.
+
 ### Executions-history PR 2 — `responses.execution_id` exact correlation
 
 PR 2 of the executions-history ladder closes a forensic-data correctness

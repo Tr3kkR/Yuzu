@@ -2743,17 +2743,22 @@ static const ToolDef kTools[] = {
      "MCP equivalent — use the REST endpoint directly for a CSV download). Deliberately "
      "gated on a GLOBAL AccessReview:Read (a dedicated securable seeded to Administrator + "
      "the Reviewer role, NOT AuditLog:Read), not a management-group-confined read — a scoped "
-     "slice would be useless as fleet-wide CC6.2 evidence. Self-audited as "
+     "slice would be useless as fleet-wide CC6.2 evidence. rbac_enforcement "
+     "(enabled|disabled|degraded) stamps whether RBAC actually governs this grant population "
+     "right now — degraded means the read could not confirm state, so gates deny "
+     "defensively, NOT that an admin turned RBAC off. Self-audited as "
      "access_review.exported. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}}},"required":["count","rows"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}},"rbac_enforcement":{"type":"string","enum":["enabled","disabled","degraded"]}},"required":["count","rows","rbac_enforcement"]})j"},
 
     {"open_access_review",
      "Open a review campaign — freeze the CURRENT cross-principal grant population "
      "(export_access_review expanded to one row per (principal, role) grant) into a new, "
      "durable campaign for reviewer attestation. A grant created after this call returns is "
      "out of scope for THIS campaign (review it in the next one); a grant revoked afterward "
-     "stays reviewable (frozen, not re-derived from live state). Mirrors POST "
+     "stays reviewable (frozen, not re-derived from live state). The fleet's current RBAC "
+     "enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same "
+     "moment — see get_access_review. Mirrors POST "
      "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. This records "
      "evidence and does not itself change any access grant — destructiveHint:false. "
      "Requires AccessReview:Attest.",
@@ -2786,21 +2791,25 @@ static const ToolDef kTools[] = {
 
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
-     "attestation row (pending/attested/flagged_revoke) plus pending_count. Mirrors GET "
+     "attestation row (pending/attested/flagged_revoke) plus pending_count. "
+     "campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen "
+     "AT OPEN (empty string for a campaign opened before this field existed). Mirrors GET "
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
      "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object"},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
      "for those), newest-first, capped at the most recent 500. The surface an auditor "
-     "needs to prove reviews ran on cadence. Mirrors GET /api/v1/access-reviews. "
+     "needs to prove reviews ran on cadence. Each campaign's rbac_enforcement "
+     "(enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN (empty string for "
+     "a campaign opened before this field existed). Mirrors GET /api/v1/access-reviews. "
      "Self-audited as access_review.list. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"}}}}},"required":["count","campaigns"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}}},"required":["count","campaigns"]})j"},
 
     {"close_access_review",
      "Close an open review campaign. Does NOT require every attestation to be decided "
@@ -23710,6 +23719,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto& rows = *rows_res;
+                // A3 (RBAC delivery plan) — see the REST twin's identical comment.
+                const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
                 JArr arr;
                 for (const auto& r : rows) {
                     JArr roles;
@@ -23734,9 +23745,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // body instead, never silently swallowed.
                 const bool audit_ok = audit_fn(req, "access_review.exported", "success",
                                                "AccessReview", "",
-                                               "rows=" + std::to_string(rows.size()));
+                                               "rows=" + std::to_string(rows.size()) +
+                                                   " rbac_enforcement=" + rbac_enforcement);
                 JObj payload;
-                payload.add("count", static_cast<int64_t>(rows.size())).raw("rows", arr.str());
+                payload.add("count", static_cast<int64_t>(rows.size()))
+                    .raw("rows", arr.str())
+                    .add("rbac_enforcement", rbac_enforcement);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success");
@@ -23780,6 +23794,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // A3 (RBAC delivery plan): the enforcement state stamped onto this
+                // campaign row at freeze time — computed from the same RbacStore
+                // instance, read immediately after the grant population above (a
+                // separate, later call, not the same read; it can trigger its own
+                // maybe_refresh_generation() round-trip), never re-derived on a
+                // later read (matches every other frozen field). Equivalent to
+                // the REST twin's comment, not byte-identical.
+                const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
+
                 // Expand each row to one GrantRef per (principal, role) — the shape
                 // access_review_store.hpp's open_campaign requires — carrying an
                 // opaque JSON snapshot of the row's non-role fields as observed right
@@ -23800,7 +23823,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     for (const auto& role : r.roles)
                         frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot});
                 }
-                auto open_res = access_review_store->open_campaign(title, session->username, frozen);
+                auto open_res = access_review_store->open_campaign(title, session->username, frozen,
+                                                                    rbac_enforcement);
                 if (!open_res) {
                     const bool denied_audit_ok =
                         audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview", "",
@@ -23817,7 +23841,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const bool audit_ok =
                     audit_fn(req, "access_review.campaign_opened", "success", "AccessReview",
-                            *open_res, "grants=" + std::to_string(frozen.size()));
+                            *open_res, "grants=" + std::to_string(frozen.size()) +
+                                           " rbac_enforcement=" + rbac_enforcement);
                 JObj payload;
                 payload.add("campaign_id", *open_res)
                     .add("grant_count", static_cast<int64_t>(frozen.size()));
@@ -23951,7 +23976,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("created_by", view.campaign.created_by)
                     .add("created_at_ms", view.campaign.created_at_ms)
                     .add("closed_by", view.campaign.closed_by)
-                    .add("closed_at_ms", view.campaign.closed_at_ms);
+                    .add("closed_at_ms", view.campaign.closed_at_ms)
+                    .add("rbac_enforcement", view.campaign.rbac_enforcement);
                 JArr attestations;
                 for (const auto& a : view.attestations) {
                     // grant_snapshot is raw-embedded, not escaped: this store's only
@@ -24017,7 +24043,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("created_by", c.created_by)
                                 .add("created_at_ms", c.created_at_ms)
                                 .add("closed_by", c.closed_by)
-                                .add("closed_at_ms", c.closed_at_ms));
+                                .add("closed_at_ms", c.closed_at_ms)
+                                .add("rbac_enforcement", c.rbac_enforcement));
                 }
                 const bool audit_ok = audit_fn(req, "access_review.list", "success", "AccessReview",
                                                "", "count=" + std::to_string(rows_res->size()));
