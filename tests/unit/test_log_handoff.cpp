@@ -411,17 +411,27 @@ TEST_CASE("U5: teardown() on a wedged sink fires the deadline action within grac
         });
     });
 
+    bool ok;
     {
         std::unique_lock<std::mutex> lk(fired_mu);
-        const bool ok = fired_cv.wait_for(lk, (grace + 100ms) * yuzu::test::kSpinScale,
-                                          [&] { return fired; });
-        REQUIRE(ok);
+        ok = fired_cv.wait_for(lk, (grace + 100ms) * yuzu::test::kSpinScale,
+                               [&] { return fired; });
     }
 
-    // Now let the process actually join: release the gate so the worker's blocked
-    // log() call (and thus ~thread_pool's join inside teardown_body()) can complete.
+    // Cleanup runs UNCONDITIONALLY, before any assertion on `ok` -- release the gate
+    // so the worker's blocked log() call (and thus ~thread_pool's join inside
+    // teardown_body()) can complete, then join the thread, regardless of whether the
+    // wait above timed out. Governance hardening round (BLOCKING finding, cpp-safety
+    // + quality-engineer independently): asserting on `ok` BEFORE this cleanup meant
+    // that on exactly the regression this test exists to catch (the deadline action
+    // never firing), REQUIRE's throw would unwind the stack while teardown_thread was
+    // still joinable and blocked -- std::thread::~thread() on a joinable thread calls
+    // std::terminate(), SIGABRTing the whole binary instead of failing this one test
+    // cleanly. Matches "BLOCKER round-2"'s already-correct pattern below.
     h.sink->release();
     teardown_thread.join();
+
+    REQUIRE(ok);
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +454,6 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
           "thread inherits an unwatched blocking join",
           "[log_handoff]") {
     Harness h; // initially paused
-    yuzu::test::ScopeExit release_on_exit{[&] { h.sink->release(); }};
 
     h.handoff->logger()->info("park");
     REQUIRE(yuzu::test::spin_until([&] { return h.handoff->in_write(); }));
@@ -485,32 +494,45 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
 
     // THE FALSIFIER: see this TEST_CASE's own header comment for the exact red/green
     // shape.
+    bool ok;
     {
         std::unique_lock<std::mutex> lk(fired_mu);
-        const bool ok = fired_cv.wait_for(lk, (grace + 1000ms) * yuzu::test::kSpinScale,
-                                          [&] { return fired; });
-        REQUIRE(ok);
+        ok = fired_cv.wait_for(lk, (grace + 1000ms) * yuzu::test::kSpinScale,
+                               [&] { return fired; });
     }
-    const auto fired_after = fired_at - teardown_start;
-    CHECK(fired_after >= grace / 2);
-    CHECK(fired_after < (grace + 1000ms) * yuzu::test::kSpinScale);
+    // Capture the values these CHECKs need BEFORE the unconditional cleanup below can
+    // change them -- drain_done specifically must reflect "was the drain still
+    // in-flight at the moment we observed `fired`", not its value after we release
+    // the sink a few lines down.
+    const auto fired_after = ok ? (fired_at - teardown_start) : std::chrono::steady_clock::duration{};
+    const bool drain_done_before_release = drain_done.load(std::memory_order_acquire);
 
-    // The drain thread must NOT have completed yet -- it is still legitimately spinning
-    // inside its own 2s wait (the sink is still wedged). This proves the interleaving
-    // this test exists to exercise was genuinely live at the moment the watchdog fired,
-    // not accidentally avoided by scheduling luck.
-    CHECK_FALSE(drain_done.load(std::memory_order_acquire));
-
-    // Unwedge: the drain thread's pending() check goes false and it returns (releasing
-    // its lease well before its own 2s bound), which lets teardown()'s
+    // Cleanup runs UNCONDITIONALLY, before REQUIRE(ok) -- same BLOCKING finding as
+    // U5's (cpp-safety + quality-engineer independently, governance hardening round):
+    // asserting on `ok` before releasing/joining means that on exactly the regression
+    // this test exists to catch (the deadline action never firing), REQUIRE's throw
+    // unwinds the stack while drain_thread/teardown_thread are still joinable and
+    // blocked -- std::thread::~thread() on a joinable thread calls std::terminate(),
+    // SIGABRTing the whole binary instead of failing this one test cleanly. Unwedge:
+    // the drain thread's pending() check goes false and it returns (releasing its
+    // lease well before its own 2s bound), which lets teardown()'s
     // wait_for_drain_quiescence() finally observe active_readers==0 and proceed.
     h.sink->release();
-
     drain_thread.join();
     teardown_thread.join();
 
     // Neither thread was left blocked on an unwatched join: both joined within this
-    // test's own bounded waits above.
+    // test's own bounded waits above. Now safe to assert -- no joinable thread
+    // remains for a throw to strand.
+    REQUIRE(ok);
+    CHECK(fired_after >= grace / 2);
+    CHECK(fired_after < (grace + 1000ms) * yuzu::test::kSpinScale);
+    // The drain thread must NOT have completed before we released the sink above --
+    // it was still legitimately spinning inside its own 2s wait while the sink
+    // stayed wedged. This proves the interleaving this test exists to exercise was
+    // genuinely live at the moment the watchdog fired, not accidentally avoided by
+    // scheduling luck.
+    CHECK_FALSE(drain_done_before_release);
     SUCCEED("teardown()'s watchdog covered the concurrent drain; both threads joined cleanly");
 }
 

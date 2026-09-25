@@ -93,11 +93,15 @@ struct WorkerExitSignal {
 };
 
 // ---------------------------------------------------------------------------
-// Global drain-lookup slot for drain_log_bounded() (plan 1.8). File-local: no header
-// exposure needed, only LogHandoff's own private static members and the
-// drain_log_bounded() free function below ever touch this.
+// Global drain-lookup slot for drain_log_bounded() (plan 1.8). DrainHandle is defined
+// at namespace scope (not anonymous), matching DrainGate/WorkerExitSignal above,
+// because it is now forward-declared in the header: governance hardening round,
+// unhappy-path UP-1's fix needs register_global_drain_handle() to take a pre-built
+// std::shared_ptr<DrainHandle> as a parameter, which requires the type to be visible
+// (even if only as an incomplete forward declaration) at the header's declaration
+// site. Everything else below (drain_mutex()/drain_slot()/DrainLease) stays file-local
+// in the anonymous namespace -- no other file ever needs to name them.
 // ---------------------------------------------------------------------------
-namespace {
 
 struct DrainHandle {
     const LogHandoff* owner{nullptr}; // identity only -- NEVER dereferenced
@@ -108,6 +112,8 @@ struct DrainHandle {
                                       // is a tiny mutex+cv+counter, never a blocking
                                       // destructor, so holding it strongly is safe.
 };
+
+namespace {
 
 std::mutex& drain_mutex() {
     static std::mutex m;
@@ -162,13 +168,13 @@ private:
 
 } // namespace
 
-void LogHandoff::register_global_drain_handle(LogHandoff* self) {
-    auto handle = std::make_shared<DrainHandle>();
+void LogHandoff::register_global_drain_handle(LogHandoff* self,
+                                              std::shared_ptr<DrainHandle> handle) {
+    // `handle`'s contents (pool/logger/sinks/gate) are already fully populated by the
+    // caller (create_with_sinks(), BEFORE `self` existed -- governance hardening
+    // round, unhappy-path UP-1: see that call site's own comment). Everything left
+    // here is noexcept except the mutex lock guarding the global slot swap.
     handle->owner = self;
-    handle->pool = self->pool_;
-    handle->logger = self->logger_;
-    handle->sinks.assign(self->wrapped_sinks_.begin(), self->wrapped_sinks_.end());
-    handle->gate = self->drain_gate_;
     std::lock_guard<std::mutex> lk(drain_mutex());
     drain_slot() = std::move(handle);
 }
@@ -314,12 +320,18 @@ void LogHandoff::set_construction_fault_for_test(bool fail) noexcept {
 
 std::expected<std::unique_ptr<LogHandoff>, std::string>
 LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t queue_capacity) {
-    if (sinks.empty())
-        return std::unexpected("LogHandoff::create_with_sinks: at least one sink is required");
-
+    // Consume the test-fault flag FIRST, unconditionally, before any other early
+    // return -- governance hardening round: the original order checked sinks.empty()
+    // first, so a fault flag set ahead of an (accidental) empty-sinks call was never
+    // consumed and leaked into the next, unrelated create_with_sinks() call,
+    // contradicting the documented "never leaks" guarantee on
+    // set_construction_fault_for_test()'s own doc comment.
     if (construction_fault_for_test_.exchange(false, std::memory_order_relaxed))
         return std::unexpected(
             "LogHandoff: injected pool/logger construction failure (test)");
+
+    if (sinks.empty())
+        return std::unexpected("LogHandoff::create_with_sinks: at least one sink is required");
 
     try {
         std::vector<std::shared_ptr<StallObservableSink>> wrapped;
@@ -385,6 +397,27 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
         // as pool/logger/error_state above.
         auto drain_gate = std::make_shared<DrainGate>();
 
+        // Prepare the global drain handle's ALLOCATING work here -- still before
+        // `handoff` exists -- rather than inside register_global_drain_handle() after
+        // handoff is live (governance hardening round, unhappy-path UP-1). Rationale:
+        // if the previous ordering's register_global_drain_handle() (make_shared<
+        // DrainHandle> plus a vector-assign copy of the wrapped sinks) threw bad_alloc
+        // AFTER `handoff` already existed, the exception would unwind through a live,
+        // fully-populated LogHandoff -- running its destructor's fail-closed teardown()
+        // and mutating the process-wide default logger -- directly contradicting this
+        // function's own documented construction-failure contract ("nothing is
+        // installed, no global state is touched", header CONSTRUCTION FAILURE note).
+        // Building the handle's contents now means the only work left once `handoff`
+        // exists is plain shared_ptr moves, a raw pointer assignment, and a mutex lock
+        // guarding the global slot swap -- all noexcept except that last lock, which is
+        // the same class of irreducible, near-bad_alloc-rarity residual this hardening
+        // round already accepts for teardown()'s own T0 (see teardown()'s comment).
+        auto drain_handle = std::make_shared<DrainHandle>();
+        drain_handle->pool = pool;   // weak_ptr copy from the still-local strong pool
+        drain_handle->logger = logger;
+        drain_handle->sinks.assign(wrapped.begin(), wrapped.end());
+        drain_handle->gate = drain_gate;
+
         // Only now, once every throwing step above has succeeded, build the actual
         // object -- its destructor unconditionally runs teardown() if not yet torn
         // down (see the header's TEARDOWN CONTRACT), so a PARTIALLY populated
@@ -397,7 +430,7 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
         handoff->error_state_ = std::move(error_state);
         handoff->drain_gate_ = std::move(drain_gate);
         handoff->worker_exit_ = std::move(worker_exit);
-        register_global_drain_handle(handoff.get());
+        register_global_drain_handle(handoff.get(), std::move(drain_handle));
         return handoff;
     } catch (const std::exception& e) {
         return std::unexpected(std::string("LogHandoff construction failed: ") + e.what());
@@ -451,6 +484,18 @@ LogHandoff::create(const Options& options) {
 }
 
 std::shared_ptr<spdlog::logger> LogHandoff::install() {
+    if (!logger_)
+        return nullptr; // torn down (governance hardening round, unhappy-path UP-3):
+                         // registry::set_default_logger(nullptr) skips the loggers_
+                         // map insert but STILL unconditionally overwrites
+                         // default_logger_ with null -- verified directly against
+                         // spdlog's registry-inl.h -- so calling install() again
+                         // after teardown() would null the process-wide default
+                         // logger and reintroduce the exact straggler-segfault
+                         // hazard T2's null-sink swap exists to prevent. logger_ is
+                         // null if and only if teardown() has completed T3, so this
+                         // check is equivalent to (and simpler than) a torn_down_
+                         // check.
     spdlog::set_default_logger(logger_);
     return logger_;
 }
@@ -500,19 +545,50 @@ void LogHandoff::teardown_body() {
     wrapped_sinks_.clear();
 }
 
-void LogHandoff::teardown(std::chrono::milliseconds grace) noexcept {
-    if (torn_down_.exchange(true, std::memory_order_acq_rel))
-        return; // idempotent -- second call (or the destructor after an explicit call)
-                // is a no-op
+void LogHandoff::wait_for_teardown_completion() {
+    // Governance hardening round, unhappy-path UP-2: the LOSER of the torn_down_
+    // exchange below used to return immediately, so a caller that immediately
+    // destroys/frees this object right after ITS OWN teardown() call returns could
+    // free it while the WINNER (on another thread) was still mid-teardown_body(),
+    // touching pool_/logger_/wrapped_sinks_/etc -- a use-after-free. The loser now
+    // waits here instead. Bounded: the winner either finishes teardown_body()
+    // normally (which notifies below) or hard_exit()s the whole process on a genuine
+    // wedge (which ends this wait too, by ending everything) -- so this is never an
+    // unwatched wait on its own account, it inherits the winner's own watchdog.
+    std::unique_lock<std::mutex> lk(teardown_done_mu_);
+    teardown_done_cv_.wait(lk, [&] { return teardown_done_; });
+}
 
-    // T0: deregister from the global slot AND stop admitting new drain_log_bounded()
-    // leases, both BEFORE any teardown work (see the header's TEARDOWN CONTRACT and
-    // the DRAIN-READER LEASE paragraph -- BLOCKER-1 fix, #4666 PR-1 adversarial
-    // review).
-    clear_global_drain_handle(this);
-    close_drain_admission();
+void LogHandoff::mark_teardown_complete() {
+    {
+        std::lock_guard<std::mutex> lk(teardown_done_mu_);
+        teardown_done_ = true;
+    }
+    teardown_done_cv_.notify_all();
+}
+
+void LogHandoff::teardown(std::chrono::milliseconds grace) noexcept {
+    if (torn_down_.exchange(true, std::memory_order_acq_rel)) {
+        wait_for_teardown_completion(); // see its own comment -- UP-2 fix
+        return;
+    }
 
     try {
+        // T0: deregister from the global slot AND stop admitting new
+        // drain_log_bounded() leases, both BEFORE any other teardown work (see the
+        // header's TEARDOWN CONTRACT and the DRAIN-READER LEASE paragraph --
+        // BLOCKER-1 fix, #4666 PR-1 adversarial review). Moved INSIDE this try block
+        // in the governance hardening round (cpp-expert finding): both calls take a
+        // std::lock_guard, and std::mutex::lock() is permitted by the standard to
+        // throw std::system_error -- previously that could escape this noexcept
+        // function via std::terminate() instead of the documented fail-closed
+        // hard_exit() below. The "must run before the watchdog" requirement was
+        // always about TIMING (fast, never blocks), not exception safety, so moving
+        // these two calls here -- still before the ShutdownDeadlineGuard is
+        // constructed -- keeps the timing property while closing the noexcept gap.
+        clear_global_drain_handle(this);
+        close_drain_admission();
+
         auto action = [] { hard_exit(kLogTeardownExitCode); };
         ShutdownDeadlineGuard<decltype(action)> guard{grace, action};
         // Still INSIDE the watchdog's scope, not after it: if a drain_log_bounded()
@@ -528,22 +604,33 @@ void LogHandoff::teardown(std::chrono::milliseconds grace) noexcept {
         wait_for_drain_quiescence();
         teardown_body();
     } catch (...) {
-        // teardown_body() must not throw in ordinary operation, but if something deep
-        // inside spdlog's own error-handler rethrow path does, fail closed the same
-        // way every other primitive in this shutdown-path family does -- never let an
-        // exception escape a call the destructor depends on being noexcept (that would
-        // reach std::terminate() instead of hard_exit(), which on Windows runs CRT
-        // abort handling -- exactly the hazard hard_exit.hpp's own header warns
-        // about).
+        // teardown_body() (or T0, now that it is inside this try) must not throw in
+        // ordinary operation, but if something deep inside spdlog's own
+        // error-handler rethrow path does, or a mutex lock genuinely fails, fail
+        // closed the same way every other primitive in this shutdown-path family
+        // does -- never let an exception escape a call the destructor depends on
+        // being noexcept (that would reach std::terminate() instead of
+        // hard_exit(), which on Windows runs CRT abort handling -- exactly the
+        // hazard hard_exit.hpp's own header warns about). hard_exit() never
+        // returns, so mark_teardown_complete() below is unreached on this path --
+        // correct, since the whole process is exiting and no loser thread's wait
+        // needs waking.
         hard_exit(kLogTeardownExitCode);
     }
+    mark_teardown_complete();
 }
 
 void LogHandoff::teardown_with_action_for_test(std::chrono::milliseconds grace,
                                                std::function<void()> action) {
-    if (torn_down_.exchange(true, std::memory_order_acq_rel))
+    if (torn_down_.exchange(true, std::memory_order_acq_rel)) {
+        wait_for_teardown_completion();
         return;
+    }
 
+    // T0 -- see teardown()'s own comment on why this is inside no try/catch here:
+    // this is a TEST-ONLY entry point (unlike teardown(), not noexcept/fail-closed),
+    // so an exception from T0 propagates normally and fails the calling Catch2
+    // TEST_CASE, which is the correct, already-documented behavior for this method.
     clear_global_drain_handle(this);
     close_drain_admission();
 
@@ -554,6 +641,7 @@ void LogHandoff::teardown_with_action_for_test(std::chrono::milliseconds grace,
                       // hard_exit) an exception here should fail the calling Catch2
                       // TEST_CASE, not the whole test binary (see the header's own
                       // comment on this method).
+    mark_teardown_complete();
 }
 
 } // namespace yuzu::agent

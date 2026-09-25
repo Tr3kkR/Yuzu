@@ -74,11 +74,18 @@
 ///
 /// teardown() steps (T0-T3; T4 from the plan -- "guard.cancel()" -- is implicit RAII
 /// here, the guard's destructor cancels it when the enclosing scope ends normally):
-///   T0: mark torn_down_ (idempotency gate) and deregister this instance from the
-///       global drain-lookup slot (see drain_log_bounded() below) BEFORE doing any
-///       teardown work, so a concurrent drain_log_bounded() call either already holds
-///       its own live (weak-locked) reference, or observes "nothing installed" from
-///       this point on -- never a half-torn-down handle.
+///   T0: mark torn_down_ (idempotency gate), deregister this instance from the global
+///       drain-lookup slot, AND stop admitting new drain_log_bounded() leases
+///       (close_drain_admission()) -- see drain_log_bounded() below -- BEFORE doing
+///       any teardown work, so a concurrent drain_log_bounded() call either already
+///       holds its own live (weak-locked, leased) reference, or observes "nothing
+///       installed"/"admission closed" from this point on -- never a half-torn-down
+///       handle. (Governance hardening round: T0's two calls now run INSIDE
+///       teardown()'s try block rather than before it, for noexcept-safety -- see
+///       teardown()'s own comment -- but still before the ShutdownDeadlineGuard is
+///       constructed, preserving the original "fast, never blocks" timing intent.)
+///       teardown() then waits for every already-admitted lease to release
+///       (wait_for_drain_quiescence()) INSIDE the watchdog's scope, before T1.
 ///   T1: logger_->flush() (a queued request; no delivery is claimed), then
 ///       pool_.reset(): ~thread_pool posts a terminate message under the `block` policy
 ///       and JOINS its one worker. A healthy sink drains in order and the join returns
@@ -86,7 +93,10 @@
 ///       watchdog above fires hard_exit() on the whole process, or (in the
 ///       teardown_with_action_for_test() path) the injected test action fires instead
 ///       of the process actually exiting -- the caller must not treat that as
-///       "teardown() returned" (see the test's own comment).
+///       "teardown() returned" (see the test's own comment). Immediately after
+///       pool_.reset(), wait_for_worker_exit() blocks until the pool's worker thread
+///       has ACTUALLY exited -- see the WORKER-EXIT SIGNAL paragraph below for why
+///       pool_.reset() alone is not sufficient.
 ///   T2: EVERY image's registry drops its reference to the logger by overwriting the
 ///       "" default-logger slot with a NULL-sink logger (never
 ///       spdlog::shutdown()/drop_all(), which null default_logger_ itself and would
@@ -121,7 +131,15 @@
 ///       to EXIT_FAILURE with no synchronous-logging fallback -- a host that cannot
 ///       create one thread cannot run the agent's own ThreadPool either, and a silently
 ///       synchronous logger is the exact forbidden mode this primitive exists to
-///       retire.
+///       retire. (Governance hardening round, unhappy-path UP-1: the "no global state
+///       is touched" guarantee is now correct for every construction step except one
+///       small, irreducible residual -- the mutex lock guarding the global drain-slot
+///       swap runs after the returned object exists, so a bad_alloc-class throw from
+///       THAT specific lock's acquisition, not from any allocation, could still reach
+///       the destructor's fail-closed teardown(). This is the same class of
+///       near-unavoidable rarity teardown()'s own T0 comment discusses; every larger
+///       allocating step -- DrainHandle construction, the sinks vector copy -- now runs
+///       BEFORE the object exists, closing the realistic window.)
 ///   (2) a `--log-file` OPEN failure (missing/unwritable directory) is NOT treated as a
 ///       LogHandoff construction failure: create() catches it internally and falls back
 ///       to a console-only sink set (still async/non-blocking), exactly like today's
@@ -223,6 +241,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -239,6 +258,17 @@ namespace yuzu::agent {
 /// Message-count bound (plan 1.2/Decision 3), NOT a byte bound -- see the FIXED
 /// RESOURCE COST note above for the 3.34 MB (~=3.19 MiB) fixed RSS this implies.
 inline constexpr std::size_t kLogQueueCapacity = 8192;
+
+/// Pins the FIXED RESOURCE COST math above to the actual vendored spdlog layout
+/// (governance hardening round, quality-engineer finding): without this, a future
+/// spdlog version bump that changes sizeof(async_msg) would silently invalidate the
+/// "8193 * 408 bytes = 3.34 MB" figure in this file's banner and in
+/// docs/resource-ledgers/4666-log-handoff.md, with nothing to catch it -- this turns
+/// that into a compile error instead.
+static_assert(sizeof(spdlog::details::async_msg) == 408,
+             "sizeof(spdlog::details::async_msg) changed -- update the FIXED RESOURCE "
+             "COST math in this file's banner and in "
+             "docs/resource-ledgers/4666-log-handoff.md to match");
 
 /// Default grace for LogHandoff::teardown()'s internal watchdog (Decision 8). Distinct
 /// from kShutdownDeadlineGrace/kOrphanDrainGrace -- this bounds ONLY the log-teardown
@@ -319,6 +349,11 @@ struct DrainGate;
 /// type. Same struct-tag-consistency note as DrainGate above.
 struct WorkerExitSignal;
 
+/// Opaque global-drain-lookup-slot payload (log_handoff.cpp). Forward-declared here
+/// only so LogHandoff::register_global_drain_handle()'s private signature can name it
+/// -- no caller outside log_handoff.cpp ever constructs or names this type directly.
+struct DrainHandle;
+
 /// Owns the private single-thread pool, the async logger, and the wrapper sinks (plan
 /// 1.2/1.4). Non-copyable, non-movable -- there is exactly one owner, matching
 /// ShutdownDeadlineGuard's own precedent for a shutdown-path primitive with a single,
@@ -330,17 +365,19 @@ struct WorkerExitSignal;
 /// callable "from any thread" and ARE internally synchronized against a CONCURRENT
 /// drain_log_bounded() call (the DRAIN-READER LEASE) and against an ordinary producer
 /// thread's logger()->info()/flush() call (the WORKER-EXIT SIGNAL, both above). They
-/// are NOT fully synchronized against EACH OTHER: the `torn_down_` atomic exchange
-/// makes a SECOND concurrent teardown()/teardown_with_action_for_test()/destructor
-/// call return immediately (idempotency, preventing a double-run of the body), but it
-/// does NOT make that second caller WAIT for the first call to actually finish -- so
-/// two threads calling teardown() (or one calling it while another drops the last
-/// `unique_ptr<LogHandoff>`, triggering the destructor) concurrently can still race
-/// each other: the second caller's own call returns as soon as it loses the exchange,
-/// which can be well before the first caller's teardown_body() has actually completed.
-/// A caller needing "teardown is genuinely done" from a second thread must still
-/// synchronize that externally (e.g. join the thread that called teardown(), as every
-/// test in this file already does). Separately, they are NOT synchronized against a
+/// ARE now synchronized against EACH OTHER (governance hardening round, unhappy-path
+/// UP-2 -- an earlier draft of this paragraph said they were not, and that was a real
+/// gap, not just wording): the `torn_down_` atomic exchange still makes a SECOND
+/// concurrent teardown()/teardown_with_action_for_test()/destructor call the LOSER of
+/// the race, but the loser now WAITS (wait_for_teardown_completion(), a
+/// mutex+condvar+bool distinct from torn_down_) for the WINNER's teardown_body() to
+/// actually finish before returning -- bounded by the winner's own watchdog, since a
+/// wedge there either lets teardown_body() finish normally (which wakes the loser) or
+/// hard_exit()s the whole process (which ends the loser's wait too, by ending
+/// everything). So two threads calling teardown() (or one calling it while another
+/// drops the last `unique_ptr<LogHandoff>`, triggering the destructor) no longer race
+/// each other for use-after-free purposes: the loser's `teardown()` call does not
+/// return until the object's live state is genuinely quiescent. Separately, they are NOT synchronized against a
 /// concurrent call to the plain accessors below (overrun_total()/queue_depth()/
 /// in_write()/stalled_for()/log_errors_total()/last_log_error_for_test()) or against
 /// install()/logger() -- those read pool_/logger_/wrapped_sinks_/error_state_
@@ -422,7 +459,11 @@ public:
     /// Sets this instance's logger as spdlog's default logger IN THIS IMAGE. Returns
     /// the logger so the caller can also install it into a second image's registry
     /// (the macOS case -- see the file banner's MULTI-IMAGE note). Calling this more
-    /// than once just re-sets the same logger; harmless.
+    /// than once BEFORE teardown() just re-sets the same logger; harmless. Returns
+    /// nullptr and does nothing if called AFTER teardown() has completed (governance
+    /// hardening round, unhappy-path UP-3): installing a null logger would null
+    /// spdlog's registry-wide default_logger_ too, reintroducing the exact
+    /// straggler-segfault hazard T2's null-sink swap exists to prevent.
     std::shared_ptr<spdlog::logger> install();
 
     /// The owned logger, independent of whether install() was called -- for a caller
@@ -513,7 +554,25 @@ private:
     /// close_drain_admission()/wait_for_drain_quiescence().
     void wait_for_worker_exit();
 
-    static void register_global_drain_handle(LogHandoff* self);
+    /// Governance hardening round, unhappy-path UP-2: the loser of the torn_down_
+    /// exchange in teardown()/teardown_with_action_for_test() calls this instead of
+    /// returning immediately, so it cannot return (and let its caller free the
+    /// object) before the winner's teardown_body() has genuinely finished. See the
+    /// THREAD-SAFETY CONTRACT paragraph above and this method's own .cpp comment.
+    void wait_for_teardown_completion();
+
+    /// Called by the WINNER of the torn_down_ exchange once teardown_body() has
+    /// completed normally (never reached on the hard_exit() path, since hard_exit()
+    /// does not return -- see teardown()'s own comment). Wakes any loser blocked in
+    /// wait_for_teardown_completion().
+    void mark_teardown_complete();
+
+    /// `handle`'s pool/logger/sinks/gate fields are already fully populated by the
+    /// caller (create_with_sinks(), built BEFORE `self` exists -- governance
+    /// hardening round, unhappy-path UP-1 fix, see that call site's own comment).
+    /// This just stamps the owner identity and swaps it into the global slot.
+    static void register_global_drain_handle(LogHandoff* self,
+                                              std::shared_ptr<DrainHandle> handle);
     static void clear_global_drain_handle(const LogHandoff* self);
 
     std::shared_ptr<spdlog::details::thread_pool> pool_;
@@ -523,6 +582,14 @@ private:
     std::shared_ptr<DrainGate> drain_gate_; // see close_drain_admission()/wait_for_drain_quiescence()
     std::shared_ptr<WorkerExitSignal> worker_exit_; // see wait_for_worker_exit()
     std::atomic<bool> torn_down_{false};
+    // Governance hardening round, unhappy-path UP-2: distinct from torn_down_, which
+    // only gates WHO runs teardown_body(); this pair (guarded by
+    // teardown_done_mu_/teardown_done_cv_) additionally lets a losing concurrent
+    // caller wait for the winner to actually finish. See
+    // wait_for_teardown_completion()/mark_teardown_complete() above.
+    std::mutex teardown_done_mu_;
+    std::condition_variable teardown_done_cv_;
+    bool teardown_done_{false}; // guarded by teardown_done_mu_
     bool log_file_fallback_{false};
     std::string log_file_fallback_reason_;
 
