@@ -289,7 +289,7 @@ inline constexpr std::uint32_t kErrorInvalidParameter = 87;
 /// A not-found there is never a legitimate absence (a corrupt hive, a stripped image), so it
 /// reads `unreadable` + `<name>:key_missing`, unlike a missing VALUE inside the opened key,
 /// which stays `absent`. Same possibility-gate rule as the sibling platform_security plugin's
-/// (separate PR) Control\Lsa key.
+/// Control\Lsa key.
 enum class ReadSource { registry, process_policy, structural_key };
 
 /// How one failed Win32 read is reported. `state` is "absent" when the OS definitively says the

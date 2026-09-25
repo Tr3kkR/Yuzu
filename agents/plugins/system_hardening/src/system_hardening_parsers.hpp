@@ -264,7 +264,7 @@ inline constexpr std::uint32_t kModeRegular = 0100000;
 /// remaps ENOENT to ENODEV: `unreadable` + `<key>:errno_19`, never a clean `absent`. Every
 /// other errno passes through untouched. `surface_mounted` is surface_is_procfs() below, run by
 /// the Linux leg with the real statfs(); this function is the errno half of that decision. The
-/// sibling platform_security plugin (separate PR) applies the same rule to efivarfs/securityfs.
+/// sibling platform_security plugin applies the same rule to efivarfs/securityfs.
 [[nodiscard]] constexpr int remap_enoent_for_surface(int err, bool surface_mounted) noexcept {
     return (err == ENOENT && !surface_mounted) ? ENODEV : err;
 }

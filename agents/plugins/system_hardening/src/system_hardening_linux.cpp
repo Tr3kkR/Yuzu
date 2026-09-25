@@ -24,7 +24,7 @@
  * reaches the pure layer (remap_enoent_for_surface), so a runtime that hides or
  * replaces /proc/sys or a subtree of it (ProcSubset=pid, a tmpfs overmount, a container or
  * chroot that does not expose it) never reports a clean absent/OK for hardening it never
- * probed. Same rule as the sibling platform_security plugin's (separate PR) efivarfs/securityfs
+ * probed. Same rule as the sibling platform_security plugin's efivarfs/securityfs
  * check. These eleven keys are kernel-global (not namespaced), so a containerised agent reads
  * the kernel the agent runs on: the host's for a shared-kernel runtime (runc), the guest
  * kernel's under Kata or a microVM, and gVisor's synthetic procfs (which reports the procfs
