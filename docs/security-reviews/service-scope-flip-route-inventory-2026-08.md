@@ -50,16 +50,22 @@ Rows 13–25 were not in the plan's original enumeration — found by the
 residual sweep of `rest_api_v1.cpp` (all 74 `auth_fn` call sites) and
 `mcp_server.cpp` (3 call sites) the plan itself flagged as outstanding.
 
-**Correction (#4980, 2026-09-25):** row 25's "closes both the CWE-862 gap
-and the service-scope gap in one call, since `perm_fn` routes through the
-§3a-flipped `require_permission`" claim was wrong. The route was actually
-gated on `Inventory:Read` via `fleet_read_fn` (the ADR-0017 admit-then-filter
-chokepoint), never `perm_fn`/`require_permission` — `fleet_read_fn`'s own
-service-scope branch admits-and-confines a service-scoped caller rather than
-denying it, which is a different posture from the §3a flip's hard 403. The
-CWE-862 half of this row's fix was real and complete; the service-scope half
-was not — that gap persisted for five weeks after this row was written and
-is what #4980 closed with a dedicated `deny_fleet_wide_service_scoped` call.
+**Correction (#4980, 2026-09-25):** row 25's claim was accurate WHEN
+WRITTEN, not wrong from the start — but it did not survive a later,
+unrelated change. On 2026-08-18 this route genuinely gated `Inventory:Read`
+via `perm_fn` (`require_permission`), and the §3a flip's hard 403 closed
+the service-scope gap at that point. Commit `606b9ec72` (2026-09-12, an
+unrelated Batch B2 fix closing a real management-group confinement gap on
+this same route) replaced that `perm_fn` gate with `fleet_read_fn` (the
+ADR-0017 admit-then-filter chokepoint) — whose service-scope branch
+admits-and-confines a service-scoped caller UNDER RBAC-ON rather than
+denying it outright (it still hard-403s under RBAC-off, same as `perm_fn`)
+— and in doing so silently reopened the service-scope axis this row's fix
+had closed. The actual exposure window was 2026-09-12 through #4980's
+merge (~13 days), RBAC-enabled deployments only, not the ~5 weeks since
+this row's own date. #4980 closed it again with a dedicated
+`deny_fleet_wide_service_scoped` call that no longer depends on which
+underlying gate this route uses.
 
 ## MCP (`mcp_server.cpp`) — sweep result: 0 findings
 
