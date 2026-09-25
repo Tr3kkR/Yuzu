@@ -573,16 +573,41 @@ void LogHandoff::wait_for_teardown_completion() {
 }
 
 void LogHandoff::mark_teardown_complete() {
-    {
-        std::lock_guard<std::mutex> lk(teardown_done_mu_);
-        teardown_done_ = true;
-    }
+    // notify_all() called WHILE STILL HOLDING the lock (Gate 8 second re-review,
+    // cpp-safety finding): this deliberately does NOT follow DrainLease's own
+    // "notify after unlock" pattern (a valid optimization there, since DrainGate is
+    // kept alive independently by a shared_ptr the caller holds). Here the object
+    // being notified (teardown_done_mu_/teardown_done_cv_) is a PLAIN MEMBER of the
+    // same LogHandoff the loser is about to destroy: if this unlocked BEFORE
+    // notifying, a loser that acquired the lock in that window, saw the predicate
+    // already true (cv::wait's predicate overload never actually blocks in that
+    // case), and returned could proceed straight into ~LogHandoff() -- destroying
+    // teardown_done_mu_/teardown_done_cv_ -- before this function's own notify_all()
+    // call ran, which would then be a heap-use-after-free on THIS (the winner's)
+    // thread. Notifying under the lock closes that window: by the time this
+    // function releases the mutex, the notify has already happened, so a loser
+    // cannot observe the predicate true without the notify having already
+    // completed.
+    std::lock_guard<std::mutex> lk(teardown_done_mu_);
+    teardown_done_ = true;
     teardown_done_cv_.notify_all();
 }
 
 void LogHandoff::teardown(std::chrono::milliseconds grace) noexcept {
     if (torn_down_.exchange(true, std::memory_order_acq_rel)) {
-        wait_for_teardown_completion(); // see its own comment -- UP-2 fix
+        // Wrapped in try/catch (Gate 8 second re-review, cpp-safety finding): this
+        // is now the ORDINARY path the destructor takes on an already-torn-down
+        // object (per the unconditional-teardown() fix above), not a rare
+        // corner case, so wait_for_teardown_completion()'s internal
+        // std::unique_lock construction -- which, like T0's mutex locks below,
+        // is permitted by the standard to throw std::system_error -- gets the
+        // same fail-closed coverage T0 already has, rather than escaping this
+        // noexcept function via std::terminate().
+        try {
+            wait_for_teardown_completion(); // see its own comment -- UP-2 fix
+        } catch (...) {
+            hard_exit(kLogTeardownExitCode);
+        }
         return;
     }
 
