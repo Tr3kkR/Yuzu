@@ -33,6 +33,7 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
+#include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "command_capability.hpp"
@@ -144,6 +145,7 @@ struct LabeledSpan {
         {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
         {"app_control", capdecls::plugin_action_catalogue_app_control(), false},
+        {"runtimes", capdecls::plugin_action_catalogue_runtimes(), false},
         {"platform_security", capdecls::plugin_action_catalogue_platform_security(), false},
         {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
@@ -171,6 +173,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_app_control(),
+        capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::core_dispatch_capabilities(),
@@ -364,6 +367,32 @@ TEST_CASE("capability catalogue: a locally-constructed duplicate span makes the 
     auto other = registry.classify("content_dist", "list_staged");
     REQUIRE(other.has_value());
     CHECK(other->dispatch_class == DispatchClass::ReadOnly);
+}
+
+/// Exact-row pin for `runtimes`: both actions are ReadOnly/None on the
+/// `Inventory` securable (a software-inventory fact, not a posture fact). The
+/// generic invariants above accept ANY seeded securable and ANY dispatch
+/// class, so without this pin a silent change to `Mutating` or `Security`
+/// ships green (an orchestrator probe confirmed it). Appended at the end of
+/// the file so sibling plugins' pins do not collide textually.
+TEST_CASE("capability catalogue: runtimes.dotnet and runtimes.jvm pin their exact "
+          "classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_runtimes();
+    REQUIRE(rows.size() == 2);
+    for (const auto action : {"dotnet", "jvm"}) {
+        const auto it =
+            std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
+        REQUIRE(it != rows.end());
+        CHECK(it->plugin == "runtimes");
+        CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+        CHECK(it->mutability == Mutability::None);
+        CHECK(it->securable == "Inventory");
+        CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->risk_tier == authz::RiskTier::Low);
+        CHECK_FALSE(it->system_reserved);
+        CHECK(it->execute_gate == ExecuteGate::None);
+    }
 }
 
 /// Exact-row pin for `platform_security` (Wave 8): both rows read fixed boot-integrity

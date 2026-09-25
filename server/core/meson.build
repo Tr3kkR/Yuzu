@@ -421,6 +421,7 @@ yuzu_server_core_lib = static_library(
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
     'src/leader_elector.cpp',
+    'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
     'src/command_outbox_delivery.cpp',
     'src/gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
@@ -630,6 +631,7 @@ yuzu_server_core_lib = static_library(
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
     'src/pg/pg_retention_guard.cpp',
+    'src/pg/multi_host_dsn.cpp', # HA WS-8: multi-host DSN must use target_session_attrs=read-write
     # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
     # secret columns. Depends on the yuzu_key_provider leaf target above.
     'src/pg/secret_codec.cpp',
