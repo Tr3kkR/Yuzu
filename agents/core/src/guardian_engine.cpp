@@ -38,6 +38,7 @@
 #include "guardian_detached_worker_role.hpp" // rung 9c R5.1: executor workers
 #include "guardian_joined_thread_role.hpp"
 #include "guardian_journal_heartbeat.hpp" // GuardianJournalStats (item 7 PR-Ag §8)
+#include "guardian_legacy_sink_executor.hpp" // #4783: detached legacy-sink sender
 #include "guardian_lifecycle_journal.hpp" // durable lifecycle journal (item 7 PR-Ag)
 #include "guardian_outbox_drain_worker.hpp"
 #include "guardian_rule_eval.hpp" // clamp_max_hash_bytes, kMaxFileHashBytes (#2233 item 6)
@@ -94,6 +95,19 @@ static_assert(is_reserved_plugin_name(kKvNamespace),
 
 constexpr std::string_view kActionPushRules = "push_rules";
 constexpr std::string_view kActionGetStatus = "get_status";
+
+// #4783 commit 4 (legacy_sink_kick()'s gap-repair loop): a small fixed cap on how
+// many sticky integrity gaps get a repair report synthesized per heartbeat tick -
+// bounds a single kick's work regardless of how many rules are gapped at once
+// (a reconnect burst caps at this many repairs per tick; R6 in the delivery plan).
+constexpr std::size_t kMaxGapRepairsPerKick = 32;
+
+// The fixed, short health_detail carried by every synthesized gap-repair report
+// (GuardDrift::health_detail -> detail_json {"detail": ...}). Deliberately a
+// CONSTANT, never built from the gap's own lost-count/rule metadata, so the #4748
+// health_detail length-cap concern never applies here (same argument that PR
+// relied on - delivery plan D1b / #3 in this file's own header banner).
+constexpr std::string_view kLegacySinkDeliveryGapDetail = "legacy-sink-delivery-gap";
 
 // The rollback guard used by wire_spark_engine() (rollback runs on EVERY exit path,
 // including a catch handler's own logging throwing - Sol rung-7.5 finding 2) is now
@@ -427,26 +441,203 @@ std::string make_rule_key(std::string_view rule_id) {
     return k;
 }
 
+// #4783 Gate 4 UP-3/UP-4: the legacy-sink loss ledger's persistence shape - a
+// SINGLE fixed key (not per-rule, unlike kBaselinePrefix - the whole ledger is
+// one small JSON blob), read at boot (start_local(), BEFORE the rule re-arm
+// loop) and written from legacy_sink_kick() (gated on change_gen - see that
+// method's own doc comment) and stop()'s unconditional final flush. Mirrors
+// guardian_persist_baseline/read_baseline_record's shape (schema field, plain
+// KvStore::set/get_entry, Ok/Absent/ReadError/Malformed collapsing) rather
+// than inventing a new one - see this row's citation in the #4783 Gate 4
+// completion report for exactly which lines this was copied from.
+constexpr std::string_view kLegacySinkLossKey = "legacy_sink_loss_ledger";
+constexpr int kLegacySinkLossSchemaVersion = 1;
+
+nlohmann::json legacy_sink_snapshot_to_json(const GuardianLegacySinkExecutor::Snapshot& snap) {
+    nlohmann::json j;
+    j["schema"] = kLegacySinkLossSchemaVersion;
+    auto& c = j["counters"];
+    c["events_lost"] = snap.counters.events_lost;
+    c["backpressure_drops"] = snap.counters.backpressure_drops;
+    c["admission_failures"] = snap.counters.admission_failures;
+    c["send_failures"] = snap.counters.send_failures;
+    c["send_exceptions"] = snap.counters.send_exceptions;
+    c["worker_faults"] = snap.counters.worker_faults;
+    c["dropped_link_down"] = snap.counters.dropped_link_down;
+    c["discarded_at_stop"] = snap.counters.discarded_at_stop;
+    c["stalls"] = snap.counters.stalls;
+    c["launch_failures"] = snap.counters.launch_failures;
+    c["gap_ledger_faults"] = snap.counters.gap_ledger_faults;
+    c["repairs_suppressed"] = snap.counters.repairs_suppressed;
+    // gap_rules is a read-time denormalization (Stats::gap_rules, set by
+    // GuardianLegacySinkExecutor::stats()/snapshot() from gaps.size()) -
+    // deliberately NOT persisted; restore() recomputes it the same way once
+    // the gaps array below is restored.
+    auto& gaps = j["gaps"] = nlohmann::json::array();
+    for (const auto& g : snap.gaps) {
+        nlohmann::json ge;
+        ge["rule_id"] = g.rule_id;
+        ge["guard_type"] = g.guard_type;
+        ge["rule_name"] = g.rule_name;
+        ge["lost"] = g.lost;
+        ge["first_lost_ms"] = g.first_lost_ms;
+        ge["last_lost_ms"] = g.last_lost_ms;
+        gaps.push_back(std::move(ge));
+    }
+    return j;
+}
+
+/// Same Ok/Absent/ReadError/Malformed collapsing as BaselineReadOutcome above -
+/// see that enum's own doc comment for the rationale (both the boot-read caller
+/// and any future re-check caller can switch on one shape without duplicating
+/// the KV-read/JSON-parse plumbing).
+enum class LegacySinkLossReadOutcome { Ok, Absent, ReadError, Malformed };
+
+LegacySinkLossReadOutcome
+read_legacy_sink_loss_record(KvStore& kv, GuardianLegacySinkExecutor::Stats& counters_out,
+                             std::vector<GuardianLegacySinkExecutor::GapSnapshotEntry>& gaps_out) {
+    auto raw = kv.get_entry(kKvNamespace, kLegacySinkLossKey);
+    if (!raw)
+        return LegacySinkLossReadOutcome::ReadError;
+    if (!raw->has_value())
+        return LegacySinkLossReadOutcome::Absent;
+    try {
+        auto j = nlohmann::json::parse(**raw);
+        // Schema-version drift is a DISTINCT failure from "malformed" only in
+        // spirit here (unlike the baseline record, this ledger has no
+        // fingerprint-vs-retarget distinction to protect) - still gated
+        // separately from the generic parse/shape checks below so a future
+        // schema bump reads as an explicit, intentional case rather than
+        // falling through whatever the shape checks happen to do with an
+        // old-shaped record.
+        if (j.value("schema", -1) != kLegacySinkLossSchemaVersion)
+            return LegacySinkLossReadOutcome::Malformed;
+        if (!j.contains("counters") || !j["counters"].is_object() || !j.contains("gaps") ||
+            !j["gaps"].is_array())
+            return LegacySinkLossReadOutcome::Malformed;
+        const auto& c = j["counters"];
+        GuardianLegacySinkExecutor::Stats counters{};
+        counters.events_lost = c.value("events_lost", std::uint64_t{0});
+        counters.backpressure_drops = c.value("backpressure_drops", std::uint64_t{0});
+        counters.admission_failures = c.value("admission_failures", std::uint64_t{0});
+        counters.send_failures = c.value("send_failures", std::uint64_t{0});
+        counters.send_exceptions = c.value("send_exceptions", std::uint64_t{0});
+        counters.worker_faults = c.value("worker_faults", std::uint64_t{0});
+        counters.dropped_link_down = c.value("dropped_link_down", std::uint64_t{0});
+        counters.discarded_at_stop = c.value("discarded_at_stop", std::uint64_t{0});
+        counters.stalls = c.value("stalls", std::uint64_t{0});
+        counters.launch_failures = c.value("launch_failures", std::uint64_t{0});
+        counters.gap_ledger_faults = c.value("gap_ledger_faults", std::uint64_t{0});
+        counters.repairs_suppressed = c.value("repairs_suppressed", std::uint64_t{0});
+        std::vector<GuardianLegacySinkExecutor::GapSnapshotEntry> gaps;
+        gaps.reserve(j["gaps"].size());
+        std::size_t skipped_empty_rule_id = 0;
+        for (const auto& ge : j["gaps"]) {
+            if (!ge.is_object())
+                return LegacySinkLossReadOutcome::Malformed;
+            GuardianLegacySinkExecutor::GapSnapshotEntry g;
+            g.rule_id = ge.value("rule_id", std::string{});
+            g.guard_type = ge.value("guard_type", std::string{});
+            g.rule_name = ge.value("rule_name", std::string{});
+            g.lost = ge.value("lost", std::uint64_t{0});
+            g.first_lost_ms = ge.value("first_lost_ms", std::int64_t{0});
+            g.last_lost_ms = ge.value("last_lost_ms", std::int64_t{0});
+            // #4783 Gate 4 unhappy-path finding, 2026-09-24 (defense in depth):
+            // SKIP a single empty-rule_id entry rather than rejecting the WHOLE
+            // record - every real entry always has one, but a rare "phantom"
+            // gap (guardian_legacy_sink_executor.hpp's worker_loop/offer()
+            // catch blocks both now refuse to create one in the first place,
+            // see their own doc comments) is not the only conceivable source
+            // of one, and this ledger is a best-effort loss-VISIBILITY marker,
+            // never a durable-correctness store - discarding every OTHER
+            // rule's legitimate open-gap state over ONE bad entry is a far
+            // worse outcome than losing that one entry's own history. A
+            // genuinely corrupt/hand-crafted record (bad JSON, wrong shape)
+            // still fails Malformed via the type checks above/the outer
+            // catch - this narrows ONLY the single-bad-entry case.
+            if (g.rule_id.empty()) {
+                ++skipped_empty_rule_id;
+                // #4783 Gate 6 sre finding, 2026-09-24: fold into the SAME
+                // durable counter record_gap_locked()'s own allocation-degrade
+                // path already uses (see that field's doc comment, amended in
+                // the same change) rather than leaving this a log-only,
+                // easily-missed signal - a restart is exactly the moment an
+                // operator is least likely to be watching logs for a one-line
+                // warn that's also wrapped in its own try/catch below.
+                ++counters.gap_ledger_faults;
+                continue;
+            }
+            gaps.push_back(std::move(g));
+        }
+        if (skipped_empty_rule_id > 0) {
+            try {
+                spdlog::warn("Guardian: legacy-sink loss ledger record had {} entr{} with an "
+                            "empty rule_id - skipped, the other {} entr{} restored normally",
+                            skipped_empty_rule_id, skipped_empty_rule_id == 1 ? "y" : "ies",
+                            gaps.size(), gaps.size() == 1 ? "y" : "ies");
+            } catch (...) {
+            }
+        }
+        counters_out = counters;
+        gaps_out = std::move(gaps);
+        return LegacySinkLossReadOutcome::Ok;
+    } catch (const nlohmann::json::exception&) {
+        return LegacySinkLossReadOutcome::Malformed;
+    }
+}
+
+/// Persist `snap` to the fixed legacy-sink loss ledger key. Takes `KvStore*` by
+/// raw pointer (not `GuardianEngine&`/`this`) for the SAME reason
+/// guardian_persist_baseline does - safe to call from legacy_sink_kick(), which
+/// deliberately runs off mtx_ (see that method's own doc comment), and `kv_`
+/// outlives every caller by construction (agent.cpp declares kv_store_ before
+/// guardian_). Returns kv_->set()'s own success bool (false if `kv` is null) -
+/// every caller logs on false and does NOT advance its own "last persisted
+/// generation" tracking, so a failed write is retried on the next opportunity
+/// rather than silently believed to have happened.
+bool persist_legacy_sink_loss_ledger(KvStore* kv, const GuardianLegacySinkExecutor::Snapshot& snap) {
+    if (!kv)
+        return false;
+    return kv->set(kKvNamespace, kLegacySinkLossKey, legacy_sink_snapshot_to_json(snap).dump());
+}
+
 } // namespace
 
 GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark)
-    : kv_{kv}, agent_id_{std::move(agent_id)}, prefer_spark_{prefer_spark},
-      ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
+    : kv_{kv}, agent_id_{std::move(agent_id)},
+      legacy_sink_executor_{std::make_unique<GuardianLegacySinkExecutor>()},
+      prefer_spark_{prefer_spark}, ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
 
 GuardianEngine::~GuardianEngine() {
     // Explicit (not = default): join the guard worker threads here via stop().
     // Workers call emit_guard_event(), which reads THIS engine's own
     // event_sink_/sink_mtx_/event_seq_ — GuardianEngine members, so they outlive
-    // this join regardless of declaration order. NOTE (H4 / #1209): the sink
-    // callback also reaches AgentImpl-side state (stream_write_mu_ +
-    // guardian_sink_stream_); that is kept safe by AgentImpl declaring `guardian_`
-    // AFTER those members (engine tears down — and joins — first) and by
-    // AgentImpl::stop() joining guards before its own teardown. stop() is idempotent.
+    // this join regardless of declaration order.
+    //
+    // #4783 UPDATE: that join is now prompt — emit_guard_event() only enqueues onto
+    // legacy_sink_executor_ (offer() never blocks on network I/O), so a guard's own
+    // detection thread no longer parks inside a stalled Write() and stop_all_guards_
+    // locked()'s join is no longer at the mercy of the network. What this join no
+    // longer bounds is the AgentImpl-side sink state (stream_write_mu_ +
+    // guardian_sink_stream_, H4 / #1209): the actual send now runs on
+    // legacy_sink_executor_'s own DETACHED worker, which this stop() call does not
+    // join and which can outlive both this engine and the AgentImpl instance that
+    // owns those members. Safety for that no longer rests on thread-join ordering —
+    // it rests on the orphan-exit contract instead: legacy_sink_executor_->
+    // active_worker_count() is summed into active_io_workers() (below), and
+    // main.cpp/service_win.cpp's hard_exit.hpp guard refuses normal C++ teardown of
+    // AgentImpl while that count is nonzero, hard_exit()ing instead after a bounded
+    // grace — exactly the same contract guardian_outbox_send_executor.hpp's Spark
+    // send executor already relies on, not a join. stop() is idempotent.
     stop();
 }
 
 std::string_view GuardianEngine::kv_namespace() {
     return kKvNamespace;
+}
+
+std::string_view GuardianEngine::legacy_sink_loss_ledger_key_for_test() {
+    return kLegacySinkLossKey;
 }
 
 std::expected<void, std::string> GuardianEngine::start_local() {
@@ -506,6 +697,42 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         spdlog::warn("Guardian: failed to begin boot ack application: {}", e.what());
     } catch (...) {
         spdlog::warn("Guardian: failed to begin boot ack application: unknown exception");
+    }
+
+    // #4783 Gate 4 UP-3/UP-4: restore the legacy-sink loss ledger (counters +
+    // open gaps) from a prior process, BEFORE the boot re-arm loop below -
+    // reconcile_rule_locked() (called from that loop) can start a REAL guard
+    // thread (e.g. a Windows FileGuard's watch thread) that reaches
+    // emit_guard_event() -> legacy_sink_executor_->offer() asynchronously,
+    // before this function returns. restore() itself is safe to call here
+    // specifically because start_local() holds mtx_ for its entire body and
+    // this call precedes every re-arm in that same locked call, so no
+    // offer()/kick() against legacy_sink_executor_ can be in flight yet - see
+    // GuardianLegacySinkExecutor::restore()'s own precondition doc comment.
+    if (kv_) {
+        GuardianLegacySinkExecutor::Stats seed_counters{};
+        std::vector<GuardianLegacySinkExecutor::GapSnapshotEntry> seed_gaps;
+        switch (read_legacy_sink_loss_record(*kv_, seed_counters, seed_gaps)) {
+        case LegacySinkLossReadOutcome::Ok: {
+            const std::size_t gap_count = seed_gaps.size(); // read BEFORE the move below
+            legacy_sink_executor_->restore(seed_counters, std::move(seed_gaps));
+            spdlog::info("Guardian: restored the legacy-sink loss ledger from a prior "
+                        "process (events_lost={}, open gap_rules={})",
+                        seed_counters.events_lost, gap_count);
+            break;
+        }
+        case LegacySinkLossReadOutcome::Absent:
+            break; // nothing persisted yet - fresh state, nothing to restore
+        case LegacySinkLossReadOutcome::ReadError:
+            spdlog::warn("Guardian: legacy-sink loss ledger lookup failed (KV read error) - "
+                        "starting with an empty loss ledger");
+            break;
+        case LegacySinkLossReadOutcome::Malformed:
+            spdlog::warn("Guardian: legacy-sink loss ledger record is malformed (bad JSON, "
+                        "schema mismatch, or bad shape) - discarding and starting with an "
+                        "empty loss ledger");
+            break;
+        }
     }
 
     // A2 (restart re-arm). A restarted agent must keep enforcing without waiting
@@ -653,6 +880,58 @@ void GuardianEngine::stop() {
     if (spark_drain_worker_)
         spark_drain_worker_->stop();
     stop_all_guards_locked();
+    // #4783: stop legacy_sink_executor_ from admitting NEW sends only AFTER the
+    // guards above have joined — by the time stop_all_guards_locked() returns, every
+    // guard's own detection thread has already made its last emit_guard_event() call
+    // (offer() never blocks, so nothing here is actually waiting ON a guard thread;
+    // this is purely about ordering the two teardown steps). This does NOT flush the
+    // backlog: any event still QUEUED (not yet in flight) at this point is DISCARDED
+    // by the executor's own stop(), counted via its discarded_at_stop stat — only a
+    // send already IN FLIGHT is left running, detached, covered by the orphan-exit
+    // accounting active_io_workers() sums below. See
+    // guardian_legacy_sink_executor.hpp's own stop() doc comment for the full
+    // contract; never blocks.
+    legacy_sink_executor_->stop();
+    // #4783 Gate 4 UP-3/UP-4: one final, unconditional (not change_gen-gated,
+    // unlike legacy_sink_kick()'s own persist) restart-durable write of the
+    // loss ledger - same reasoning as the lifecycle-journal final flush right
+    // below: a bounded, synchronous KV write that catches whatever changed
+    // since the last successful kick()-driven persist, including a rule that
+    // never got a single heartbeat before the agent shut down (an open gap
+    // with zero prior kicks still needs to survive the restart it is about to
+    // undergo). FIREWALLED for the same reason as the journal flush below -
+    // stop() is reached from the (implicitly noexcept) ~GuardianEngine
+    // destructor. kv_ read without mtx_ is safe - see legacy_sink_kick()'s own
+    // comment on that; mtx_ IS held here (stop()'s whole body), but that does
+    // not change kv_'s own never-reassigned-after-construction contract, and
+    // it is NOT what protects the sequence below (mtx_ guards nothing legacy-
+    // sink-related - see legacy_sink_persist_mu_'s own doc comment).
+    //
+    // #4783 Gate 8 re-review: snapshot + persist + record-gen run under
+    // legacy_sink_persist_mu_ for their ENTIRE span, the same lock
+    // legacy_sink_kick()'s own persist block takes for its entire span - this
+    // is what stops a late in-flight heartbeat kick() (agent.cpp calls
+    // stop() before joining the heartbeat thread - quiesce_run_workers())
+    // from clobbering the fresher write below with a stale snapshot it took
+    // before stop() ran; see legacy_sink_persist_mu_'s doc comment for the
+    // exact race this closes. The lock_guard is taken INSIDE the try, not
+    // outside it: std::mutex::lock() can throw std::system_error, and this
+    // whole path is reached from the (implicitly noexcept) destructor, so an
+    // escape here must be caught, not left to std::terminate.
+    if (kv_) {
+        try {
+            std::lock_guard<std::mutex> persist_lk(legacy_sink_persist_mu_);
+            const auto snap = legacy_sink_executor_->snapshot();
+            if (persist_legacy_sink_loss_ledger(kv_, snap))
+                legacy_sink_last_persisted_gen_ = snap.change_gen;
+            else
+                spdlog::warn("Guardian: failed to persist the legacy-sink loss ledger during "
+                            "shutdown (change_gen={}) - a restart may see stale (though never "
+                            "corrupt) loss/gap state",
+                            snap.change_gen);
+        } catch (...) {
+        }
+    }
     // F7: stop() is terminal - nothing reconciles again afterward, so there is no
     // re-log/false-transition risk (unlike apply_rules's full_sync, which must sweep
     // precisely instead). Blanket-clearing here just keeps a heartbeat composed
@@ -1503,18 +1782,26 @@ void GuardianEngine::set_event_sink(EventSink sink) {
     event_sink_ = std::move(sink);
 }
 
-void GuardianEngine::emit_guard_event(const GuardDrift& d) {
-    // Snapshot the sink under sink_mtx_, then release BEFORE the (potentially
-    // blocking) network send — never hold the lock across the sink call, and
-    // never take mtx_ here (a guard worker can fire while apply_rules/stop hold
+void GuardianEngine::emit_guard_event(
+    const GuardDrift& d, bool is_gap_repair,
+    std::optional<std::chrono::system_clock::time_point> timestamp_override,
+    std::optional<std::uint64_t> expected_gap_lost_seq) {
+    // Snapshot the sink under sink_mtx_, then release BEFORE handing off to
+    // legacy_sink_executor_ (#4783) — never hold the lock any longer than needed,
+    // and never take mtx_ here (a guard worker can fire while apply_rules/stop hold
     // mtx_ and join this thread).
     EventSink sink;
     {
         std::lock_guard lock(sink_mtx_);
         sink = event_sink_;
     }
-    if (!sink)
-        return; // sink not wired yet (pre-network arm) — drop; durable buffering is A3
+    if (!sink) {
+        // sink not wired yet (pre-network arm) — drop; durable buffering is A3.
+        // #4783: now COUNTED (previously a silent return) so "never wired" is
+        // distinguishable from "wired and delivered/lost".
+        ++legacy_sink_dropped_unwired_;
+        return;
+    }
 
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
@@ -1537,14 +1824,46 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
                     std::to_string(seq));
     ev.set_rule_id(d.rule_id);
     ev.set_guard_category("event");
-    // rule_name / guard_type / detected_value / expected_value / detection_latency_us,
-    // the 4-way event_type cascade (+ remediation fields) and drift_rate are shared
-    // byte-for-byte with the spark consumer's Compliance branch — set them from the
-    // single apply_drift_to_event source of truth so the two producers cannot drift
-    // apart (#2237 item 1). event_id, rule_id, guard_category, timestamp and platform
-    // stay stamped here (idempotency- and host-specific).
-    apply_drift_to_event(d, ev);
-    ev.mutable_timestamp()->set_seconds(now_ms / 1000);
+    if (d.health != GuardDrift::Health::None) {
+        // Health arm: never through apply_drift_to_event — its default arm would mint
+        // drift.detected from a report that carries no verdict, and every compliance
+        // field on a health report is ignored outright (guard.hpp's doc comment).
+        // Shape pinned byte-for-byte to guardian_spark_send.cpp's Health/!healthy case
+        // (#2237) so the two wire producers cannot drift apart; extracting a shared
+        // apply_health_to_event() helper is tracked as #4782, not done here, because
+        // test_guardian_spark_send.cpp pins that serializer's exact literal output and
+        // a shared-helper refactor was out of scope for this fix. No coupling test
+        // exists between the two copies today (dormant risk while prefer_spark_
+        // defaults false) — #4782 is exactly that gap.
+        ev.set_guard_type(d.guard_type);
+        ev.set_rule_name(d.rule_name);
+        ev.set_event_type("guard.unhealthy");
+        if (!d.health_detail.empty()) {
+            nlohmann::json j;
+            j["detail"] = d.health_detail;
+            ev.set_detail_json(j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+        }
+    } else {
+        // rule_name / guard_type / detected_value / expected_value / detection_latency_us,
+        // the 4-way event_type cascade (+ remediation fields) and drift_rate are shared
+        // byte-for-byte with the spark consumer's Compliance branch — set them from the
+        // single apply_drift_to_event source of truth so the two producers cannot drift
+        // apart (#2237 item 1). event_id, rule_id, guard_category, timestamp and platform
+        // stay stamped here (idempotency- and host-specific).
+        apply_drift_to_event(d, ev);
+    }
+    // #4783 follow-up review, part (c): the wire `timestamp` field is stamped
+    // from `timestamp_override` when the caller supplied one (ONLY
+    // legacy_sink_kick(), with the gap's `last_lost` — see this function's own
+    // doc comment in guardian_engine.hpp) rather than from `now_ms` above -
+    // `event_id` keeps using `now_ms` regardless, so this touches ONLY the
+    // event's timestamp, not its identity.
+    const auto timestamp_secs = timestamp_override.has_value()
+                                    ? std::chrono::duration_cast<std::chrono::seconds>(
+                                          timestamp_override->time_since_epoch())
+                                          .count()
+                                    : now_ms / 1000;
+    ev.mutable_timestamp()->set_seconds(timestamp_secs);
     // Stamp the agent's real platform (mirrors get_status) — not a hardcoded
     // "windows", which would mislabel every drift event once Linux/macOS guards land.
 #if defined(_WIN32)
@@ -1554,7 +1873,151 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
 #else
     ev.set_platform("linux");
 #endif
-    sink(ev);
+    // #4783: enqueue-only from here — offer() itself never blocks on network I/O and
+    // never throws (an escaping exception from THIS specific call would end the
+    // calling guard's detection loop permanently, see guard_file.cpp's outer catch);
+    // everything ABOVE this line keeps whatever throw surface it already had.
+    // Delivery, loss accounting and the sticky per-rule integrity gap are
+    // legacy_sink_executor_'s job from here — see guardian_legacy_sink_executor.hpp.
+    // `is_gap_repair` (#4783 commit 4) threads straight through: only
+    // legacy_sink_kick() ever passes true, for a synthesized guard.unhealthy
+    // report rebuilding an existing gap — see that method's own doc comment.
+    // `expected_gap_lost_seq` (adversarial-review finding, 2026-09-24) also
+    // threads straight through — see offer()'s own doc comment and the class
+    // doc comment's ADMISSION-TIME EPISODE BINDING section.
+    (void)legacy_sink_executor_->offer(std::move(ev), std::move(sink), is_gap_repair,
+                                       expected_gap_lost_seq);
+}
+
+void GuardianEngine::legacy_sink_kick() noexcept {
+    // #4783 commit 4: deliberately NOT gated on prefer_spark_ (unlike
+    // journal_maintenance_tick() above, whose gate is specific to the spark-runtime
+    // maintenance passes it drives) and deliberately NOT under mtx_ — see this
+    // method's own doc comment in guardian_engine.hpp for the full rationale.
+    // kick()/gapped_rules_needing_repair() take only the executor's own internal
+    // lock; emit_guard_event() below takes only sink_mtx_ then that same executor
+    // lock, exactly like a real guard's own emission path — never mtx_, so this
+    // cannot contend with (or deadlock against) apply_rules()/stop().
+    try {
+        legacy_sink_executor_->kick();
+        const auto gaps =
+            legacy_sink_executor_->gapped_rules_needing_repair(kMaxGapRepairsPerKick);
+        for (const auto& [rule_id, gap] : gaps) {
+            if (gap.repair_seq != 0)
+                continue;
+            GuardDrift d;
+            d.guard_type = gap.guard_type;
+            d.rule_id = rule_id;
+            d.rule_name = gap.rule_name;
+            d.health = GuardDrift::Health::Unhealthy;
+            d.health_detail = kLegacySinkDeliveryGapDetail;
+            // #4783 follow-up review, part (c): stamp the repair with the gap's
+            // OWN last_lost, not this kick's wall-clock now — see
+            // emit_guard_event()'s doc comment in guardian_engine.hpp for why.
+            // Adversarial-review finding, 2026-09-24: also pass the gap's OWN
+            // lost_seq (captured in this SAME gapped_rules_needing_repair() call,
+            // above) as expected_gap_lost_seq — see that doc comment and
+            // guardian_legacy_sink_executor.hpp's ADMISSION-TIME EPISODE BINDING
+            // section for why offer() must re-validate this repair still
+            // describes the loss episode captured here, not whatever gap is live
+            // by the time this call actually reaches offer().
+            emit_guard_event(d, /*is_gap_repair=*/true, gap.last_lost, gap.lost_seq);
+        }
+    } catch (...) {
+        // Firewalled: runs on the bare heartbeat thread (agent.cpp) - same posture
+        // as journal_maintenance_tick()'s own try/catch (review B4a). A throw here
+        // must never escalate to std::terminate.
+    }
+
+    // #4783 Gate 4 UP-3/UP-4: persist the loss ledger if it changed since the
+    // last write - own try/catch, deliberately AFTER (and independent of) the
+    // repair-dispatch loop above, so a KV write failure here can never prevent
+    // (or be masked by) the gap-repair work. kv_ is a raw pointer set once at
+    // construction and never reassigned (same rationale
+    // guardian_persist_baseline's own doc comment gives for reading it off
+    // mtx_ from a non-engine thread) - safe to read here without mtx_, which
+    // this method deliberately never takes (see its own doc comment).
+    //
+    // #4783 Gate 8 re-review: snapshot + the change_gen decision + persist +
+    // record-gen all run under legacy_sink_persist_mu_ for their ENTIRE span
+    // (lock_guard taken INSIDE the try - std::mutex::lock() can throw, and
+    // this whole method is noexcept), the same lock stop()'s own final
+    // persist takes for its entire span - so the two call sites can never
+    // interleave a stale snapshot from one against a fresher write from the
+    // other. This lock is scoped ONLY to this orchestration, never anything
+    // guard-thread-reachable, so it adds no new blocking dependency for a
+    // guard thread's own reporting or an apply_rules reconcile - see
+    // legacy_sink_persist_mu_'s own doc comment for the full race this closes
+    // and why it is deliberately not mtx_.
+    if (kv_) {
+        try {
+            std::lock_guard<std::mutex> persist_lk(legacy_sink_persist_mu_);
+            const auto snap = legacy_sink_executor_->snapshot();
+            if (snap.change_gen != legacy_sink_last_persisted_gen_) {
+                // TEST-ONLY (#4783 Gate 8 re-review): fires here, with the lock
+                // above already held, after the decision to write but before
+                // the write itself - see legacy_sink_persist_race_hook_for_test_'s
+                // own doc comment for the exact race this reproduces.
+                if (legacy_sink_persist_race_hook_for_test_)
+                    legacy_sink_persist_race_hook_for_test_();
+                if (persist_legacy_sink_loss_ledger(kv_, snap)) {
+                    legacy_sink_last_persisted_gen_ = snap.change_gen;
+                } else {
+                    spdlog::warn("Guardian: failed to persist the legacy-sink loss ledger "
+                                "(change_gen={}) - will retry on the next heartbeat kick",
+                                snap.change_gen);
+                }
+            }
+        } catch (...) {
+            // Same firewall posture as the repair-dispatch try/catch above.
+        }
+    }
+}
+
+std::uint64_t GuardianEngine::legacy_sink_events_lost() const {
+    // No mtx_: legacy_sink_executor_ is set once at construction (never reset in
+    // production - set_legacy_sink_max_events_for_test() is test-only and runs
+    // strictly before start_local()) and guards this counter with its own internal
+    // lock, same no-mtx_ rationale as legacy_sink_executor_for_test() above.
+    return legacy_sink_executor_->stats().events_lost;
+}
+
+std::uint64_t GuardianEngine::legacy_sink_gap_rules() const {
+    return static_cast<std::uint64_t>(legacy_sink_executor_->stats().gap_rules);
+}
+
+std::uint64_t GuardianEngine::legacy_sink_dropped_unwired() const {
+    // No mtx_: legacy_sink_dropped_unwired_ is a plain atomic member, incremented
+    // directly by emit_guard_event() with no lock - same no-mtx_ rationale as
+    // legacy_sink_events_lost() above, one step simpler since there is no executor
+    // indirection to cross here.
+    return legacy_sink_dropped_unwired_.load();
+}
+
+void GuardianEngine::set_legacy_sink_max_events_for_test(std::size_t max_events) {
+    assert(!started_ &&
+           "set_legacy_sink_max_events_for_test: must be called before start_local()");
+    GuardianLegacySinkExecutor::Config cfg;
+    cfg.max_events = max_events;
+    legacy_sink_executor_ = std::make_unique<GuardianLegacySinkExecutor>(cfg);
+}
+
+// #4783 TEST-ONLY seams (see guardian_engine.hpp's own doc comments). None of these
+// take mtx_: legacy_sink_executor_ is set once at construction and never reset in
+// production (set_legacy_sink_max_events_for_test() above is the one exception, and
+// it is itself test-only, asserted to run before start_local()), and every method
+// they delegate to is the executor's OWN thread-safe surface — no GuardianEngine-
+// owned state is touched, so there is nothing here for mtx_ to guard.
+GuardianLegacySinkExecutor& GuardianEngine::legacy_sink_executor_for_test() const {
+    return *legacy_sink_executor_;
+}
+
+bool GuardianEngine::flush_legacy_sink_for_test(std::chrono::milliseconds timeout) const {
+    return legacy_sink_executor_->wait_idle_for_test(timeout);
+}
+
+bool GuardianEngine::retire_legacy_sink_workers_for_test(std::chrono::milliseconds timeout) const {
+    return legacy_sink_executor_->wait_workers_retired_for_test(timeout);
 }
 
 void GuardianEngine::stop_all_guards_locked() {
@@ -2231,16 +2694,23 @@ std::size_t GuardianEngine::active_io_workers() const {
     // (guardian_outbox_send_executor.hpp) - its `send` callback captures AgentImpl
     // state directly and is safe ONLY because this sum is what keeps main.cpp /
     // service_win.cpp from tearing that state down while a send is still detached
-    // and running (see guardian_outbox_drain_worker.hpp's class doc). All three
-    // must be summed here: this is the orphan-exit contract's sole source of truth
-    // (hard_exit.hpp / guardian_io_executor.hpp) - main.cpp/service_win.cpp refuse
-    // normal C++ teardown while this is nonzero, and a source left out of the sum
-    // would let a detached worker survive teardown undetected.
+    // and running (see guardian_outbox_drain_worker.hpp's class doc). #4783 adds a
+    // FOURTH: legacy_sink_executor_'s own detached sender for the legacy IGuard
+    // producers' events - always live (constructed unconditionally, not gated on
+    // prefer_spark_), and its injected `send` callback reaches AgentImpl state the
+    // exact same way (guardian_sink_stream_ + stream_write_mu_ via emit_guardian_
+    // event()). All FOUR must be summed here: this is the orphan-exit contract's
+    // sole source of truth (hard_exit.hpp / guardian_io_executor.hpp) -
+    // main.cpp/service_win.cpp refuse normal C++ teardown while this is nonzero, and
+    // a source left out of the sum would let a detached worker survive teardown
+    // undetected. legacy_sink_executor_->active_worker_count() takes only its OWN
+    // internal lock (never mtx_), so this stays mtx_ -> executor-mu, non-invertible.
     std::size_t n = spark_reader_ ? spark_reader_->active_io_workers() : 0;
     if (spark_runtime_)
         n += spark_runtime_->active_backend_op_workers();
     if (spark_drain_worker_)
         n += spark_drain_worker_->active_send_workers();
+    n += legacy_sink_executor_->active_worker_count();
     return n;
 }
 

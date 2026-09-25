@@ -536,6 +536,13 @@ Get a single group's details including its current members.
 }
 ```
 
+The group row is read through `ManagementGroupStore::get_group_checked` and its
+members through `get_members_checked` (#1762). A store-not-open /
+pool-acquire-timeout / query-error degrade on EITHER read returns `503` (A4
+envelope, `retry_after_ms: 2000`) rather than a `404` or an authoritative empty
+`members: []`; `404` now always means the group does not exist. The MCP twin
+`get_management_group` fails the same way.
+
 ---
 
 #### `PUT /api/v1/management-groups/{id}`
@@ -1932,7 +1939,11 @@ are rejected. Response:
 
 `crl_republished: false` means the revocation stands (the agent is refused on its
 next gRPC call) but the public CRL could not be rebuilt — external CRL consumers
-will not see it until the next successful publish. Errors: `400` (missing/invalid
+will not see it until the next successful publish. The server retries on its own:
+the leader's freshness pass republishes on its next 15-second tick once the cause
+clears (up to about 5 minutes later if that attempt fails too). Repeating the
+`POST` is not a retry — it returns `404` because the serial is already revoked.
+Errors: `400` (missing/invalid
 serial, unknown field, bad JSON), `403` (missing `Security:Delete`), `404` (serial
 not found or already revoked), `413` (body too large), `503` (CA unavailable).
 
@@ -3503,7 +3514,7 @@ Create a new policy fragment from YAML.
 
 Delete a policy fragment.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Delete`
 
 **Response:**
 
@@ -3658,7 +3669,7 @@ Get policy detail including compliance summary.
 
 Delete a policy and all associated compliance data.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Delete`
 
 **Response:**
 
@@ -3680,7 +3691,7 @@ Enable a previously disabled policy.
 
 ```json
 {
-  "status": "enabled"
+  "status": "ok"
 }
 ```
 
@@ -3700,7 +3711,7 @@ Disable a policy, pausing compliance checks.
 
 ```json
 {
-  "status": "disabled"
+  "status": "ok"
 }
 ```
 
@@ -3714,13 +3725,13 @@ included in the body.
 
 Invalidate agent-side compliance cache for a specific policy. Resets all agent statuses to `pending`, forcing re-evaluation.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Execute`
 
 **Response:**
 
 ```json
 {
-  "status": "invalidated",
+  "status": "ok",
   "agents_invalidated": 42
 }
 ```
@@ -3734,13 +3745,13 @@ retry, internal error string never included in the body.
 
 Invalidate compliance cache for all policies across all agents.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Execute`
 
 **Response:**
 
 ```json
 {
-  "status": "invalidated",
+  "status": "ok",
   "total_invalidated": 210
 }
 ```
@@ -6034,7 +6045,9 @@ re-eval, unchanged.
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
 | 500 | `RESULT_SET_GATE_UNCONFIGURED` — the server's dispatch-visibility gate is not wired. Fails **closed**: nothing is dispatched, and the refusal is audited. An operator seeing this has a server misconfiguration, not an authorization problem |
+| 500 | `RESULT_SET_STORE_FAULT_AFTER_DISPATCH` — a real command already dispatched to agents, but the store fault persisting the pending result-set row afterward (#4306; previously `400`, corrected — this is a server fault, not a client error, once a command has already been sent). Do **not** re-send; poll `GET /api/v1/executions/{id}` for the dispatched command's outcome instead |
 | 503 | `RESULT_SET_NO_AGENTS` — no agents were reached in the target scope. Deliberately indistinguishable from "every resolved target was outside your reach": a distinct status would disclose devices the caller may not see |
+| 503 | `RESULT_SET_STORE_UNAVAILABLE` (pre-dispatch) — the per-owner quota could not be verified before dispatch (Postgres degraded, #4306). Nothing was dispatched; safe to retry (`Retry-After` header present) |
 | 503 | `RESULT_SET_DISPATCH_UNAVAILABLE` / `RESULT_SET_DISPATCH_FAILED` — dispatch not wired, or the dispatch itself raised |
 
 #### `GET /api/v1/inventory/{agent_id}/{plugin}`
@@ -6281,8 +6294,9 @@ List the caller's owned result sets, most recently used first (`last_used_at` th
 | Status | Reason |
 |---|---|
 | 403 | Service-scoped API token — result-set listing cannot be confined to the token's service |
+| 503 | `RESULT_SET_STORE_UNAVAILABLE` — a store-level read failure while listing |
 
-A store-level read failure is not surfaced as an error on this route — `ResultSetStore::list_by_owner` deliberately returns a plain (possibly empty) container rather than `std::expected` (ADR-0036 "not yet widened" class), so a degraded store answers `200` with an empty `result_sets` array, not a `503`.
+A store-level read failure now answers `503 RESULT_SET_STORE_UNAVAILABLE` (fail-closed, #4306) rather than a silent empty `200` array.
 
 #### `POST /api/v1/result-sets`
 
@@ -8085,7 +8099,7 @@ Per-device DEX read model — the machine-readable equivalent of the **DEX** len
 - **Permission:** `GuaranteedState:Read`, scoped to the device's management group (a REST worker is held to the same per-device scope as the dashboard lens).
 - **Path parameter:** `id` — the agent's `agent_id`.
 - **Query parameters:** `window` — one of `24h` / `7d` / `30d` / `all` (default `7d`); an off-enum value is rejected with `400`.
-- **Response:** `data` object `{agent_id, window, score, signals[]}` — `score` is the device's DEX experience score (0–100; `-1` = n/a, treat as "no data", **not** a low score); `signals[]` each `{obs_type, count, distinct_devices, last_seen}` for the window. An unknown `agent_id` returns `200` with `score:-1` and empty `signals` (the scope gate, not existence, decides access). `403` when the device is outside the operator's management scope. `503` when the store is unavailable, **or** `503` with header `Sec-Audit-Failed: true` when the audit row cannot persist (see Audit below).
+- **Response:** `data` object `{agent_id, window, score, signals[]}` — `score` is the device's DEX experience score (0–100; `-1` = n/a, treat as "no data", **not** a low score); `signals[]` each `{obs_type, count, distinct_devices, last_seen}` for the window. An unknown `agent_id` returns `200` with `score:-1` and empty `signals` (the scope gate, not existence, decides access). `403` when the device is outside the operator's management scope. `503` when the store is unavailable, `503` with header `Sec-Audit-Failed: true` when the audit row cannot persist (see Audit below), **or** `503` (`retry_after_ms: 2000`, no `Sec-Audit-Failed`) when the underlying signal-summary read **degraded** (store closed / pool-acquire timeout / query error, #4855) — a degrade is a retryable error, never a `200` with a fabricated `score:0`/`100` and no signals. This is a NAMED exception to the general "#2659 DEX reads degrade to empty" posture described in [guaranteed-state.md](guaranteed-state.md) — this one read fails closed instead.
 - **Headers:** `X-Correlation-Id` is echoed on **every** response path (matches `/api/v1/events`); the value also appears as `correlation_id` in error bodies.
 - **Audit:** emits `dex.device.view` (`target_type=Agent`, `target_id=<agent_id>`, `detail` carries `cid=<correlation_id>`) **before** the behavioral PII is served (audit-on-open). **Fail-closed:** if the audit row cannot persist (audit DB locked/full/corrupt), the endpoint returns `503` + `Sec-Audit-Failed: true` and serves **no** device data — serving audited PII while the evidence row is known-lost is exactly what audit-on-open prevents (SOC 2 CC7.2 / works-council).
 
@@ -8166,7 +8180,7 @@ Fleet DEX overview — the `/dex` landing page's fleet summary: per-device exper
 
 - **Permission:** `GuaranteedState:Read`. The `top_devices[]` array is confined to the caller's management-group scope (ADR-0017 World A), exactly like `/fragments/dex/overview`; every other field remains a fleet-wide aggregate.
 - **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
-- **Response:** `data` object `{window, overall_experience, device_score, app_score, network_score, great, fair, poor, coverage_monitored, coverage_total, crash_free_pct, windows_reporting, crashes_per_1k_device_days, total_crashes, devices_impacted, total_online, active_signal_types, health_score, os_reporting_count, segments[], crashes_by_day[], top_apps[], top_devices[], os_table[]}`. `403` — a service-scoped API token is denied outright: `top_devices[]` has no single agent to confine the token's own service-tag scope against (a separate axis from the management-group confinement above).
+- **Response:** `data` object `{window, overall_experience, device_score, app_score, network_score, great, fair, poor, unscored, coverage_monitored, coverage_total, crash_free_pct, windows_reporting, crashes_per_1k_device_days, total_crashes, devices_impacted, total_online, active_signal_types, health_score, os_reporting_count, segments[], crashes_by_day[], top_apps[], top_devices[], os_table[]}`. `unscored` (#4855) counts connected devices whose per-device score could not be computed (no store, or a degraded per-device signal-summary read) — a non-zero value means `great`/`fair`/`poor`/`overall_experience` cover fewer devices than are actually connected, not a healthier fleet than reported. `403` — a service-scoped API token is denied outright: `top_devices[]` has no single agent to confine the token's own service-tag scope against (a separate axis from the management-group confinement above).
 - **Audit:** emits **`dex.overview.view`** before serving (fail-closed 503 + `Sec-Audit-Failed: true` on a dropped row) — same "REST adds more rigor than its own fragment" rationale as `GET /api/v1/dex/app` above (the dashboard fragment audits only the service-scoped denial, not an ordinary success).
 
 #### `POST /api/v1/dex/devices/{id}/live`
@@ -10258,7 +10272,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices). A service-scoped API token is denied outright (`kPermissionDenied`) — found by this branch's own governance review (PR #3156); the same DIFFERENT-axis gap as its REST twin `GET /api/v1/dex/perf/group`. This tool's own interim deny call was retired as provably dead code (guardian-confinement-2298 PR 3 "the flip", #3290 Phase 2 bucket 1a): the shared `perm_fn` (`AuthRoutes::require_permission`) already denies any service-scoped token outright for `(GuaranteedState, Read)` before this tool-specific branch is reached, since the service-scope global-safe allow-list is seeded empty. That denial is audited under the generic `auth.permission_required` verb, not `dex.perf.group.view` (REST's twin route denies BEFORE `perm_fn` via its own `deny_fleet_wide_service_scoped` call, so REST's deny IS recorded under `dex.perf.group.view`). |
 | `get_dex_tag_app_perf` | The device-model tag-value cohort twin of `get_dex_group_app_perf` — the MCP twin of `GET /api/v1/dex/perf/tag`. Required `value` and `app`; optional `key` (default `"model"`, pattern `^[A-Za-z0-9_.:-]{1,64}$`) and `version`. An absent `key` defaults; a PRESENT `key` (including `""`) is validated like REST's `has_param`, so `key=""` `400`s identically on both transports rather than MCP silently substituting the default. Same sub-floor suppression, same service-scoped denial (`kPermissionDenied`) and the same retired-interim-deny-call / generic-`auth.permission_required`-verb posture as `get_dex_group_app_perf` above — not `dex.perf.tag.view` (REST's twin denies before `perm_fn` and IS recorded under that dedicated verb). |
 | `compare_app_perf_versions` | Cohort-paired before/after comparison (the `/auto` VERIFY stage). Parameters `group`, `app`, `baseline`, `candidate` (all required) + `window` (integer days, default 7). Returns the same identity-free aggregate shape as `GET /api/v1/dex/perf/compare`. A successful call is **recorded under the generic `mcp.compare_app_perf_versions` tool-call audit** (not the REST `dex.app_perf.compare` verb) — but a service-scoped API token is denied outright (`kPermissionDenied`, found by this branch's own governance review, PR #3156) and that denial IS recorded under `dex.app_perf.compare`, matching its REST twin's deny-path verb rather than the generic one. |
-| `get_dex_device_score` (#4035) | Per-device DEX read model — the MCP twin of `GET /api/v1/dex/devices/{id}`. Score (-1 = unavailable) + this device's own signal summary. Ancestor-aware SCOPED `GuaranteedState:Read` gate (like `query_software_licenses`); every call emits `dex.device.view` (set-and-proceed, `audit_persisted:false` on a dropped row — MCP has no `Sec-Audit-Failed` header, unlike the REST twin's fail-closed 503). |
+| `get_dex_device_score` (#4035) | Per-device DEX read model — the MCP twin of `GET /api/v1/dex/devices/{id}`. Score (-1 = no store configured) + this device's own signal summary. Ancestor-aware SCOPED `GuaranteedState:Read` gate (like `query_software_licenses`); every call emits `dex.device.view` (set-and-proceed, `audit_persisted:false` on a dropped row — MCP has no `Sec-Audit-Failed` header, unlike the REST twin's fail-closed 503). **#4855:** a DEGRADED signal-summary read (store closed / pool-acquire timeout / query error) returns a retryable `kInternalError` (`retry_after_ms`) instead of a result — never conflate this with the `-1` "no store" case above; the `dex.device.view` behavioral-PII audit row still records `success` (the access happened), while the separate `mcp.get_dex_device_score` tool-invocation audit flips to `failure`. |
 | `get_dex_device_app_perf` (#4035) | Per-device retained daily app-perf series — the MCP twin of `GET /api/v1/dex/devices/{id}/app-perf` (closes the gap this section previously documented as "no MCP twin"). Optional `app` narrows to one app. Same SCOPED gate + `dex.device.app_perf.view` audit posture as `get_dex_device_score`. |
 | `get_dex_app` (#4035) | App blast-radius drill — the MCP twin of `GET /api/v1/dex/app`. Required `name`, optional `window`. `devices[]` is confined to the caller's management-group scope (ADR-0017 World A), same as the REST twin. `deny_fleet_wide_service_scoped` (the separate service-scoped-token axis) + fail-closed `try_persist_audit` under `dex.app.view` (`audit_persisted:false` on a dropped row), matching the REST twin's posture even though the dashboard fragment only audits the denial. |
 | `list_dex_apps` (#4035) | App-centric stability list — the MCP twin of `GET /api/v1/dex/apps`. No per-agent identity — not audited. |
