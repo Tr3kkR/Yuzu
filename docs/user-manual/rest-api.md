@@ -2577,8 +2577,8 @@ through this route, even to hand it to someone else first); `409` —
 (`{name}=="Administrator"` only) removing this grant would leave the fleet
 with zero **authenticatable** Administrators — the guard counts a grant only
 when its `principal_id` names an active `auth.users` row, so a grant naming a
-nonexistent, deactivated, or (soft-)deleted account is never counted as a
-surviving administrator; `503` — the RBAC store is unavailable, or (on an
+nonexistent, deactivated, soft-deleted, or group-held (not creatable via this
+surface) principal is never counted as a surviving administrator; `503` — the RBAC store is unavailable, or (on an
 otherwise-successful unassignment) its audit row could not persist — treat
 the removal as unconfirmed and reconcile via a read. Audited
 `rbac.role.unassigned`.
