@@ -400,7 +400,7 @@ void RegistryGuard::run() try {
                                  log_id_token(cfg_.rule_id), d.remediation_action,
                                  log_key_token(cfg_.hive), log_key_token(cfg_.key),
                                  log_key_token(cfg_.value_name), log_key_token(detected),
-                                 cfg_.value_type, target.get() ? "" : ", key absent");
+                                 log_key_token(cfg_.value_type), target.get() ? "" : ", key absent");
             } else {
                 // Backoff window or Bounded give-up: drift detected + reported (this
                 // event is the alert) but the fix is withheld this cycle.
@@ -522,7 +522,8 @@ void RegistryGuard::run() try {
 
     spdlog::info("Guardian RegistryGuard[{}]: watching {}\\{} [{}] (expect {}={}) [resilient]",
                  log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key),
-                 cfg_.value_type, log_key_token(cfg_.value_name), log_key_token(cfg_.expected));
+                 log_key_token(cfg_.value_type), log_key_token(cfg_.value_name),
+                 log_key_token(cfg_.expected));
 
     reconcile(); // initial compare + initial arm
 

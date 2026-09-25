@@ -79,6 +79,22 @@ approach (tracing local-variable construction is out of scope), not a scanner
 bug -- see _selfcheck()'s degrade_msg-shaped case, which asserts the scanner
 does NOT flag it and documents why that is expected.
 
+SECOND KNOWN LIMITATION (Phase-3 governance quality-engineer finding,
+2026-09-25, empirically confirmed and left open rather than closed here):
+`parse_call()` requires the statement's first token after `(` to be a `"`
+string literal, so `spdlog::warn(fmt::format("Guardian: rule '{}' failed",
+rule_id));` -- a raw, wholly unwrapped rule_id, zero token wrapping anywhere
+in the statement -- makes `parse_call` return `None` and the whole statement
+is silently skipped. No current call site in this tree uses this idiom
+(verified by grep at authoring time), but `fmt::format`-wrapped-then-passed
+spdlog calls are a standard idiom industry-wide, so this is a real gap in
+the scanner's coverage claim above, not a hypothetical one. Extending
+`parse_call` to descend into a sole `fmt::format(...)`/`fmt::vformat(...)`
+wrapping call is tracked as a follow-up rather than fixed in this same
+governance pass (Test 1/2 in Gate 7: no live instance exists today, so this
+is scanner-hardening against a future regression class, not a fix for a
+current forgery sink).
+
 SAFE FORMATTERS. A call site that passes a raw-looking argument to a function
 in SAFE_FORMATTER_CALLS below -- not to spdlog:: directly -- is not flagged;
 the wrap happens INSIDE the formatter:
@@ -154,10 +170,13 @@ class Pattern:
     substring (case-sensitive) against the concatenated format-string
     literal; every `{}` placeholder whose span overlaps a match is marked
     sensitive. `requires_prefix`, if set, additionally requires the WHOLE
-    literal to start with that substring (used for exactly one pattern --
-    see its own comment). `excludes_suffix`, if set, skips a match whose
-    span is IMMEDIATELY followed by that substring (used for exactly one
-    pattern -- see its own comment)."""
+    literal to start with that substring (used to scope a pattern to one
+    call-site family, e.g. RegistryGuard-only). `excludes_suffix`, if set,
+    skips a match whose span is IMMEDIATELY followed by that substring --
+    infrastructure kept for a future scoping need; no current pattern uses
+    it (the one prior use, on the RegistryGuard bracket pattern, was removed
+    when the field it carved out for -- value_type -- was itself found to
+    need wrapping, see that pattern's own comment)."""
 
     __slots__ = ("name", "text", "requires_prefix", "excludes_suffix")
 
@@ -248,19 +267,27 @@ SENSITIVE_PATTERNS = [
     # printed) -- both patterns' hits on the shared "key" placeholder are
     # redundant-but-harmless, not a bug.
     Pattern("hive\\key (registry)", "{}\\\\{}"),
-    # excludes_suffix: guard_registry.cpp's ONE "watching {}\\{} [{}] (expect
-    # {}={})" summary line uses this exact bracket position for value_TYPE,
-    # not value_name -- verified by reading its argument list (rule_id, hive,
-    # key, value_type, value_name, expected) against its placeholder order
-    # (rule_id, hive, key, [bracket], "expect X=", "=Y"): the bracket's
-    # argument is cfg_.value_type (a closed-set/compile-time-literal string,
-    # correctly left unwrapped per b8303f02a's own commit message), and
-    # cfg_.value_name is correctly wrapped one placeholder later, in the
-    # "expect {}=" slot. Every OTHER hive\key[...] site in this file (three of
-    # them) puts value_name in the bracket and is immediately followed by
-    # something other than " (expect " (" {} ->", " (detected=", " detected=")
-    # -- this exclusion is that one line's exact, verified shape, not a guess.
-    Pattern("key[value_name] (registry)", "\\\\{} [{}]", excludes_suffix=" (expect "),
+    # guard_registry.cpp's ONE "watching {}\\{} [{}] (expect {}={})" summary
+    # line uses this exact bracket position for value_TYPE, not value_name
+    # -- verified by reading its argument list (rule_id, hive, key,
+    # value_type, value_name, expected) against its placeholder order
+    # (rule_id, hive, key, [bracket], "expect X=", "=Y"). Previously excluded
+    # via excludes_suffix=" (expect " on the theory that value_type was a
+    # closed-set/compile-time-literal string safe to leave raw -- the #4665
+    # Phase-3 governance security-guardian review (2026-09-25) traced it
+    # empirically to `param("value_type")`, fully attacker-authored free text
+    # on the agent side, validated only indirectly by the SERVER's
+    # `derive_rule_spec`/`validate_assertion_params` before a structured rule
+    # is ever pushed -- NOT a compile-time enum. `value_type` is now wrapped
+    # at both its call sites (guard_registry.cpp:403,525) and the exclusion
+    # is removed so this pattern checks that bracket like every other one.
+    Pattern("key[value_name] (registry)", "\\\\{} [{}]"),
+    # guard_registry.cpp's "(detected={}, type={}{})" enforce-FAILED line's
+    # OWN value_type placeholder -- scoped to RegistryGuard statements only
+    # (guardian_spark_timing.cpp's unrelated "type={}" placeholder in its
+    # frozen #4606 arm-committed evidence line is a closed-set Spark
+    # mechanism-type enum, not operator input, and must NOT be flagged).
+    Pattern("type={}", "type={}", requires_prefix="Guardian RegistryGuard["),
     # Guardian event_id, both call conventions seen in the tree --
     # guaranteed_state_store.cpp/guardian_ingest.cpp use "event_id={}";
     # guardian_outbox_send_executor.hpp uses "event_id {}" (a space, not '=').
@@ -269,11 +296,24 @@ SENSITIVE_PATTERNS = [
     # and make_event_id() (guardian_spark_runtime.cpp) concatenates
     # `agent_id + "-" + boot_nonce_ + "-" + rule_id + ...` -- rule_id is
     # charset-valid past apply_rules()'s #4665 pre-validation, but agent_id's
-    # own neutralisation is explicitly OUT OF #4665's scope (#489, per
-    # 3784a6f21's commit message), so the composed event_id is not provably
-    # safe to print raw.
+    # own neutralisation was NOT covered by this sweep's own event_id wrap,
+    # so the composed event_id is not provably safe to print raw on that
+    # basis alone. (3784a6f21's commit message deferred agent_id itself to
+    # "#489's scope" -- re-checked at Phase-3 governance and found NOT to
+    # hold: #489 is a REST audit `detail`/`target_id` sanitizer-promotion
+    # sweep in rest_api_v1.cpp, and neither names agent_id nor this file's
+    # spdlog:: sites. agent_id is now wrapped at its 3 real raw sites below.)
     Pattern("event_id={}", "event_id={}"),
     Pattern("event_id {}", "event_id {}"),
+    # Guardian agent_id -- client-supplied at Register (length-checked only,
+    # agent_service_impl.cpp), charset-unrestricted, so the same CWE-117
+    # forgery threat model as rule_id/event_id applies. guaranteed_state_store
+    # .cpp's upsert_rule_status and both insert_event_classified/insert_events
+    # observation-projection-failure logs print it unquoted as "agent_id={}"
+    # alongside an already-wrapped rule_id/event_id on the SAME line -- found
+    # by Phase-3 governance cpp-safety review (2026-09-25) as a sibling-field
+    # miss the original #4665 sweep left open under a miscited #489 deferral.
+    Pattern("agent_id={}", "agent_id={}"),
     # Unquoted key=value path/service forms in the "guard armed" summary lines
     # -- guardian_engine.cpp.
     Pattern("path={}", "path={}"),
@@ -731,16 +771,18 @@ def _selfcheck() -> None:
         # constructed fixed literal as the ternary's un-wrapped branch, not a
         # bare quoted string -- must be recognised as safe too.
         'spdlog::critical("Guardian spark #4508: a wedge candidate survived a withdrawal of rule \'{}\' - the sweep was skipped or reordered", rule_id ? ::yuzu::log_id_token(*rule_id) : std::string{"<all>"});',
-        # the REAL guard_registry.cpp:523 shape: the bracket holds value_type
-        # (correctly raw, a closed-set string), value_name AND expected are
-        # both correctly wrapped in "(expect {}={})" -- the excludes_suffix
-        # case (for value_type's bracket) composed with the new
-        # "(expect {}={})" pattern (for value_name+expected).
-        'spdlog::info("Guardian RegistryGuard[{}]: watching {}\\\\{} [{}] (expect {}={}) [resilient]", log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key), cfg_.value_type, log_key_token(cfg_.value_name), log_key_token(cfg_.expected));',
+        # the REAL guard_registry.cpp:523-525 shape: hive, key, value_type,
+        # value_name AND expected are now ALL wrapped -- value_type's bracket
+        # was the one site the #4665 Phase-3 governance run's security-guardian
+        # pass found still raw (the "closed-set string" theory it was excluded
+        # under was wrong; see the pattern's own comment).
+        'spdlog::info("Guardian RegistryGuard[{}]: watching {}\\\\{} [{}] (expect {}={}) [resilient]", log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_type), log_key_token(cfg_.value_name), log_key_token(cfg_.expected));',
         # the REAL guard_registry.cpp:392/399/407 success/failure shapes,
         # fully fixed: detected AND expected both wrapped.
         'spdlog::info("Guardian RegistryGuard[{}]: {} {}\\\\{} [{}] {} -> {} ({}us)", log_id_token(cfg_.rule_id), d.remediation_action, log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_name), log_key_token(detected), log_key_token(cfg_.expected), d.remediation_latency_us);',
-        'spdlog::warn("Guardian RegistryGuard[{}]: enforce {} FAILED for {}\\\\{} [{}] (detected={}, type={}{})", log_id_token(cfg_.rule_id), d.remediation_action, log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_name), log_key_token(detected), cfg_.value_type, target.get() ? "" : ", key absent");',
+        # value_type now wrapped too (was the raw sibling this fixture existed
+        # to document before the #4665 Phase-3 fix).
+        'spdlog::warn("Guardian RegistryGuard[{}]: enforce {} FAILED for {}\\\\{} [{}] (detected={}, type={}{})", log_id_token(cfg_.rule_id), d.remediation_action, log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_name), log_key_token(detected), log_key_token(cfg_.value_type), target.get() ? "" : ", key absent");',
     ]
     for src in must_not:
         if flagged(src):
@@ -769,10 +811,11 @@ def _selfcheck() -> None:
         # detected/expected left raw -- isolates the NEW patterns from the
         # pre-existing value_name one (must still be flagged on their own).
         'spdlog::info("Guardian RegistryGuard[{}]: {} {}\\\\{} [{}] {} -> {} ({}us)", log_id_token(cfg_.rule_id), d.remediation_action, log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_name), detected, cfg_.expected, d.remediation_latency_us);',
-        # the "(expect {}={})" line with only `expected` left raw (value_name
-        # wrapped) -- must still be flagged; the pattern spans both
-        # placeholders precisely so this single-slot mutation isn't missed.
-        'spdlog::info("Guardian RegistryGuard[{}]: watching {}\\\\{} [{}] (expect {}={}) [resilient]", log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key), cfg_.value_type, log_key_token(cfg_.value_name), cfg_.expected);',
+        # the "(expect {}={})" line with only `expected` left raw (value_type
+        # and value_name both wrapped) -- must still be flagged; the pattern
+        # spans both placeholders precisely so this single-slot mutation
+        # isn't missed.
+        'spdlog::info("Guardian RegistryGuard[{}]: watching {}\\\\{} [{}] (expect {}={}) [resilient]", log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_type), log_key_token(cfg_.value_name), cfg_.expected);',
         # intra-argument mutations (CDX-03/K6): a wrap call's TEXT appears
         # somewhere in the argument slot, but the argument as a WHOLE is not
         # wrapped -- the exact two constructions the adversarial review used

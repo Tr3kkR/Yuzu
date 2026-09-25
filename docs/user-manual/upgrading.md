@@ -2800,20 +2800,42 @@ following the documented contract are unaffected. This only changes behaviour fo
 relying on the previously-permissive accept-anything-non-empty behaviour to create a `rule_id`
 outside `[A-Za-z0-9._-]+` or longer than 256 bytes.
 
-**What to do:** **enforcement at the server is create-only — but the upgraded agent revalidates
-every rule_id on *every* push it receives, not just newly-created ones.** An existing rule whose
-`rule_id` predates this release and doesn't conform to the charset is never torn down and the
-prior enforcement it already established survives on the agent — but the server keeps including
-that row in every future policy push to every agent in its scope, and an upgraded agent rejects
-the **whole push** the moment any one rule in it fails validation (this is deliberate: a partial
-apply that silently dropped just the bad rule while reporting success was the worse failure mode).
-In practice this means: no *new* policy — for any rule, not just the non-conforming one — reaches
-agents in that scope until the offending row is removed. **REST `DELETE
-/guaranteed-state/rules/{rule_id}` cannot remove it** — the route only matches ids of the shape
-`[A-Za-z0-9._-]+`, which a non-conforming id by definition isn't. Use MCP `delete_guardian_rule`
-(no such restriction) or a direct database delete. If you have automation that might have created
-a non-conforming `rule_id` before this release, find and remove it with MCP before upgrading, or
-be ready to do so immediately after if a push starts failing.
+**What to do:** enforcement at the server is create-only — an existing rule whose `rule_id`
+predates this release and doesn't conform to the charset is never torn down, and the prior
+enforcement it already established survives on the agent unchanged. The server-side push builder
+now **excludes** a non-conforming legacy row from every push it builds (logged at `error` with a
+sampled rate limit as `Guardian push: rule ... has a rule_id that fails the .../256-byte charset
+check (#4665) — excluding it from this push`, and counted in
+`yuzu_guardian_push_rule_excluded_total{reason="invalid_rule_id"}`), the same way an
+over-depth `spec_json` is already excluded — so a single non-conforming legacy rule no longer
+blocks delivery of every OTHER rule to agents in its scope. The practical effect is narrower than
+earlier releases of this note stated: only the non-conforming rule itself stops receiving updates
+(it is frozen at its last-applied state on the agent); everything else in scope keeps updating
+normally. The separately-documented agent-side behaviour — `GuardianEngine::apply_rules()`
+rejecting an entire incoming push if any one rule in it fails validation — still exists as
+defense-in-depth and still matters for any push NOT built by `build_agent_push` (there is none in
+this release, but the invariant is agent-side, not push-builder-side, so don't rely on the server
+filter alone if you're driving pushes through a different path).
+
+**Finding a non-conforming legacy `rule_id` before you upgrade:** `GET
+/api/v1/guaranteed-state/rules` returns every rule regardless of its `rule_id`'s shape; filter the
+response for any `rule_id` that doesn't match `^[A-Za-z0-9._-]{1,256}$` — that's the same predicate
+the server now enforces at creation. Removing it is optional post-upgrade (the exclusion above
+means it no longer blocks anything else), but you'll want to know it's there if you're relying on
+that rule's own enforcement.
+
+**Removing a non-conforming `rule_id`:** the two delete surfaces have DIFFERENT restrictions, not
+a simple REST-restricted/MCP-unrestricted split. REST `DELETE
+/guaranteed-state/rules/{rule_id}` routes on the same charset regex the create path now enforces
+(`[A-Za-z0-9._-]+`, no length bound), so it **can't** reach a `rule_id` containing a byte outside
+that charset, but it has no length cap of its own and so **can** reach one that's charset-clean but
+over 256 bytes (a shape only possible pre-#4665, when creation had no length bound either). MCP
+`delete_guardian_rule`'s own input schema caps at `maxLength: 256` with no charset `pattern`, so it
+has the exact opposite gap: it **can** reach a charset-violating id (any length up to 256), but
+**can't** reach one that's charset-clean and over 256 bytes — the request is rejected by schema
+validation before the handler's own logic ever runs. A `rule_id` that violates BOTH (wrong charset
+AND over-length) is reachable by neither REST nor MCP; fall back to a direct database delete
+(`guaranteed_state_store.guaranteed_state_rules`) for that case.
 
 ## Upgrade Order
 

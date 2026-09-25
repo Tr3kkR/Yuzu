@@ -1552,8 +1552,19 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 - Compensating control: the server-authored `Guardian T_server` line (neutralised on the server) is
   the authoritative half of the join; no shipped consumer reads agent-log lines; the operator manual
   (`docs/user-manual/server-admin.md`, Upgrade Notes) states which lines print ids as authored.
-- **CONFIRMED and FIXED, branch `feat/4665-log-injection-neutralisation` (`2ef5b8d3c`..`ebb6600db`,
-  10 commits; not yet merged to `dev` as of this entry).** `common/include/yuzu/log_token.hpp`
+- **CONFIRMED and FIXED, branch `feat/4665-log-injection-neutralisation` (starting `2ef5b8d3c`;
+  not yet merged to `dev` as of this entry).** The fix went through three further rounds after
+  its initial 10 commits (`2ef5b8d3c`..`ebb6600db`) landed: doc corrections (`a3388bf1a`), an
+  `/adversarial-review` (Kimi + Codex) fix round (`1ecfa6899`) that found and closed a real,
+  previously-unwrapped forgery sink in `guard_registry.cpp`'s registry assertion values
+  (`cfg_.expected`/`detected`, CDX-01/K5), and a full `/governance` 8-gate run afterward that
+  found and closed two more sibling-field misses (`guard_registry.cpp`'s `cfg_.value_type`,
+  `guaranteed_state_store.cpp`'s `agent_id`) plus a server-side push-builder gap: a legacy
+  non-conforming `rule_id` was excluded from `apply_rules()`'s validation reach but NOT from
+  `guardian_push_builder.cpp::build_agent_push`, so a single such row could wedge whole-push
+  delivery to every agent in its scope with no server-side signal — now filtered out at the
+  builder (`yuzu_guardian_push_rule_excluded_total{reason="invalid_rule_id"}`), matching the
+  existing depth-guard exclusion pattern. `common/include/yuzu/log_token.hpp`
   gained `log_key_token()` (a path/service-name/
   registry-key/free-text neutraliser for a `'...'`-quoted log fragment - preserves spaces and
   non-ASCII bytes, unlike the pre-existing `log_id_token()`) and `is_valid_rule_id()` (the shared

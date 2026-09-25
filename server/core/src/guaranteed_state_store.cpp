@@ -827,7 +827,7 @@ void upsert_rule_status(PGconn* conn, const std::string& agent_id, const std::st
         std::vector<std::string>{agent_id, rule_id, std::string(state), updated_at});
     if (res.status() != PGRES_COMMAND_OK)
         spdlog::warn("GuaranteedStateStore: status upsert failed for agent_id={} rule_id={}: {}",
-                     agent_id, log_id_token(rule_id), PQerrorMessage(conn));
+                     log_id_token(agent_id), log_id_token(rule_id), PQerrorMessage(conn));
 }
 
 } // namespace
@@ -930,7 +930,7 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                 observations_proj_failures_.fetch_add(1, std::memory_order_relaxed);
                 spdlog::error("GuaranteedStateStore: observation projection failed "
                               "(event kept, read-model row lost) event_id={} agent_id={}: {}",
-                              log_id_token(row.event_id), row.agent_id, pr.error());
+                              log_id_token(row.event_id), log_id_token(row.agent_id), pr.error());
                 pg::exec_params(conn, "ROLLBACK TO SAVEPOINT observation_projection", std::vector<std::string>{});
             } else {
                 pg::exec_params(conn, "RELEASE SAVEPOINT observation_projection", std::vector<std::string>{});
@@ -1037,7 +1037,7 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
                     observations_proj_failures_.fetch_add(1, std::memory_order_relaxed);
                     spdlog::error("GuaranteedStateStore: observation projection failed in batch "
                                   "(event kept) event_id={} agent_id={}: {}",
-                                  log_id_token(row.event_id), row.agent_id, pr.error());
+                                  log_id_token(row.event_id), log_id_token(row.agent_id), pr.error());
                     pg::exec_params(conn, "ROLLBACK TO SAVEPOINT observation_projection", std::vector<std::string>{});
                 } else {
                     pg::exec_params(conn, "RELEASE SAVEPOINT observation_projection", std::vector<std::string>{});
