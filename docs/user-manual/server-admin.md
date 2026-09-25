@@ -2467,6 +2467,8 @@ A nonzero result means that host's `installed_count` will report a higher number
 
 **Who this affects.** Any integration using a service-scoped API token to call this specific route. No legitimate use of a service-scoped token should have depended on this — the other 8 result-set routes have always denied this way, and the MCP twin (`create_result_set_from_inventory_query`) was never affected. There is no opt-out.
 
+**What to do.** Nothing for a correctly-built integration. If a service-scoped workflow did depend on this route, it needs a non-service-scoped credential going forward, same as the flip notes above; there is no per-route or per-deployment allow.
+
 ---
 
 ## Settings Page
