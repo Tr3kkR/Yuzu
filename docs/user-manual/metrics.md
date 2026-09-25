@@ -112,6 +112,19 @@ manually: alert on `yuzu_server_command_outbox_pending` growing without
 bound, or on `yuzu_server_command_outbox_deliver_retry_total` climbing
 steadily.
 
+### Postgres reachability metrics (HA WS-8)
+
+Each server replica runs a dedicated reachability probe (its own connection, not
+the pool) that feeds `/readyz`'s gating `pg_reachable` row — see
+`docs/user-manual/server-admin.md` "Health Endpoints". These metrics are that
+probe's view, per replica.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_pg_reachable` | gauge | `1` when this replica's probe reaches a **writable** primary (the `/readyz` `pg_reachable` row is ok), else `0` — unreachable, stale, not yet probed, or connected to a server that refuses writes (a standby, or `default_transaction_read_only` on). Set on each `/metrics` scrape. Alert: `YuzuServerPostgresUnreachable` (`== 0` for 2m). Zero on several replicas at once points at the database or the network path to it, not the replicas. |
+| `yuzu_server_pg_reachability_last_success_age_seconds` | gauge | Seconds since this replica's probe last succeeded. Healthy values stay under ~9 s (probe interval plus its deadlines; a multi-host DSN adds one 5 s connect deadline per silent host listed ahead of the one that answers, on each reconnect); `/readyz` reports `stale` past 15 s. Absent until the first success. |
+| `yuzu_server_pg_reachability_probe_failures_total` | counter | Probes that failed (connect or query error or timeout) or reached a server that refuses writes. Pre-seeded at 0. A single increment is a blip and does not change readiness; `/readyz` goes not-ready after two consecutive failures, or at once on a refused-writes answer. |
+
 ### Agent presence metrics (HA WS-5 slice 1)
 
 `OfflineEndpointStore` (schema `endpoint_state`) is the cross-replica agent

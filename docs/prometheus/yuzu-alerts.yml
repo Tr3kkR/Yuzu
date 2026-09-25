@@ -2065,18 +2065,51 @@ groups:
 
   # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
   # The server fails closed without PostgreSQL, so substrate health is
-  # service-affecting. NOTE ON TIMING: /readyz flips to 503 *immediately* on
-  # breaker-open (off yuzu_pg_connect_failed_total), so the load balancer
-  # drains the instance right away. These alerts carry `for:` windows and are
-  # for paging/escalation — they fire AFTER the LB has already reacted, not
-  # before. Metrics come from the pool's Observer feed.
+  # service-affecting. NOTE ON TIMING: /readyz goes 503 within seconds of this
+  # replica losing Postgres, off its dedicated reachability probe (HA WS-8,
+  # the `pg_reachable` row: 2 failed probes, a probe stuck >15s, or a server
+  # that refuses writes), so the load balancer drains the instance well before
+  # any alert here fires.
+  # These alerts carry `for:` windows and are for paging/escalation — they fire
+  # AFTER the LB has already reacted, not before. The pool metrics come from
+  # the pool's Observer feed; the reachability metrics from the probe.
   - name: yuzu-postgres
     rules:
+      - alert: YuzuServerPostgresUnreachable
+        # HA WS-8 (ADR-2002 §12): this replica's dedicated reachability probe
+        # has reported Postgres unreachable, stale, or read-only (a standby)
+        # for 2m. /readyz has been 503 for that whole window, so the LB has
+        # already taken this replica out of rotation. `for: 2m` rides out an
+        # ordinary Patroni failover (10-30s), during which EVERY replica is
+        # briefly red by design. Fired on several replicas at once, it is the
+        # database or the network path to it, not the replicas.
+        expr: |
+          yuzu_server_pg_reachable == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }} cannot reach a writable PostgreSQL primary (/readyz 503)"
+          description: >-
+            The dedicated Postgres reachability probe on {{ $labels.instance }}
+            has failed for over 2 minutes; /readyz reports not ready with a
+            `pg` reason (unreachable, stale, or read_only). Check the server log
+            for the "[readyz] Postgres not reachable" line (it carries the libpq
+            detail), the database, and the network or proxy path to it.
+            read_only means the probe reached a server that refuses writes: a
+            standby (check that the proxy routes to the current primary) or a
+            primary with default_transaction_read_only on (often a full disk on
+            managed Postgres). With a multi-host DSN (target_session_attrs=read-write)
+            libpq refuses read-only hosts itself, so a cluster with no writable
+            host shows as unreachable, with the reason in the log line.
+
       - alert: YuzuPgConnectFailing
-        # The connect-failure circuit breaker has armed — the database is
-        # unreachable. /readyz already reports not-ready off the same signal
-        # (LB eviction is immediate); this alert fires after for:2m of
-        # sustained failure to page/escalate, NOT to drive LB eviction.
+        # The pool's connect-failure breaker has armed — NEW pool connections
+        # are failing. This arms only when a pool connect is attempted, so it
+        # can lag (idle pooled connections are reused first) or stay quiet
+        # with no traffic; YuzuServerPostgresUnreachable above is the steady
+        # reachability signal. This alert fires after for:2m of sustained
+        # failure to page/escalate, NOT to drive LB eviction.
         expr: |
           rate(yuzu_pg_connect_failed_total[5m]) > 0
         for: 2m
