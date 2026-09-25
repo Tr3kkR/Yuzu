@@ -83,8 +83,9 @@ exhausted (`FATAL: sorry, too many clients already`).
 
 Yuzu restarts cleanly once Postgres is reachable — no Yuzu-side repair is
 needed, and **no auth data is lost by the outage itself**. Sessions are
-in-memory (see [Sessions](#sessions-are-in-memory-only)), so every operator
-must sign in again after the restart; that is expected, not damage.
+durable rows in Postgres (see [Sessions](#sessions-are-durable)), so an
+operator whose session did not reach its absolute lifetime or idle timeout
+during the outage does not need to sign in again after the restart.
 
 ### `auth` schema migration failure
 
@@ -221,20 +222,23 @@ Step 3 is the one people skip. It is the only cheap check that distinguishes
 "restored correctly" from "restored, and every MFA user will be locked out the
 moment they try to log in".
 
-## Sessions are in-memory only
+## Sessions are durable
 
-There is no sessions table. `AuthManager` holds sessions in memory
-(`sessions_`), so:
+Operator sessions are rows in the Postgres `session_store.sessions` table
+(`SessionStore`, HA WS-1/1a, ADR-2002 §4). `AuthManager`'s in-memory
+`sessions_` map is only a per-replica validate cache in front of those rows:
+on a cache miss the server re-reads the row and rebuilds the session from it.
+So:
 
-- **A server restart revokes every session, fleet-wide.** That is the fastest
-  emergency revocation there is, and it needs no database access.
-- Nothing about a session survives a crash, a restart, or a failover.
-- The old "verify persistence after Revoke sessions" procedure no longer
-  applies — there is nothing to verify and nothing that can resurrect a
-  revoked session.
+- **A server restart is NOT a revocation.** The restart empties the cache, and
+  the next request rebuilds each session from its row. The same holds for a
+  crash or a failover to another replica.
+- A row is removed only by an explicit revoke (sign-out, or the REST calls
+  below, which delete by token or by username) or by the reaper once the
+  session passes its absolute lifetime (8 hours). An idle-timed-out session
+  is refused on every replica, but its row stays until the reaper removes it.
 
-For targeted revocation while the server is running, use the REST surface
-rather than a restart:
+To revoke sessions, use the REST surface:
 
 ```bash
 # Revoke every session for one operator (admin).
@@ -246,8 +250,52 @@ curl -fsS -X DELETE https://yuzu.internal/api/v1/sessions/me \
      -H "Authorization: Bearer $TOKEN"
 ```
 
-API tokens are a separate credential class and are **not** revoked by either
-of those, nor by a restart — revoke them explicitly via the token endpoints.
+**Check that the revoke persisted.** Both calls delete the durable rows first,
+then clear this replica's cache. If the response body reports
+`db_persisted: false` (the audit row shows `result=partial` with
+`db_error=true`), only this replica's cache was cleared. The rows survive, and
+any replica that misses its cache, including this one after a restart, will
+rebuild those sessions from them. Retry the revoke once the database is
+healthy.
+
+API tokens are a separate credential class. The admin `?username=` call does
+**not** revoke them, and neither does a restart. `/sessions/me` ("Sign out
+everywhere") revokes the caller's API tokens as well as their sessions (check
+`api_tokens_db_persisted` in its response). Otherwise revoke tokens explicitly
+via the token endpoints.
+
+**Emergency fleet-wide revocation.** There is no single admin route that
+revokes every operator's sessions. The audited path is the admin
+`?username=` call above, once per operator. If that is not practical, delete
+the rows directly in Postgres. This is a direct database operation: it
+bypasses the server, **writes no audit row** (record it manually), and signs
+out every operator including you. Take a backup first (see
+[Backup — the KEK pairing rule](#backup--the-kek-pairing-rule)).
+
+```bash
+psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
+BEGIN;
+DELETE FROM session_store.sessions;
+-- Bump the write-generation exactly as SessionStore does, so every
+-- replica drops its cached sessions on its next generation poll (~1s).
+INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')
+ON CONFLICT (key) DO UPDATE SET value = (session_store.session_meta.value::bigint + 1)::text;
+COMMIT;
+SQL
+```
+
+The generation bump is required. A running replica serves a cached session
+without re-reading its row, and clears its cache only when it sees the
+write-generation advance. A bare `DELETE` therefore leaves every cached
+session valid on the replica that holds it, until some later session change
+advances the generation, the session expires, or that replica restarts.
+
+`ON_ERROR_STOP` makes `psql` exit non-zero if any statement fails, in which
+case the whole transaction has rolled back and nothing changed. Afterwards,
+confirm `SELECT count(*) FROM session_store.sessions;` returns 0 and that
+`write_generation` in `session_store.session_meta` went up. This revokes
+sessions only: API tokens stay valid and must be revoked through the token
+endpoints.
 
 ## Account lockout recovery
 
