@@ -188,6 +188,7 @@
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -19929,8 +19930,10 @@ private:
     auth::AutoApproveEngine auto_approve_;
     yuzu::MetricsRegistry metrics_;
     /// PR1.9c: the composed classification ruleset `build_classified_command`
-    /// consults on every dispatch — core (this package) plus the six
-    /// per-group plugin catalogues (p7/p10-p13). A STATIC ruleset, constructed
+    /// consults on every dispatch — core (this package) plus the per-group and
+    /// per-plugin catalogues below (bounded by
+    /// `CommandCapabilityRegistry::kMaxSources`; see its doc comment before
+    /// adding a fragment). A STATIC ruleset, constructed
     /// once: composing it is not itself a cached DECISION (ADR-0012 §4) —
     /// `classify_and_authorize_dispatch` still re-classifies and re-authorizes
     /// on every call; nothing about a dispatch OUTCOME is memoized here. No
@@ -19957,6 +19960,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
         yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
         yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
+        yuzu::server::capdecls::plugin_action_catalogue_local_security_policy(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail

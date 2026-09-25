@@ -1002,6 +1002,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // platform_security
         {"platform_security.secure_boot", "Report Secure Boot and setup-mode state (efivars on Linux, SecureBoot registry state on Windows; unsupported on macOS)"},
         {"platform_security.code_integrity", "Report code-signing enforcement posture (Linux LSM and lockdown, macOS Gatekeeper and SIP, Windows CI policy and Device Guard)"},
+        // local_security_policy
+        {"local_security_policy.password_policy", "Report local password policy posture: length, age, complexity, history (login.defs/pwquality/pam, pwpolicy, secedit; read-only)"},
+        {"local_security_policy.lockout_policy", "Report local account lockout policy posture: threshold, window, duration (faillock/pam, pwpolicy, secedit; read-only)"},
+        {"local_security_policy.audit_policy", "Report local audit policy posture: auditd rule counts, audit_control flags, Windows audit categories (read-only)"},
+        {"local_security_policy.sudoers", "Report parsed sudoers content: defaults, aliases, includes and user specs (Linux/macOS, read-only)"},
         // sccm
         // peripherals
         {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},

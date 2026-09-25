@@ -37,6 +37,7 @@
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -150,6 +151,7 @@ struct LabeledSpan {
         {"runtimes", capdecls::plugin_action_catalogue_runtimes(), false},
         {"platform_security", capdecls::plugin_action_catalogue_platform_security(), false},
         {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
+        {"local_security_policy", capdecls::plugin_action_catalogue_local_security_policy(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -158,7 +160,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty sources exactly as a live composition site would use.
+    // literally, twenty-one sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -179,6 +181,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
+        capdecls::plugin_action_catalogue_local_security_policy(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -475,4 +478,35 @@ TEST_CASE("capability catalogue: browser_inventory's two actions pin their exact
         CHECK(it->execute_gate == ExecuteGate::AdminOrApproval);
         CHECK_FALSE(it->system_reserved);
     }
+}
+
+/// Exact-row pin for the four `local_security_policy` rows (Wave 8): read-only posture
+/// class, so `Security` (the antivirus/bitlocker/firewall/autoruns class), never Inventory.
+/// Literals, not derived from the fragment, so a securable/gate/tier change fails here.
+/// `sudoers` alone pins Medium, not Low (owner decision, 2026-09-22, co-01): its rows carry the
+/// NOPASSWD flag and command allowlist -- a map of where a compromised or careless
+/// account could already run something as root without a password, the same
+/// "gaps in coverage" shape antivirus.av_exclusions' Medium tier is based on.
+TEST_CASE("capability catalogue: local_security_policy rows pin their exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_local_security_policy();
+    REQUIRE(rows.size() == 4);
+    const char* const expected[4] = {"password_policy", "lockout_policy", "audit_policy", "sudoers"};
+    for (std::size_t i = 0; i < 4; ++i) {
+        const auto& row = rows[i];
+        INFO("action=" << expected[i]);
+        CHECK(row.plugin == "local_security_policy");
+        CHECK(row.action == expected[i]);
+        CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(row.mutability == Mutability::None);
+        CHECK(row.securable == "Security");
+        CHECK(row.operation == authz::Operation::Read);
+        const bool is_sudoers = std::string_view{expected[i]} == "sudoers";
+        CHECK(row.risk_tier == (is_sudoers ? authz::RiskTier::Medium : authz::RiskTier::Low));
+        CHECK_FALSE(row.system_reserved);
+        CHECK(row.execute_gate == ExecuteGate::None);
+    }
+
+    auto registry = build_registry(all_labeled_sources());
+    CHECK_FALSE(registry.classify("local_security_policy", "set_policy").has_value());
 }

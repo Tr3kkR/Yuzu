@@ -101,6 +101,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -126,19 +127,21 @@ FRAGMENT_FILES = [
 # Wave 8 PR8.6: +2 app_control (wdac_policy/applocker_policy) — read-only
 # posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
 # Wave 8 PR8.1-a1: +2 platform_security (secure_boot/code_integrity).
-# Running total: 194 (base, already includes __sync__.now — see above) +
-# 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
-# 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
-# 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
-# 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) = 219.
-# This constant has been bumped independently on both sides of a merge several times
-# (PR #4719 CI is the trail; #4721 tracks deriving it per fragment). The rule is
-# always the same: find the shared baseline both sides agree on and add EVERY side's new
-# plugin on top of it, never pick one side's total. Dev is at 216 here (209 baseline +
-# printing.clear_queue 1 + app_control 2 + platform_security 2 + browser_inventory 2);
-# firmware_posture's 1 row and runtimes' 2 rows (dotnet, jvm) landed independently on the
-# two sides of the merge: 216 + 1 + 2 = 219.
-EXPECTED_TOTAL_ROWS = 219
+# Wave 8 PR8.4: +1 firmware_posture (firmware).
+# Wave 10 PR10.1-b: +2 runtimes (dotnet/jvm).
+# Wave 8 PR8.3: +4 local_security_policy (password_policy/lockout_policy/audit_policy/sudoers).
+# EXPECTED_TOTAL_ROWS is re-derived empirically (sum of len(parse_fragment_gate_rows(f))
+# over the real FRAGMENT_FILES, not hand arithmetic) every time this constant is
+# touched by a merge — see merge-can-semantically-break-a-clean-tree.md: two sides
+# independently bumping this constant merges CLEANLY to the WRONG total, and
+# neither surviving stale value is trustworthy. Recomputed 2026-09-25 after
+# merging origin/dev (firmware_posture +1, platform_security +2, runtimes +2) into
+# this branch (local_security_policy +4): 194 (base through power_health) + 2
+# (autoruns) + 3 (app_usage) + 3 (execution_artifacts) + 2 (windows_optional_features)
+# + 3 (peripherals) + 3 (printing incl. clear_queue) + 2 (app_control) + 1
+# (firmware_posture) + 2 (runtimes) + 2 (platform_security) + 2 (browser_inventory) +
+# 4 (local_security_policy) = 223.
+EXPECTED_TOTAL_ROWS = 223
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
