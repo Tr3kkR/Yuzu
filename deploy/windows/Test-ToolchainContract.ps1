@@ -906,6 +906,15 @@ Check 'the CI psql export is opt-in and agent-guarded' {
   $writeAt = $assertText.IndexOf('YUZU_CI_PSQL=', $leNineAt)
   $occurrences = @([regex]::Matches($assertText, [regex]::Escape('YUZU_CI_PSQL='))).Count
   if(-not ($writeAt -gt $leNineAt -and $occurrences -eq 1)){ return $false }
+  # Pin the three value guards on the export condition itself (a single
+  # `if($own)` truthy test would also pass the checks above, and an
+  # array-valued manifest psql would then smuggle a newline into
+  # GITHUB_ENV). Each anchor must sit between the `-le 9)` bound and the
+  # write; a missing anchor fails cleanly.
+  foreach($guard in @('$own.psql -is [string]', "-notmatch '[\r\n]'", 'Test-Path -LiteralPath $own.psql -PathType Leaf')){
+    $guardAt = $assertText.IndexOf($guard, $leNineAt)
+    if(-not ($guardAt -gt $leNineAt -and $guardAt -lt $writeAt)){ return $false }
+  }
   # Assert via the AST, not a file-wide text match, that [switch]$ExportCiEnv
   # is declared IN THE PARAM BLOCK (a match anywhere in the file, e.g. a
   # comment or a string, would satisfy a bare -match).
@@ -942,7 +951,8 @@ Check 'the Windows Ensure Postgres step timeout exceeds the script''s own worst 
   if($stepAt -lt 0){ return $false }
   $nextStepAt = $ciText.IndexOf("`n      - name:", $stepAt + 1)
   $step = if($nextStepAt -gt $stepAt){ $ciText.Substring($stepAt, $nextStepAt - $stepAt) } else { '' }
-  ($step -match '(?m)timeout-minutes:\s*8\s*$') -and ($step -match '(?m)run:\s*source scripts/ci/ensure-postgres\.sh\s*$')
+  # Line-anchored: a commented-out `# timeout-minutes: 8` must not satisfy it.
+  ($step -match '(?m)^\s*timeout-minutes:\s*8\s*$') -and ($step -match '(?m)^\s*run:\s*source scripts/ci/ensure-postgres\.sh\s*$')
 }
 Check 'provisioning parameter defaults equal every reviewed pin' {
   $mapping = [ordered]@{

@@ -332,6 +332,11 @@ expect_contains "heal" "heal call" "ALTER SYSTEM SET full_page_writes = off" "$h
 expect_contains "heal" "heal call" "SELECT pg_catalog.pg_reload_conf()" "$heal_call_line"
 expect "heal" "guard ordering (identity -> config-parse -> first ALTER SYSTEM)" "true" \
   "$([[ "$heal_call_line" == *'yuzu-heal-identity-guard'*'yuzu-heal-config-parse-guard'*'ALTER SYSTEM SET fsync'* ]] && echo true || echo false)"
+# The pinned search_path must precede the identity guard (a SUPERUSER
+# role's schema-shadowed function could otherwise intercept the guard's own
+# unqualified calls) — dropping or reordering it fails here.
+expect "heal" "search_path pin precedes the identity guard" "true" \
+  "$([[ "$heal_call_line" == *'SET search_path = pg_catalog, pg_temp'*'yuzu-heal-identity-guard'* ]] && echo true || echo false)"
 # Pin the heal session's safety-critical argv, not just that SOME ALTER
 # lands: dropping an IS NULL disjunct, the port check, the NOT,
 # ON_ERROR_STOP=1 or -X, or narrowing the config guard incorrectly, must
@@ -496,6 +501,85 @@ expect_contains "heal-guard-fails" "stderr" "yuzu-heal-identity-guard" "$err"
 expect_not_contains "heal-guard-fails" "stderr" "fake-psql-sentinel-should-not-appear" "$err"
 expect_not_contains "heal-guard-fails" "stderr" "CONTEXT" "$err"
 # (See the note in case 6a on why there is no "no ALTER lands" check.)
+
+# ── 6c. p1_server_diag pass-through when the label is NOT English. The first
+#        two lines are a verbatim PostgreSQL 18.6 capture of the identity
+#        guard raising with lc_messages=de_DE.UTF-8: the ERROR label is
+#        translated (FEHLER:), the CONTEXT label is not, and only the
+#        guard's own "yuzu-heal-" marker line may reach the annotation. The
+#        sentinel line is this harness's usual synthetic marker. ────────────
+N=$((N + 1))
+FAKE_DE_GUARD_FAIL_OUT=$'FEHLER:  yuzu-heal-identity-guard: connected server 127.0.0.1 port 25585 is not loopback:5434\nCONTEXT:  PL/pgSQL-Funktion inline_code_block Zeile 1 bei RAISE\nfake-psql-sentinel-should-not-appear'
+state="$(new_state 0 "$CAP_DEFAULT" 2 '' '' "$FAKE_DE_GUARD_FAIL_OUT")"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "heal-fails-translated-marker" "rc" "1" "$RC"
+expect_contains "heal-fails-translated-marker" "stderr" "FEHLER:  yuzu-heal-identity-guard" "$err"
+expect_not_contains "heal-fails-translated-marker" "stderr" "CONTEXT" "$err"
+expect_not_contains "heal-fails-translated-marker" "stderr" "PL/pgSQL-Funktion" "$err"
+expect_not_contains "heal-fails-translated-marker" "stderr" "fake-psql-sentinel-should-not-appear" "$err"
+
+# ── 6d. the real `psql: error: connection to server ... failed: ...` shape
+#        (CAP_REFUSED, a verbatim capture) on the heal arm reaches the
+#        ::error:: line through the connection-phase alternation. ───────────
+N=$((N + 1))
+state="$(new_state 0 "$CAP_DEFAULT" 2 '' '' "$CAP_REFUSED")"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+err_line="$(grep '^::error::.*heal failed on' <<<"$err")"
+expect "heal-fails-connection-phase" "rc" "1" "$RC"
+expect_contains "heal-fails-connection-phase" "::error:: line" "connection to server" "$err_line"
+expect_contains "heal-fails-connection-phase" "::error:: line" "failed:" "$err_line"
+
+# ── 6e. rc 124 (the /usr/bin/timeout wrapper) gets the "timed out after 30s"
+#        hint in EVERY rc != 0 arm that threads p1_rc_hint: read, heal,
+#        re-read, and both manifest-probe arms — and no DSN credential. The
+#        exit code alone is the fixture. ─────────────────────────────────────
+N=$((N + 1))
+state="$(new_state 124 "$CAP_REFUSED" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "rc124-read" "rc" "1" "$RC"
+expect_contains "rc124-read" "stderr" "timed out after 30s" "$err"
+expect_not_contains "rc124-read" "stderr" "yuzu:yuzu" "$err"
+
+N=$((N + 1))
+state="$(new_state 0 "$CAP_DEFAULT" 124 '' '' "$FAKE_FAIL_OUT")"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "rc124-heal" "rc" "1" "$RC"
+expect_contains "rc124-heal" "stderr" "heal failed on" "$err"
+expect_contains "rc124-heal" "stderr" "timed out after 30s" "$err"
+expect_not_contains "rc124-heal" "stderr" "yuzu:yuzu" "$err"
+
+N=$((N + 1))
+state="$(new_state 0 "$CAP_DEFAULT" 0 124 '' '' "$FAKE_FAIL_OUT")"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "rc124-reread" "rc" "1" "$RC"
+expect_contains "rc124-reread" "stderr" "could not re-read after heal" "$err"
+expect_contains "rc124-reread" "stderr" "timed out after 30s" "$err"
+expect_not_contains "rc124-reread" "stderr" "yuzu:yuzu" "$err"
+
+N=$((N + 1))
+state="$(new_state '' '' '' '' '')"
+printf '124' > "$state/select1_rc"
+invoke "$state" 'yuzu-fake-windows-1' true "$DSN0" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "rc124-probe-per-agent" "rc" "1" "$RC"
+expect_contains "rc124-probe-per-agent" "stderr" "NOT falling back to the shared agent-0 cluster" "$err"
+expect_contains "rc124-probe-per-agent" "stderr" "timed out after 30s" "$err"
+expect_not_contains "rc124-probe-per-agent" "stderr" "yuzu:yuzu" "$err"
+
+N=$((N + 1))
+state="$(new_state '' '' '' '' '')"
+printf '124' > "$state/select1_rc"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "rc124-probe-agent0" "rc" "1" "$RC"
+expect_contains "rc124-probe-agent0" "stderr" "refusing to proceed" "$err"
+expect_contains "rc124-probe-agent0" "stderr" "timed out after 30s" "$err"
+expect_not_contains "rc124-probe-agent0" "stderr" "yuzu:yuzu" "$err"
 
 # ── 7. still not off after heal (rc=0 on the re-read: trusted rows print) ──
 N=$((N + 1))
@@ -818,6 +902,8 @@ expect_contains "per-agent-heal-port" "heal call" "ALTER SYSTEM SET fsync = off"
 expect_contains "per-agent-heal-port" "heal call" "ALTER SYSTEM SET synchronous_commit = off" "$per_agent_heal_call_line"
 expect_contains "per-agent-heal-port" "heal call" "ALTER SYSTEM SET full_page_writes = off" "$per_agent_heal_call_line"
 expect_contains "per-agent-heal-port" "heal call" "SELECT pg_catalog.pg_reload_conf()" "$per_agent_heal_call_line"
+expect "per-agent-heal-port" "search_path pin precedes the identity guard" "true" \
+  "$([[ "$per_agent_heal_call_line" == *'SET search_path = pg_catalog, pg_temp'*'yuzu-heal-identity-guard'* ]] && echo true || echo false)"
 # The same argv pins as case 2, for the derived :5434 DSN and port.
 expect_contains "per-agent-heal-port" "heal call" "-X -w --dbname=${DSN1} -q -v ON_ERROR_STOP=1 -tA" "$per_agent_heal_call_line"
 expect_contains "per-agent-heal-port" "heal call (identity guard, full predicate)" \
@@ -875,6 +961,18 @@ expect_contains "sleep-scale-leading-zero" "stdout" "YUZU_TEST_POSTGRES_DSN=${DS
 N=$((N + 1))
 expect "p1-timeout-static-pin" "exactly one absolute /usr/bin/timeout wrapper" "1" \
   "$(grep -c '^\[\[ -x /usr/bin/timeout \]\] && P1_TIMEOUT=(/usr/bin/timeout 30)$' "$ENSURE")"
+# The step's timeout-minutes (ci.yml, pinned by Test-ToolchainContract.ps1)
+# is sized from these literals: the bounded post-heal re-read loop (5
+# attempts), its 1 s sleep, and the probe retry's 2 s sleep. Changing any
+# of them silently invalidates that arithmetic.
+expect "p1-timeout-static-pin" "re-read loop is exactly 5 attempts" "1" \
+  "$(grep -c '^      for attempt in 1 2 3 4 5; do$' "$ENSURE")"
+# shellcheck disable=SC2016 # literal $(( in the grep pattern
+expect "p1-timeout-static-pin" "re-read sleep is 1 x scale" "1" \
+  "$(grep -c '^        sleep \$((1 \* P1_SLEEP_SCALE))$' "$ENSURE")"
+# shellcheck disable=SC2016 # literal $(( in the grep pattern
+expect "p1-timeout-static-pin" "probe retry sleep is 2 x scale" "1" \
+  "$(grep -c '^      sleep \$((2 \* P1_SLEEP_SCALE))$' "$ENSURE")"
 
 # ── 23. a keyword-form DSN is never provable, so pg_dsn_host_port reads
 #          "?" — every operator-facing message must show a readable "host
