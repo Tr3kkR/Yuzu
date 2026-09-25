@@ -432,7 +432,8 @@ StatfsOutcome fs_of(std::uint64_t magic) { return {0, 0, magic}; }
 // Fails under: the walk statfs()ing only /proc/sys (the subtree overmount then reads procfs),
 // walking from the root down, trusting anything after the first existing directory, treating a
 // non-ENOENT statfs failure as "keep looking" or as confirmed, returning true when nothing
-// exists, or probing past /proc/sys.
+// exists, probing past /proc/sys, or -- the review-5318560722 blocker -- folding a REFUSED probe
+// (EACCES/EPERM) into the same "not confirmed" answer as a probe that simply found nothing.
 TEST_CASE("system_hardening: surface_is_procfs trusts the nearest existing directory only",
           "[system_hardening][classify]") {
     const std::string leaf = "/proc/sys/kernel/yama/ptrace_scope";
@@ -440,33 +441,55 @@ TEST_CASE("system_hardening: surface_is_procfs trusts the nearest existing direc
     SECTION("a tmpfs over /proc/sys/kernel under a procfs /proc/sys is not procfs") {
         FakeStatfs f{{{"/proc/sys/kernel", fs_of(kTmpfsMagic)}, {"/proc/sys", fs_of(kProcSuperMagic)}},
                      {}};
-        CHECK_FALSE(surface_is_procfs(leaf, f));
+        const auto s = surface_is_procfs(leaf, f);
+        CHECK_FALSE(s.confirmed_procfs);
+        CHECK(s.refused_errno == 0);
         CHECK(f.calls == std::vector<std::string>{"/proc/sys/kernel/yama", "/proc/sys/kernel"});
     }
     SECTION("a missing kernel/yama defers to its procfs parent") {
         FakeStatfs f{{{"/proc/sys/kernel", fs_of(kProcSuperMagic)}, {"/proc/sys", fs_of(kProcSuperMagic)}},
                      {}};
-        CHECK(surface_is_procfs(leaf, f));
+        const auto s = surface_is_procfs(leaf, f);
+        CHECK(s.confirmed_procfs);
+        CHECK(s.refused_errno == 0);
         CHECK(f.calls == std::vector<std::string>{"/proc/sys/kernel/yama", "/proc/sys/kernel"});
     }
     SECTION("the leaf's own directory, when present and procfs, decides at once") {
         FakeStatfs f{{{"/proc/sys/fs", fs_of(kProcSuperMagic)}}, {}};
-        CHECK(surface_is_procfs("/proc/sys/fs/suid_dumpable", f));
+        CHECK(surface_is_procfs("/proc/sys/fs/suid_dumpable", f).confirmed_procfs);
         CHECK(f.calls.size() == 1);
     }
-    SECTION("a statfs failure other than ENOENT is never confirmation, and stops the walk") {
-        for (const int err : {EACCES, EPERM, EINTR, EIO}) {
+    SECTION("a refused statfs (EACCES/EPERM) is reported as a refusal, never as confirmation, "
+            "and stops the walk") {
+        for (const int err : {EACCES, EPERM}) {
             INFO("errno " << err);
             FakeStatfs f{{{"/proc/sys/kernel/yama", StatfsOutcome{-1, err, 0}},
                           {"/proc/sys", fs_of(kProcSuperMagic)}},
                          {}};
-            CHECK_FALSE(surface_is_procfs(leaf, f));
+            const auto s = surface_is_procfs(leaf, f);
+            CHECK_FALSE(s.confirmed_procfs);
+            CHECK(s.refused_errno == err);
+            CHECK(f.calls.size() == 1);
+        }
+    }
+    SECTION("a non-refusal statfs failure other than ENOENT carries no refusal, and stops the "
+            "walk") {
+        for (const int err : {EINTR, EIO}) {
+            INFO("errno " << err);
+            FakeStatfs f{{{"/proc/sys/kernel/yama", StatfsOutcome{-1, err, 0}},
+                          {"/proc/sys", fs_of(kProcSuperMagic)}},
+                         {}};
+            const auto s = surface_is_procfs(leaf, f);
+            CHECK_FALSE(s.confirmed_procfs);
+            CHECK(s.refused_errno == 0);
             CHECK(f.calls.size() == 1);
         }
     }
     SECTION("nothing existing up to /proc/sys is not procfs, and the walk stops at /proc/sys") {
         FakeStatfs f{{{"/proc", fs_of(kProcSuperMagic)}, {"/", fs_of(kProcSuperMagic)}}, {}};
-        CHECK_FALSE(surface_is_procfs(leaf, f));
+        const auto s = surface_is_procfs(leaf, f);
+        CHECK_FALSE(s.confirmed_procfs);
+        CHECK(s.refused_errno == 0);
         CHECK(f.calls ==
               std::vector<std::string>{"/proc/sys/kernel/yama", "/proc/sys/kernel", "/proc/sys"});
     }
@@ -474,7 +497,7 @@ TEST_CASE("system_hardening: surface_is_procfs trusts the nearest existing direc
         for (const auto& k : kLinuxAllowlist) {
             INFO(k.path);
             FakeStatfs f; // every directory ENOENT: the longest possible walk
-            CHECK_FALSE(surface_is_procfs(k.path, f));
+            CHECK_FALSE(surface_is_procfs(k.path, f).confirmed_procfs);
             CHECK(f.calls == surface_probe_dirs(k.path));
             for (const auto& d : f.calls)
                 CHECK(d.starts_with("/proc/sys"));
@@ -482,9 +505,27 @@ TEST_CASE("system_hardening: surface_is_procfs trusts the nearest existing direc
     }
     SECTION("the chosen answer drives the ENOENT remap end to end") {
         FakeStatfs hidden{{{"/proc/sys/kernel", fs_of(kTmpfsMagic)}}, {}};
-        CHECK(remap_enoent_for_surface(ENOENT, surface_is_procfs(leaf, hidden)) == ENODEV);
+        CHECK(resolve_leaf_errno(ENOENT, surface_is_procfs(leaf, hidden)) == ENODEV);
         FakeStatfs present{{{"/proc/sys/kernel", fs_of(kProcSuperMagic)}}, {}};
-        CHECK(remap_enoent_for_surface(ENOENT, surface_is_procfs(leaf, present)) == ENOENT);
+        CHECK(resolve_leaf_errno(ENOENT, surface_is_procfs(leaf, present)) == ENOENT);
+    }
+    SECTION("a refused probe is never downgraded to ENODEV, and surfaces PERMISSION_DENIED end "
+            "to end (review-5318560722 blocker)") {
+        FakeStatfs refused{{{"/proc/sys/kernel/yama", StatfsOutcome{-1, EACCES, 0}},
+                            {"/proc/sys", fs_of(kProcSuperMagic)}},
+                           {}};
+        const int err = resolve_leaf_errno(ENOENT, surface_is_procfs(leaf, refused));
+        CHECK(err == EACCES);
+        CHECK(classify_read_errno(err) == PostureState::unreadable);
+
+        ConstraintAccumulator acc;
+        const auto row = failed_row("linux", "kernel.yama.ptrace_scope", err, acc);
+        CHECK(row.state == PostureState::unreadable);
+        CHECK(any_denied({&row, 1}));
+        const auto status = select_status(acc, any_denied({&row, 1}));
+        CHECK(status.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+        CHECK(status.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(status.provenance == "kernel.yama.ptrace_scope:eacces");
     }
 }
 

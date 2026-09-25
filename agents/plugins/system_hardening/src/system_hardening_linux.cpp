@@ -74,8 +74,9 @@ ReadOutcome read_proc_sys(std::string_view path) {
     } while (raw < 0 && errno == EINTR);
     if (raw < 0) {
         const int open_errno = errno; // captured before the statfs probe can touch errno
-        const bool mounted = open_errno == ENOENT ? surface_is_procfs(path, statfs_dir) : true;
-        return {remap_enoent_for_surface(open_errno, mounted), 0, {}};
+        const SurfaceCheck surface =
+            open_errno == ENOENT ? surface_is_procfs(path, statfs_dir) : SurfaceCheck{};
+        return {resolve_leaf_errno(open_errno, surface), 0, {}};
     }
     yuzu::agent::ScopedFd fd(raw);
 

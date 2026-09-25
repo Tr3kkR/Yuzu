@@ -38,7 +38,12 @@
  * Linux leg only ever hands this layer an ENOENT it has confirmed: a leaf ENOENT
  * whose nearest existing directory is not procfs arrives as ENODEV
  * (remap_enoent_for_surface below) and reads `unreadable` + `<key>:errno_19`, never
- * a clean `absent`. A run whose every key is a value or `absent` therefore reports
+ * a clean `absent`. A leaf ENOENT whose confirmation probe was itself REFUSED
+ * (EACCES/EPERM on an ancestor statfs, e.g. a seccomp or LSM syscall filter that
+ * denies statfs while permitting open) is never remapped to ENODEV either --
+ * resolve_leaf_errno propagates the refusal untouched, so it reads `unreadable` +
+ * `<key>:eacces` like any other denial (see PERMISSION_DENIED below), not a
+ * downgraded CONSTRAINED. A run whose every key is a value or `absent` therefore reports
  * OK/FULL, except that the all-absent Linux backstop reports CONSTRAINED/PARTIAL; a
  * run with an `unreadable` key reports PERMISSION_DENIED/PARTIAL when any read was
  * refused (a denial outranks every other cause), else CONSTRAINED/PARTIAL --
@@ -304,28 +309,53 @@ struct StatfsOutcome {
     std::uint64_t f_type = 0;
 };
 
-/// True iff the nearest EXISTING directory above `leaf` (surface_probe_dirs order, stopping at
-/// /proc/sys) is a procfs mount. `statfs_dir(const std::string& dir) -> StatfsOutcome` is the
-/// real statfs() in the Linux leg and a fake in the unit suite. The walk trusts the FIRST
-/// directory that exists (so a tmpfs over /proc/sys/kernel is caught even with /proc/sys itself
-/// procfs), skips only a missing directory (ENOENT: kernel/yama without Yama defers to its
-/// procfs parent), and answers false on any other statfs failure and when nothing up to
-/// /proc/sys exists -- never guessed true. At most surface_probe_dirs(leaf).size() calls, never a
-/// directory outside /proc/sys.
-template <typename StatfsFn>
-[[nodiscard]] bool surface_is_procfs(std::string_view leaf, StatfsFn&& statfs_dir) {
-    for (const auto& dir : surface_probe_dirs(leaf)) {
-        const StatfsOutcome s = statfs_dir(dir);
-        if (s.rc == 0) return s.f_type == kProcSuperMagic;
-        if (s.err != ENOENT) return false;
-    }
-    return false;
-}
-
 /// EACCES/EPERM: the read was refused. The one pair failure_token spells `:eacces`
 /// and select_status turns into PERMISSION_DENIED.
 [[nodiscard]] constexpr bool is_denied_errno(int err) noexcept {
     return err == EACCES || err == EPERM;
+}
+
+/// The result of confirming the surface a leaf ENOENT arrived on. `refused_errno` is non-zero
+/// (EACCES or EPERM) exactly when the confirmation probe itself -- not the leaf -- was refused;
+/// that case is never "unconfirmed", it is a denial the caller must propagate as-is, so
+/// `confirmed_procfs` carries no meaning when `refused_errno != 0`.
+struct SurfaceCheck {
+    bool confirmed_procfs = false;
+    int refused_errno = 0;
+};
+
+/// Confirms whether the nearest EXISTING directory above `leaf` (surface_probe_dirs order,
+/// stopping at /proc/sys) is a procfs mount. `statfs_dir(const std::string& dir) -> StatfsOutcome`
+/// is the real statfs() in the Linux leg and a fake in the unit suite. The walk trusts the FIRST
+/// directory that exists (so a tmpfs over /proc/sys/kernel is caught even with /proc/sys itself
+/// procfs) and skips only a missing directory (ENOENT: kernel/yama without Yama defers to its
+/// procfs parent). A REFUSED probe (EACCES/EPERM) stops the walk and reports the refusal --
+/// distinct from "confirmed not procfs" -- so the caller never downgrades a denial to an
+/// unconfirmed surface; any other statfs failure, or nothing existing up to /proc/sys, answers
+/// not-confirmed with no refusal, never guessed true. At most surface_probe_dirs(leaf).size()
+/// calls, never a directory outside /proc/sys.
+template <typename StatfsFn>
+[[nodiscard]] SurfaceCheck surface_is_procfs(std::string_view leaf, StatfsFn&& statfs_dir) {
+    for (const auto& dir : surface_probe_dirs(leaf)) {
+        const StatfsOutcome s = statfs_dir(dir);
+        if (s.rc == 0) return {s.f_type == kProcSuperMagic, 0};
+        if (s.err == ENOENT) continue;
+        return {false, is_denied_errno(s.err) ? s.err : 0};
+    }
+    return {false, 0};
+}
+
+/// The errno a leaf open() failure resolves to, once the surface check (run only when the leaf
+/// itself reported ENOENT) is in hand. A refused surface probe reports ITS OWN refusal untouched
+/// -- never remapped, never downgraded to "unconfirmed" -- because a denial is the strongest
+/// signal available and collapsing it into ENODEV is exactly the false-CONSTRAINED-instead-of-
+/// PERMISSION_DENIED defect this function exists to close. Every other open() errno (including a
+/// non-refused, non-ENOENT surface outcome, which never reaches here) passes through
+/// remap_enoent_for_surface unchanged from before.
+[[nodiscard]] constexpr int resolve_leaf_errno(int open_errno, SurfaceCheck surface) noexcept {
+    if (open_errno != ENOENT) return open_errno;
+    if (surface.refused_errno != 0) return surface.refused_errno;
+    return remap_enoent_for_surface(open_errno, surface.confirmed_procfs);
 }
 
 /// The reason token of a FAILED read: `<key>:eacces` | `<key>:not_regular` |
