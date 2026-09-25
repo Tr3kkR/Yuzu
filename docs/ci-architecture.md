@@ -1113,6 +1113,15 @@ NOT yet wired into the `macos` job (Phase 4 to-do), so the DB queries above have
 no macOS data yet. `release.yml` build-macos is now self-hosted on BigMags too (unsigned —
 signing/notarization deferred to Phase B). Only the `pre-release.yml`
 `install-macos` smoke test stays GitHub-hosted (`macos-14`, ephemeral).
+The macOS job installs Erlang/OTP 28 + rebar3 per run via `erlef/setup-beam`
+(`ImageOS: macos26`), the same pin as the Linux leg, so the gateway is built and its
+eunit/ct suites run on macOS too. Before #4841 it had no Erlang and Meson silently
+skipped the gateway. Every CI leg that runs `meson test` (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan) now runs
+`scripts/ci/assert-gateway-tests.py <builddir>` straight after `meson setup`, so a missing `rebar3` (gateway tests not registered)
+fails the Configure step rather than skipping. It is deliberately a post-configure check, not the `-Drequire_gateway` project
+option: a non-default project option stored in these persistent, branch-shared build dirs makes every older branch's
+`meson setup --reconfigure` fail with `Unknown options` (measured, #4851). `tests/test_gateway_test_summary.py` pins that
+every such `meson setup` is followed by the check and that none passes `-Drequire_gateway`.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected

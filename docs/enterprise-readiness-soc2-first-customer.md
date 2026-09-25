@@ -505,6 +505,29 @@ The DEX read model (`guardian_observations` + the `/dex` dashboard) is the first
 
 - PR review records, CI logs, deployment approvals, and release notes/change tickets.
 
+**Addendum — the gateway Common Test CI check reported success while executing nothing,
+2026-05-13 to #4800 (CC8.1/CC7.2).** Recorded here because this section cites "Required
+CI checks … before merge" and "CI logs" as change-management evidence, and one of those
+checks did not operate for that period. When the gateway's Common Test suites moved into
+`gateway/apps/yuzu_gw/test/ct/` (335670056, 2026-05-13), the Meson `gateway ct` test
+kept invoking `rebar3 ct` without that directory, so it discovered zero suites, printed
+`All 0 tests passed.` and passed on every CI leg that ran it. CI logs from that window show
+`gateway ct … OK` with no Common Test case executed, so they are **not** evidence that the
+gateway's integration, end-to-end, metrics or performance suites passed. Two real defects
+shipped behind it on `dev` (#4707, the gateway `/metrics` endpoint returning HTTP 500, and
+#4708, a stale test); neither reached a tagged release. The gateway's EUnit check was
+unaffected and did run.
+
+#4800 closes it: the check now runs the suites (52 cases on the Linux and Windows legs),
+and the wrapper fails any run that exits 0 without executing a test. `/test`'s EUnit gate
+and the release workflow's EUnit step were brought under the same rule. A hermetic
+self-test (`tests/test_gateway_test_summary.py`) pins the directory and the rule. The same
+change closes a second, older gap (#4841): the macOS CI leg never had Erlang, so Meson
+silently skipped the gateway there and the leg passed without building or testing it. The
+macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (ci.yml, nightly, sanitizer-tests) checks, right after
+configure, that the gateway tests were registered (`scripts/ci/assert-gateway-tests.py`),
+so a runner missing the gateway toolchain fails instead of passing without the gateway.
+
 ---
 
 ## 3.7 Workstream G — Customer Assurance Package (Enterprise Sales Enablement)
