@@ -108,8 +108,10 @@
 ///       even if install() was never called on this instance -- a test that never
 ///       installed this LogHandoff as the default logger will still observe the
 ///       process-wide default become the null sink after calling teardown() (this is
-///       deliberate: see U4/U10 in test_log_handoff.cpp, which pins exactly this
-///       behavior). PR-1 only ever runs in the ONE registry image it is compiled into
+///       deliberate: see U4 in test_log_handoff.cpp, which pins exactly this
+///       behavior -- U10 in the same file is a different test, the loser-waits
+///       handshake under concurrent teardown(), and asserts nothing about the
+///       default logger). PR-1 only ever runs in the ONE registry image it is compiled into
 ///       (the agent-core library); the MULTI-IMAGE note below is what PR-2 must add.
 ///   T3: this object's own last reference to the async logger's sinks (logger_.reset(),
 ///       wrapped_sinks_.clear()) -- runs under the same watchdog as T1, since final
