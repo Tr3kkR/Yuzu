@@ -565,47 +565,55 @@ private:
 /// verdict (adversarial-review round, #2703).
 [[nodiscard]] bool rbac_enforcement_in_effect(const RbacStore* store) noexcept;
 
-/// Three-way classification of RBAC enforcement state (originally A3, the
-/// Periodic Access Review export, SOC 2 CC6.2; reconciled here with a second,
-/// independently-authored consumer from PR #4985/A2, `rbac_admin_predicate.
-/// hpp`'s `is_rbac_administrator` — both PRs built the identical shape
-/// against this branch's own primitives before either merged, converging on
-/// this one definition rather than shipping two) — strictly more granular
-/// than `rbac_enforcement_in_effect`'s plain enforced/not-enforced boolean,
-/// which deliberately conflates "genuinely enabled" with "degraded view,
-/// deny by default" (both gate DENY, so the boolean is right for
+/// Three-way classification of RBAC enforcement state — strictly more
+/// granular than `rbac_enforcement_in_effect`'s plain enforced/not-enforced
+/// boolean, which deliberately conflates "genuinely enabled" with "degraded
+/// view, deny by default" (both gate DENY, so the boolean is right for
 /// authorization).
 ///
-/// PRIMARY use: an AUDIT-FACING label for export/evidence surfaces. An
-/// auditor reading an evidence export needs the distinction a bare boolean
-/// erases: a `kDegraded` stamp says "we could not confirm the state, gates
-/// denied defensively" — NOT "an administrator turned RBAC on".
+/// THE TEST for whether a NEW use of this label is permitted: does it change
+/// the SET OF INPUTS THAT ADMIT a request? If yes — forbidden. Use
+/// `rbac_enforcement_in_effect()`'s boolean directly; the admit/deny outcome
+/// must always equal what that boolean alone gives (see the documented
+/// equivalence below). If no — the use only stamps an audit label, or picks
+/// between two outcomes that are BOTH already non-admitting — it is
+/// permitted, subject to two further conditions: (1) a SINGLE snapshot read
+/// per logical decision (call `rbac_enforcement_label()` exactly once and
+/// branch on that one result — never decompose into this call plus a
+/// separate `rbac_enforcement_in_effect()` call, or two calls to this
+/// function, "to satisfy the letter" of a narrower use: the underlying view
+/// can self-heal between calls — a healthy pool's next refresh clears a
+/// stale cache — so two calls can observe two different states across one
+/// logical decision); (2) a `security-guardian` review, via this file's
+/// routed-concerns row (`.claude/routed-concerns-access-control.md`, the A2
+/// row's trigger list names this enum/function explicitly) — adding a new
+/// consumer is a security decision, not a routine edit, and that row is
+/// where consumers satisfying this test are tracked, not a hardcoded count
+/// in this comment.
 ///
-/// SANCTIONED non-export use: `is_rbac_administrator` (Doomgoose external
-/// review, PR #4985 IMPORTANT #2) reads this label to choose WHICH
-/// non-admitting failure to return — a retryable `kUnavailable` (503) versus
-/// a terminal `kDenied` (403) — when a `principal_roles` lookup finds no
-/// Administrator row. It was previously conflating "genuinely enabled, no
-/// row" with "degraded, no row" and returning a terminal 403 for a transient
-/// store hiccup, exactly the failure mode this enum exists to let a caller
-/// avoid. This does NOT admit on `kDegraded` or on any other value — the
-/// admit/deny outcome is unchanged, and stays governed entirely by
-/// `rbac_enforcement_in_effect()`'s own boolean (equal to `!= kDisabled`
-/// below) plus the row lookup; the label only selects the shape of an
-/// already-non-admitting response. It reads `rbac_enforcement_label()`
-/// exactly ONCE per call and branches on that one snapshot — do NOT
-/// decompose this into a call to `rbac_enforcement_in_effect()` plus a
-/// second, separate call to this function "to satisfy the letter" of
-/// export-only use: the view can self-heal between two calls (a healthy
-/// pool's next refresh clears a stale cache), so two calls can observe two
-/// different states across one logical decision.
+/// PRIMARY use: an AUDIT-FACING label for export/evidence surfaces
+/// (`access_review_model.cpp`, A3, the Periodic Access Review export, SOC 2
+/// CC6.2). An auditor reading an evidence export needs the distinction a
+/// bare boolean erases: a `kDegraded` stamp says "we could not confirm the
+/// state, gates denied defensively" — NOT "an administrator turned RBAC on".
 ///
-/// EXCEPT for that one sanctioned consumer: this is a READ-ONLY label. A NEW
-/// caller deciding whether to admit/deny a request MUST use
-/// `rbac_enforcement_in_effect()` directly, never this enum — adding a
-/// second non-export consumer is a security decision, not a routine edit,
-/// and needs the same admit/deny-outcome-unchanged proof `is_rbac_
-/// administrator` above satisfies.
+/// WORKED EXAMPLE of a sanctioned non-export use, satisfying the test above:
+/// `rbac_admin_predicate.hpp`'s `is_rbac_administrator` (Doomgoose external
+/// review, PR #4985 IMPORTANT #2, reconciled with A3 above at merge time —
+/// both PRs independently built this identical shape against this branch's
+/// own primitives before either merged). It reads the label TWICE from one
+/// snapshot: once to pick which authority source to consult (`!= kDisabled`
+/// — this IS the same routing decision `rbac_enforcement_in_effect()`'s own
+/// boolean makes, by the documented equivalence below, so it changes nothing
+/// about which inputs admit), and once — only after that source's own row
+/// lookup has already found no matching grant, i.e. only on an
+/// already-non-admitting path — to choose WHICH non-admitting failure to
+/// return: a retryable `kUnavailable` (503) for `kDegraded`, versus a
+/// terminal `kDenied` (403) otherwise. It was previously conflating those
+/// two "no row" cases and returning a terminal 403 for a transient store
+/// hiccup, exactly the failure mode this enum exists to let a caller avoid.
+/// Neither read ever returns `kAdmin` by itself — an actual grant/role match
+/// is still required on every path.
 enum class RbacEnforcementLabel {
     kEnabled,  ///< store open, `is_rbac_enabled() == true`.
     kDisabled, ///< store open, `is_rbac_enabled() == false`, view FRESH — the

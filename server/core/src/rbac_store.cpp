@@ -1453,46 +1453,46 @@ void RbacStore::set_rbac_enabled(bool enabled) {
     apply_local_generation(*new_gen);
 }
 
-bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
-    // Permit the full-fleet fallback (return false) ONLY for a store that is
+RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
+    // THE single derivation of enforcement state from the 3 raw accessors —
+    // rbac_enforcement_in_effect() below is now a one-line PROJECTION of
+    // THIS function's result (security-guardian re-review, PR #4985 merge
+    // reconciliation: the two were previously two independently-written
+    // function bodies kept in sync by a "keep any future change... in sync
+    // here" comment alone — a real risk once this label became load-bearing
+    // for is_rbac_administrator's own RBAC-on/off branch routing, not just
+    // an export string. Delegating makes "the two can never silently drift
+    // apart" true by CONSTRUCTION instead of by convention).
+    //
+    // Permit the fresh-disabled outcome (kDisabled) ONLY for a store that is
     // loaded, explicitly disabled, AND whose disabled view is currently
-    // FRESH. Null / load-failed (!is_open()) fail CLOSED — see the header
-    // for the #1498 rationale.
+    // FRESH. Null / load-failed (!is_open()) fails CLOSED (kDegraded) — see
+    // the header for the #1498 rationale.
     if (!store || !store->is_open())
-        return true;
+        return RbacEnforcementLabel::kDegraded;
     if (store->is_rbac_enabled())
-        return true;
+        return RbacEnforcementLabel::kEnabled;
     // adversarial-review round (#2703): is_rbac_enabled()==false is not, on
     // its own, proof RBAC is genuinely disabled — maybe_refresh_generation()
     // (just invoked by the call above) deliberately never touches a stale
     // cached rbac_enabled_ on a failed refresh, so a replica that has never
     // itself observed a remote enable stays cached false indefinitely
-    // through an outage. Treat a degraded view (the refresh did not land)
-    // the same as "enabled" here — the one place this distinction is
+    // through an outage. A degraded view (the refresh did not land) reads as
+    // kDegraded here, never kDisabled — the one place this distinction is
     // security-relevant, unlike the raw is_rbac_enabled() accessor other
     // (non-confinement) callers use.
-    return store->rbac_enabled_view_degraded();
-}
-
-RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
-    // Mirrors rbac_enforcement_in_effect()'s branch order and short-circuiting
-    // exactly (see that function's comments for the rationale on each step) —
-    // this is the SAME derivation, just split into three outcomes instead of
-    // two. Keep any future change to that function's branches in sync here.
+    //
     // (cpp-safety re-review, PR #4985 fix round, corrected by a security-
     // guardian follow-up pass: `noexcept` here is honest only to the same
-    // degree as that sibling function's own pre-existing `noexcept` —
-    // `is_open()` IS itself `noexcept`, but `is_rbac_enabled()` and
-    // `rbac_enabled_view_degraded()` are NOT, so this rests on THOSE two not
-    // actually throwing in practice, exactly like the unchanged sibling. Not
-    // a new risk this function introduces.)
-    if (!store || !store->is_open())
-        return RbacEnforcementLabel::kDegraded;
-    if (store->is_rbac_enabled())
-        return RbacEnforcementLabel::kEnabled;
-    if (store->rbac_enabled_view_degraded())
-        return RbacEnforcementLabel::kDegraded;
-    return RbacEnforcementLabel::kDisabled;
+    // degree as `is_rbac_enabled()`/`rbac_enabled_view_degraded()` not
+    // throwing in practice — `is_open()` IS itself `noexcept`, those two are
+    // not. Not a new risk this delegation introduces.)
+    return store->rbac_enabled_view_degraded() ? RbacEnforcementLabel::kDegraded
+                                                : RbacEnforcementLabel::kDisabled;
+}
+
+bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
+    return rbac_enforcement_label(store) != RbacEnforcementLabel::kDisabled;
 }
 
 // to_string(RbacEnforcementLabel) is constexpr and header-inline (rbac_store.hpp) —
