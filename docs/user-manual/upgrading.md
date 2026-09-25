@@ -3671,7 +3671,7 @@ on the install path (`POST /api/product-packs`). List, get, and
 uninstall paths do not re-verify, so already-installed unsigned packs
 remain queryable and uninstallable after upgrade.
 
-### vNEXT — Access-review CSV export gains a leading metadata line (breaking for fixed-column-index CSV consumers) — **BREAKING**
+### vNEXT — Access-review CSV export gains a leading metadata line (breaking for fixed-column-index CSV consumers)
 
 `GET /api/v1/access-reviews/export?format=csv` (SOC 2 CC6.2 evidence) now
 emits one new line before the existing header row:
@@ -3696,18 +3696,21 @@ tools" — the actual split matters):
   row (line 2) into the result set as if it were data — every field name and
   every row is now misaligned. The `awk -F, 'NR>1'` idiom (and any hand-rolled
   "skip the first line" loop in another language) does the same thing: it now
-  emits the real header row as a spurious first "data" row, then the genuine
-  data rows correctly, but interleaved with that one bad row.
+  emits the real header row as a spurious first "data" row, ahead of the
+  genuine data rows, which otherwise parse correctly.
 - **Also silently WRONG, not a loud failure:** `pandas.read_csv(path)` with
   its default settings does **not** raise `ParserError` on this shape — do
   not rely on pandas to "fail loud" here. Because every row past line 1 is
   uniformly wider than the 1-field metadata line, pandas' documented
   "extra leading columns become an implicit index" heuristic kicks in: it
   silently produces a 1-column, tuple-indexed `DataFrame` with the metadata
-  line as the sole column name and every real field folded into the index —
-  wrong, but no exception. (Verified directly against pandas 3.0.6, both the
-  `c` and `python` engines; there is no known pandas default-settings
-  invocation of this shape that raises instead of silently misparsing.)
+  line as the sole column name and the leading fields folded into a
+  `MultiIndex`, leaving only the last field (`source`) as the actual,
+  mislabeled `DataFrame` column — wrong, but no exception. (Verified
+  directly against pandas 3.0.6, both the `c` and `python` engines; on that
+  version, neither engine's default settings raise instead of silently
+  misparsing — untested against older pandas majors, so treat "on 3.0.6"
+  as the scope of this claim, not a guarantee for every pandas release.)
 
 **The fix is the same for every consumer class: skip exactly one line before
 treating the next line as the header**, verified working against each tool

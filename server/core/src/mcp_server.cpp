@@ -23674,8 +23674,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // A3 (RBAC delivery plan): the enforcement state stamped onto this
                 // campaign row at freeze time — computed from the same RbacStore
                 // instance, read immediately after the grant population above (a
-                // separate, later call, not the same read). Mirrors the REST
-                // twin's identical comment.
+                // separate, later call, not the same read; it can trigger its own
+                // maybe_refresh_generation() round-trip), never re-derived on a
+                // later read (matches every other frozen field). Equivalent to
+                // the REST twin's comment, not byte-identical.
                 const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
 
                 // Expand each row to one GrantRef per (principal, role) — the shape

@@ -241,9 +241,10 @@ decision (including what was deliberately excluded from the floor and why).
 degrade-vs-outage ambiguity — read this if you're relying on it as
 evidence.** `enabled`/`disabled`/`degraded` (full description:
 `rest-api.md` → the `GET /api/v1/access-reviews/export` section) is derived
-from the identical fail-closed machinery this whole section describes — a
-replica whose generation refresh has failed reports `degraded`, same as a
-replica whose RBAC store is unreachable. **Correlate against
+from the identical fail-closed machinery described above under "RBAC store
+integrity (fail-closed / deny-on-degrade)" — a replica whose generation
+refresh has failed reports `degraded`, same as a replica whose RBAC store is
+unreachable. **Correlate against
 `yuzu_server_rbac_read_degrade_total{reason=~"generation_refresh_failed.*"}`**
 (and the narrower `stale_beyond_accepted_bound` reason) if you need to
 distinguish "the store genuinely couldn't confirm state at pull time" from
