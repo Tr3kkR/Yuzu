@@ -37,7 +37,12 @@
 ///     `rbac_enforcement_in_effect`'s own fail-closed doc comment):
 ///     require a `principal_roles` row for
 ///     `(principal_type="user", principal_id=session.username,
-///     role_name="Administrator")`, via `get_principal_roles_checked`.
+///     role_name="Administrator")`, via `get_principal_roles_checked`. The
+///     enabled-vs-degraded distinction (`RbacEnforcementLabel`,
+///     `rbac_store.hpp`) matters for the "row absent" outcome specifically:
+///     genuinely enabled + absent is a confirmed `kDenied`; degraded + absent
+///     is `kUnavailable` (we could not confirm either way), never collapsed
+///     into the same terminal denial — see below.
 ///
 /// Four decisions this predicate makes explicit, each deliberate and
 /// documented HERE rather than left implicit at a call site:
@@ -116,7 +121,8 @@ enum class RbacAdminGate {
     if (!rbac_store)
         return RbacAdminGate::kUnavailable;
 
-    if (rbac_enforcement_in_effect(rbac_store)) {
+    const RbacEnforcementLabel enforcement = rbac_enforcement_label(rbac_store);
+    if (enforcement != RbacEnforcementLabel::kDisabled) {
         auto rows = rbac_store->get_principal_roles_checked("user", session.username);
         if (!rows.has_value())
             return RbacAdminGate::kUnavailable;
@@ -124,7 +130,18 @@ enum class RbacAdminGate {
             if (pr.role_name == "Administrator")
                 return RbacAdminGate::kAdmin;
         }
-        return RbacAdminGate::kDenied;
+        // Doomgoose external review, PR #4985 (IMPORTANT #2): a genuinely
+        // absent Administrator row is a confirmed kDenied only when
+        // enforcement is GENUINELY enabled. When this branch was reached
+        // only because the enabled-flag cache view is DEGRADED
+        // (`rbac_enforcement_in_effect`'s own conservative "treat as
+        // enabled" fallback — see its #2703 comment), a missing row means
+        // "we could not confirm either way", not "confirmed not admin" — map
+        // it to kUnavailable so a transient store hiccup can never
+        // masquerade as a permanent policy denial (this file's own header
+        // invariant, above).
+        return enforcement == RbacEnforcementLabel::kDegraded ? RbacAdminGate::kUnavailable
+                                                               : RbacAdminGate::kDenied;
     }
 
     // RBAC-off branch: durable re-read from AuthDB (decision 1 — never the
@@ -203,6 +220,45 @@ enum class RbacAdminGate {
     // function doc comment above for why those two are not distinguished
     // here).
     return "false";
+}
+
+/// The fixed, shared wording every `is_rbac_administrator` call site uses
+/// for its two non-admit outcomes. Doomgoose external review, PR #4985
+/// MINOR "duplicated gate-denial classification": these strings (and the
+/// kUnavailable/kDenied branching that selects between them) were
+/// duplicated verbatim across all 4 REST/MCP assign+unassign call sites —
+/// EXTEND this, never fork a second copy, matching
+/// `authz_topology_floor.hpp`'s own rule.
+inline constexpr std::string_view kRbacAdminGateUnavailableMessage =
+    "service unavailable — cannot confirm administrator authority";
+inline constexpr std::string_view kRbacAdminGateDeniedMessage = "administrator role required";
+inline constexpr std::string_view kRbacAdminGateDeniedAuditReason =
+    "caller is not a durable RBAC administrator";
+
+/// Shared control-flow chokepoint for the two non-admit `RbacAdminGate`
+/// outcomes. Returns `true` (having already invoked exactly one of
+/// `on_unavailable`/`on_denied`) when the caller must deny and `return`
+/// immediately; returns `false` — invoking neither callback — only for
+/// `RbacAdminGate::kAdmin`, when the caller should proceed. Each callback
+/// carries ONLY the transport-specific response/audit mechanics (REST's
+/// `httplib::Response` + `detail::a4_error`/`emit_behavioral_audit` vs MCP's
+/// JSON-RPC `a4_error`/`audit_fn`, which genuinely differ and are not
+/// unified here) — the shared wording above is what each callback should
+/// use for its message text, so the two transports can never drift apart on
+/// what they tell the caller.
+template <typename OnUnavailable, typename OnDenied>
+[[nodiscard]] inline bool deny_unless_rbac_administrator(RbacAdminGate gate,
+                                                          OnUnavailable&& on_unavailable,
+                                                          OnDenied&& on_denied) {
+    if (gate == RbacAdminGate::kUnavailable) {
+        on_unavailable();
+        return true;
+    }
+    if (gate != RbacAdminGate::kAdmin) {
+        on_denied();
+        return true;
+    }
+    return false;
 }
 
 } // namespace yuzu::server

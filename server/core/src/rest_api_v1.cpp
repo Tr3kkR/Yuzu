@@ -977,10 +977,10 @@ const std::string& openapi_spec() {
       "post": {"summary": "Check if current user has a permission", "tags": ["RBAC"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"securable_type": {"type": "string"}, "operation": {"type": "string"}}}}}}, "responses": {"200": {"description": "Permission check result"}}}
     },
     "/rbac/roles/{name}/assignments": {
-      "post": {"summary": "Assign a built-in RBAC role to a human user, fleet-wide (A2)", "tags": ["RBAC"], "description": "Gated on a durable is_rbac_administrator check (re-read fresh from the store), NOT an ordinary permission check — see docs/user-manual/rbac.md \"Fleet-Wide Role Assignment\". principal_type must be \"user\"; ITServiceOwner is rejected (its confinement needs a management-group scope this route does not carry — use POST /api/v1/management-groups/{id}/roles instead). Pre-provisioning (a principal_id with no existing auth.users row) is allowed.", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"principal_type": {"type": "string", "enum": ["user"]}, "principal_id": {"type": "string"}}, "required": ["principal_type", "principal_id"]}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Unknown role, ITServiceOwner, principal_type != \"user\", or invalid principal_id format — the same uniform message for an unknown role and ITServiceOwner (M1: no role-catalog oracle)"}, "403": {"description": "Caller does not hold a durable Administrator role, or is a service-scoped/engine session"}, "503": {"description": "RBAC/AuthDB store unavailable, or the audit write for this mutation failed (fail-closed)"}}}
+      "post": {"summary": "Assign a built-in RBAC role to a human user, fleet-wide (A2)", "tags": ["RBAC"], "description": "Gated on a durable is_rbac_administrator check (re-read fresh from the store), NOT an ordinary permission check — see docs/user-manual/rbac.md \"Fleet-Wide Role Assignment\". principal_type must be \"user\"; ITServiceOwner is rejected (its confinement needs a management-group scope this route does not carry — use POST /api/v1/management-groups/{id}/roles instead). Pre-provisioning (a principal_id with no existing auth.users row) is allowed.", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"principal_type": {"type": "string", "enum": ["user"]}, "principal_id": {"type": "string"}}, "required": ["principal_type", "principal_id"]}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Unknown role, ITServiceOwner, principal_type != \"user\", or invalid principal_id format — the same uniform message for an unknown role and ITServiceOwner (M1: no role-catalog oracle)"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller does not hold a durable Administrator role, or is a service-scoped/engine session"}, "503": {"description": "RBAC/AuthDB store unavailable, or the audit write for this mutation failed (fail-closed)"}}}
     },
     "/rbac/roles/{name}/assignments/{principal_id}": {
-      "delete": {"summary": "Revoke a fleet-wide RBAC role grant from a human user (A2)", "tags": ["RBAC"], "description": "Idempotent (success even when the role was not held). A caller may not remove their own Administrator assignment; removing the fleet's last remaining authenticatable Administrator grant is refused for anyone (atomic store-level guard).", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "principal_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}, "403": {"description": "Caller does not hold a durable Administrator role, is removing their own Administrator assignment, or is a service-scoped/engine session"}, "409": {"description": "Refused: would remove the fleet's last remaining authenticatable Administrator role grant"}, "503": {"description": "RBAC store unavailable, or the audit write for this mutation failed (fail-closed)"}}}
+      "delete": {"summary": "Revoke a fleet-wide RBAC role grant from a human user (A2)", "tags": ["RBAC"], "description": "Idempotent (success even when the role was not held). A caller may not remove their own Administrator assignment; removing the fleet's last remaining authenticatable Administrator grant is refused for anyone (atomic store-level guard).", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "principal_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller does not hold a durable Administrator role, is removing their own Administrator assignment, or is a service-scoped/engine session"}, "409": {"description": "Refused: would remove the fleet's last remaining authenticatable Administrator role grant"}, "503": {"description": "RBAC store unavailable, or the audit write for this mutation failed (fail-closed)"}}}
     },
     "/tag-categories": {
       "get": {"summary": "List tag categories and allowed values", "tags": ["Tags"], "responses": {"200": {"description": "List of tag categories"}}}
@@ -3277,10 +3277,16 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
-            // #2466/#2406: fail closed — never report an unassign that was not audited.
-            if (!detail::emit_behavioral_audit(audit_fn, req, res,
-                                               "engine_principal.role.unassigned", "success",
-                                               "EnginePrincipal", principal_id, role_name)) {
+            // #2466/#2406: fail closed — never report an unassign that was not
+            // audited. `removed=<bool>` (governance SHOULD #10, matching the
+            // human-route convention above) lets an auditor tell an actual
+            // revoke apart from an idempotent no-op from the log alone
+            // (Doomgoose external review, PR #4985 MINOR "audit-fidelity
+            // asymmetry").
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.role.unassigned", "success",
+                    "EnginePrincipal", principal_id,
+                    role_name + "; removed=" + (*result ? "true" : "false"))) {
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res, "the role unassignment took effect but its audit record "
@@ -5550,22 +5556,25 @@ void RestApiV1::register_routes(
                 return;
             }
             const auto gate = is_rbac_administrator(*session, auth_db, rbac_store);
-            if (gate == RbacAdminGate::kUnavailable) {
-                res.status = 503;
-                res.set_content(detail::a4_error(res, "service unavailable — cannot confirm "
-                                                       "administrator authority"),
-                                "application/json");
+            // Doomgoose external review, PR #4985 MINOR "duplicated
+            // gate-denial classification" — shared chokepoint, see its own
+            // doc comment (rbac_admin_predicate.hpp).
+            if (deny_unless_rbac_administrator(
+                    gate,
+                    [&] {
+                        res.status = 503;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateUnavailableMessage),
+                                        "application/json");
+                    },
+                    [&] {
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
+                                                            "denied", "User", session->username,
+                                                            std::string(kRbacAdminGateDeniedAuditReason));
+                        res.status = 403;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateDeniedMessage),
+                                        "application/json");
+                    }))
                 return;
-            }
-            if (gate != RbacAdminGate::kAdmin) {
-                (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
-                                                    "denied", "User", session->username,
-                                                    "caller is not a durable RBAC administrator");
-                res.status = 403;
-                res.set_content(detail::a4_error(res, "administrator role required"),
-                                "application/json");
-                return;
-            }
             if (step_up_fn &&
                 !step_up_fn(req, res, *session, "POST /api/v1/rbac/roles/{name}/assignments"))
                 return;
@@ -5664,10 +5673,7 @@ void RestApiV1::register_routes(
             // either.
             if (!is_rbac_assignable_role(role_name)) {
                 const std::string reason =
-                    role_name == "ITServiceOwner"
-                        ? "ITServiceOwner: requires group-scoped confinement, not supported "
-                          "fleet-wide"
-                        : audit_token(role_name) + ": not one of the 6 fleet-wide-assignable roles";
+                    rbac_role_rejection_reason(role_name, audit_token(role_name));
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
                                                     "denied", "User", audit_target_id, reason);
                 res.status = 400;
@@ -5768,22 +5774,25 @@ void RestApiV1::register_routes(
                 return;
             }
             const auto gate = is_rbac_administrator(*session, auth_db, rbac_store);
-            if (gate == RbacAdminGate::kUnavailable) {
-                res.status = 503;
-                res.set_content(detail::a4_error(res, "service unavailable — cannot confirm "
-                                                       "administrator authority"),
-                                "application/json");
+            // Doomgoose external review, PR #4985 MINOR "duplicated
+            // gate-denial classification" — shared chokepoint, see its own
+            // doc comment (rbac_admin_predicate.hpp).
+            if (deny_unless_rbac_administrator(
+                    gate,
+                    [&] {
+                        res.status = 503;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateUnavailableMessage),
+                                        "application/json");
+                    },
+                    [&] {
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, "rbac.role.unassigned", "denied", "User",
+                            session->username, std::string(kRbacAdminGateDeniedAuditReason));
+                        res.status = 403;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateDeniedMessage),
+                                        "application/json");
+                    }))
                 return;
-            }
-            if (gate != RbacAdminGate::kAdmin) {
-                (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.unassigned",
-                                                    "denied", "User", session->username,
-                                                    "caller is not a durable RBAC administrator");
-                res.status = 403;
-                res.set_content(detail::a4_error(res, "administrator role required"),
-                                "application/json");
-                return;
-            }
             if (step_up_fn &&
                 !step_up_fn(req, res, *session,
                             "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}"))

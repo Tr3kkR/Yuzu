@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 
 /// @file rbac_assignable_roles.hpp
@@ -60,6 +61,26 @@ inline constexpr std::string_view kRbacAssignableRoles[] = {
         if (r == role_name)
             return true;
     return false;
+}
+
+/// The M1 uniform-rejection audit reason for a `role_name` that fails
+/// `is_rbac_assignable_role` — ONLY call this when it does. Doomgoose
+/// external review, PR #4985 MINOR "duplicated role-rejection reason
+/// string": this exact ITServiceOwner-specific-vs-generic text was
+/// duplicated verbatim between the REST route (`rest_api_v1.cpp`) and the
+/// MCP tool handler (`mcp_server.cpp`). EXTEND this, never fork a second
+/// copy. `role_name_for_audit` is embedded in the generic branch's message
+/// VERBATIM — this function does NOT neutralize it itself, by design, so it
+/// can never silently double-neutralize a caller's own choice or silently
+/// skip one: REST passes an already-`audit_token`-neutralized value (its
+/// established CRLF/control-byte-safety convention, `web_utils.hpp`); MCP
+/// passes the raw value (its `role` input is schema-enum-constrained before
+/// this is ever reached, so nothing unsafe can reach it).
+[[nodiscard]] inline std::string rbac_role_rejection_reason(std::string_view role_name,
+                                                             std::string_view role_name_for_audit) {
+    if (role_name == "ITServiceOwner")
+        return "ITServiceOwner: requires group-scoped confinement, not supported fleet-wide";
+    return std::string(role_name_for_audit) + ": not one of the 6 fleet-wide-assignable roles";
 }
 
 } // namespace yuzu::server

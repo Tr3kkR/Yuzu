@@ -18,10 +18,14 @@
 
 #include "rbac_admin_predicate.hpp"
 
+#include "pg/pg_pool.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "test_rbac_store_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <chrono>
+#include <thread>
 
 using namespace yuzu::server;
 
@@ -136,6 +140,82 @@ TEST_CASE("is_rbac_administrator: RBAC on, ONLY a group-held Administrator grant
     // does not resolve (decision 2 in the header comment).
     auto gate = is_rbac_administrator(make_session("groupmember"), h.auth_db.get(), h.rbac.get());
     CHECK(gate == RbacAdminGate::kDenied);
+}
+
+// Doomgoose external review, PR #4985 (IMPORTANT #2): `rbac_enforcement_in_
+// effect()` deliberately returns `true` (enforcement "in effect") not only
+// when RBAC is genuinely enabled, but ALSO when the enabled-flag cache view
+// is DEGRADED (a refresh outage left a replica's cached rbac_enabled_ stale
+// — see rbac_store.cpp's #2703 comment right above it). Pre-fix,
+// `is_rbac_administrator`'s RBAC-on branch could not tell the two apart: a
+// degraded view with no matching Administrator row read as a confirmed
+// kDenied (403, terminal) instead of kUnavailable (503, retryable) —
+// contradicting this file's own header invariant that a transient store
+// hiccup must never masquerade as a permanent policy denial.
+//
+// Reproduces the degrade via the SAME technique as test_rbac_store.cpp's
+// "rbac_enforcement_in_effect fails closed when a generation refresh fails
+// PAST the bounded stale-serve window" test: a SECOND RbacStore replica on
+// its OWN size-1 pool, starved by holding its one connection, pushed past
+// kRbacStaleServeBoundMs (5000ms) so `generation_valid_` gets cleared by a
+// genuinely FAILED refresh attempt (not merely elapsed time with a healthy
+// pool — a healthy pool's very next successful refresh would self-heal the
+// view before this predicate ever observed it degraded, exactly as that
+// sibling file's neighboring "elapsed time alone" test warns). The starved
+// connection is then released so `is_rbac_administrator`'s OWN
+// `get_principal_roles_checked` read can succeed normally — the 1s
+// refresh-stampede gate (`kRbacGenerationRefreshMs`) keeps the very next
+// `is_rbac_enabled()` call (inside `rbac_enforcement_label`) on the fast,
+// no-query path, so it does not touch the now-healthy pool and does not
+// self-heal either. This reproduces exactly the combination the fix
+// targets: a CONFIRMED-empty row lookup on a view that is DEGRADED, not
+// genuinely enabled.
+TEST_CASE("is_rbac_administrator: RBAC-on branch reached via a DEGRADED "
+          "(not genuinely enabled) enforcement view, no Administrator row "
+          "-> kUnavailable, never kDenied",
+          "[pg][rbac_admin_predicate]") {
+    PredicateHarness h;
+    REQUIRE_FALSE(h.rbac->is_rbac_enabled()); // fresh install default: disabled
+
+    yuzu::server::pg::PgPool pool_b{{.conninfo = h.rbac.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    REQUIRE_FALSE(replica_b.is_rbac_enabled());
+    REQUIRE_FALSE(rbac_enforcement_in_effect(&replica_b)); // baseline: genuinely fresh+disabled
+
+    // Clear the 1s refresh-stampede gate so the next call genuinely attempts
+    // a durable re-read instead of serving the just-constructed cache.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // Starve replica_b's own pool: every maybe_refresh_generation() call
+    // from here on cannot acquire a connection and must fail.
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // First failed attempt lands well inside kRbacStaleServeBoundMs (5000ms)
+    // of construction — bounded stale-serve keeps this NOT degraded yet.
+    CHECK_FALSE(rbac_enforcement_in_effect(&replica_b));
+
+    // Push wall time past the bound, still starved — this failed attempt is
+    // the one that finally exceeds the bound and clears generation_valid_.
+    std::this_thread::sleep_for(std::chrono::milliseconds(4200));
+    REQUIRE(rbac_enforcement_in_effect(&replica_b));
+    REQUIRE(rbac_enforcement_label(&replica_b) == RbacEnforcementLabel::kDegraded);
+
+    // Release the starved connection — see the comment above the TEST_CASE
+    // for why the very next read still observes the degraded view.
+    held.reset();
+
+    // No principal_roles(user, *, Administrator) row exists anywhere on this
+    // database. Pre-fix, reaching the RBAC-on branch (because
+    // rbac_enforcement_in_effect() returned true above) with no matching row
+    // was read as a confirmed kDenied regardless of WHY that branch was
+    // reached. Post-fix, the degraded case maps a missing row to
+    // kUnavailable instead — "could not confirm", not "confirmed not
+    // admin".
+    auto gate = is_rbac_administrator(make_session("whoever"), h.auth_db.get(), &replica_b);
+    CHECK(gate == RbacAdminGate::kUnavailable);
 }
 
 TEST_CASE("is_rbac_administrator: null RbacStore -> kUnavailable regardless of "

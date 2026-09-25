@@ -363,6 +363,10 @@ TEST_CASE("REST POST .../rbac/roles/{name}/assignments: RBAC-off durable admin "
     REQUIRE(res);
     CHECK(res->status == 201);
     CHECK(res->body.find("\"assigned\":true") != std::string::npos);
+    // Doomgoose external review, PR #4985 (IMPORTANT #3): "jane" has no
+    // auth.users row at all — the "false" leg of the target_provisioned
+    // three-state field.
+    CHECK(res->body.find(R"("target_provisioned":"false")") != std::string::npos);
 
     auto roles = h.rbac->get_principal_roles("user", "jane");
     REQUIRE(roles.size() == 1);
@@ -385,6 +389,83 @@ TEST_CASE("REST POST .../rbac/roles/{name}/assignments: RBAC-on durable admin "
                              R"({"principal_type":"user","principal_id":"jane"})");
     REQUIRE(res);
     CHECK(res->status == 201);
+    CHECK(h.rbac->get_principal_roles("user", "jane").size() == 1);
+}
+
+// MINOR (Doomgoose external review, PR #4985): the enum-sync test
+// (kRbacAssignableRoles matches the MCP schema's role enum) covers the
+// ALLOW-LIST itself, but only 3 of the 6 names were ever exercised via a
+// REAL assign call anywhere in this file (Administrator/Operator/Viewer) —
+// PlatformEngineer/ApiTokenManager/Reviewer never went through the actual
+// route. Small, direct coverage for the remaining 3.
+TEST_CASE("REST POST .../rbac/roles/{name}/assignments: the remaining 3 "
+          "allow-listed roles (PlatformEngineer/ApiTokenManager/Reviewer) "
+          "assign successfully too",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    for (const std::string role : {"PlatformEngineer", "ApiTokenManager", "Reviewer"}) {
+        const std::string principal = "user-" + role;
+        auto res = h.assign_rest(
+            role, R"({"principal_type":"user","principal_id":")" + principal + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        auto roles = h.rbac->get_principal_roles("user", principal);
+        REQUIRE(roles.size() == 1);
+        CHECK(roles[0].role_name == role);
+    }
+}
+
+// Doomgoose external review, PR #4985 (IMPORTANT #3): the target_provisioned
+// three-state field ("true"/"false"/"unknown") had zero test coverage
+// despite docs/test-coverage.md claiming otherwise. Three cases below cover
+// all three states through the real REST assign route.
+
+TEST_CASE("REST POST .../rbac/roles/{name}/assignments: target_provisioned is "
+          "\"true\" for an existing ACTIVE auth.users row",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true); // RBAC-on: the admin gate never touches auth.users
+    REQUIRE(h.auth_db->upsert_user("jane", "hash", "salt", auth::Role::user).has_value());
+
+    auto res = h.assign_rest("Operator",
+                             R"({"principal_type":"user","principal_id":"jane"})");
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(res->body.find(R"("target_provisioned":"true")") != std::string::npos);
+    CHECK(h.rbac->get_principal_roles("user", "jane").size() == 1);
+}
+
+TEST_CASE("REST POST .../rbac/roles/{name}/assignments: target_provisioned is "
+          "\"unknown\" when the AuthDB read genuinely degrades (never "
+          "conflated with \"false\")",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true); // RBAC-on: the admin gate never touches auth.users
+
+    // Break ONLY get_user()'s own SELECT column list (mirrors
+    // test_auth_db_pg.cpp's break_load_mfa_row_only fault-injection idiom —
+    // DROP a column that ONE specific statement selects, leaving every
+    // other query against the same table, including the RBAC-on admin gate
+    // and assign_role's own write, completely unaffected). Each TEST_CASE
+    // gets its own cloned database, so the DDL is contained.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult alter{
+            PQexec(conn.get(), "ALTER TABLE auth.users DROP COLUMN identity_source")};
+        REQUIRE(alter.ok());
+    }
+
+    auto res = h.assign_rest("Operator",
+                             R"({"principal_type":"user","principal_id":"jane"})");
+    REQUIRE(res);
+    // The degraded read must never block the assignment itself (A2
+    // explicitly permits pre-provisioning even when the read to CONFIRM
+    // provisioning state fails) — only the reported state is affected.
+    CHECK(res->status == 201);
+    CHECK(res->body.find(R"("target_provisioned":"unknown")") != std::string::npos);
     CHECK(h.rbac->get_principal_roles("user", "jane").size() == 1);
 }
 
@@ -611,6 +692,13 @@ TEST_CASE("REST unassign: removing the fleet's last remaining Administrator "
           "[pg][rest][rbac][a2]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
+    // "soleadmin" MUST have a genuine, active auth.users row — a bare
+    // principal_roles grant with no matching active account is a GHOST
+    // admin, never counted as a survivor in the first place (Doomgoose
+    // external review, PR #4985 IMPORTANT #1), so removing ONLY a ghost
+    // grant would no longer be refused. This test is about a REAL last
+    // administrator.
+    REQUIRE(h.auth_db->upsert_user("soleadmin", "hash", "salt", auth::Role::user).has_value());
     REQUIRE(h.rbac->assign_role({"user", "soleadmin", "Administrator"}).has_value());
 
     auto res = h.unassign_rest("Administrator", "soleadmin");
@@ -807,6 +895,11 @@ TEST_CASE("MCP unassign_rbac_role: last-Administrator refusal is a JSON-RPC "
           "[pg][mcp][rbac][a2]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
+    // "soleadmin" MUST have a genuine, active auth.users row — see the REST
+    // twin's identical comment (Doomgoose external review, PR #4985
+    // IMPORTANT #1): a bare grant with no matching active account is a
+    // GHOST admin, never counted as a survivor.
+    REQUIRE(h.auth_db->upsert_user("soleadmin", "hash", "salt", auth::Role::user).has_value());
     REQUIRE(h.rbac->assign_role({"user", "soleadmin", "Administrator"}).has_value());
 
     auto res = h.mcp_call_tool_approved(

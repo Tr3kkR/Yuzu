@@ -21918,9 +21918,14 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // removed=<bool> (governance SHOULD #10, matching the
+                // human-route convention) lets an auditor tell an actual
+                // revoke apart from an idempotent no-op from the log alone
+                // (Doomgoose external review, PR #4985 MINOR "audit-fidelity
+                // asymmetry").
                 bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.role.unassigned", "success", "EnginePrincipal",
-                    principal_id, role_name);
+                    principal_id, role_name + "; removed=" + (*result ? "true" : "false"));
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). The grant was removed but its audit row did not
@@ -21968,22 +21973,26 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto gate = is_rbac_administrator(*session, auth_db, rbac_store);
-                if (gate == RbacAdminGate::kUnavailable) {
-                    // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
-                    res.set_content(
-                        a4_error(kInternalError,
-                                 "service unavailable — cannot confirm administrator authority",
-                                 "retry shortly", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
+                // Doomgoose external review, PR #4985 MINOR "duplicated
+                // gate-denial classification" — shared chokepoint, see its
+                // own doc comment (rbac_admin_predicate.hpp).
+                if (deny_unless_rbac_administrator(
+                        gate,
+                        [&] {
+                            // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
+                            res.set_content(
+                                a4_error(kInternalError, kRbacAdminGateUnavailableMessage,
+                                         "retry shortly",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+                        },
+                        [&] {
+                            (void)audit_fn(req, "rbac.role.assigned", "denied", "User",
+                                           session->username, std::string(kRbacAdminGateDeniedAuditReason));
+                            res.set_content(a4_error(kPermissionDenied, kRbacAdminGateDeniedMessage),
+                                            "application/json");
+                        }))
                     return;
-                }
-                if (gate != RbacAdminGate::kAdmin) {
-                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", session->username,
-                                   "caller is not a durable RBAC administrator");
-                    res.set_content(a4_error(kPermissionDenied, "administrator role required"),
-                                    "application/json");
-                    return;
-                }
                 // Empty mcp_tier guard (adversarial-review PR1/A2 round-2 finding,
                 // #4309 gap class): an empty tier makes tier_allows()/requires_approval()
                 // both no-op (tier_allows("") == true, requires_approval("") == false),
@@ -22066,11 +22075,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // ITServiceOwner named exclusion (delivery plan §2) AND a
                 // genuinely unknown/custom role name, uniformly.
                 if (!is_rbac_assignable_role(role_name)) {
-                    const std::string reason =
-                        role_name == "ITServiceOwner"
-                            ? "ITServiceOwner: requires group-scoped confinement, not "
-                              "supported fleet-wide"
-                            : role_name + ": not one of the 6 fleet-wide-assignable roles";
+                    const std::string reason = rbac_role_rejection_reason(role_name, role_name);
                     (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
                                    reason);
                     res.set_content(error_response(id, kInvalidParams, kUniformReject),
@@ -22150,22 +22155,26 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto gate = is_rbac_administrator(*session, auth_db, rbac_store);
-                if (gate == RbacAdminGate::kUnavailable) {
-                    // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
-                    res.set_content(
-                        a4_error(kInternalError,
-                                 "service unavailable — cannot confirm administrator authority",
-                                 "retry shortly", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
+                // Doomgoose external review, PR #4985 MINOR "duplicated
+                // gate-denial classification" — shared chokepoint, see its
+                // own doc comment (rbac_admin_predicate.hpp).
+                if (deny_unless_rbac_administrator(
+                        gate,
+                        [&] {
+                            // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
+                            res.set_content(
+                                a4_error(kInternalError, kRbacAdminGateUnavailableMessage,
+                                         "retry shortly",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+                        },
+                        [&] {
+                            (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
+                                           session->username, std::string(kRbacAdminGateDeniedAuditReason));
+                            res.set_content(a4_error(kPermissionDenied, kRbacAdminGateDeniedMessage),
+                                            "application/json");
+                        }))
                     return;
-                }
-                if (gate != RbacAdminGate::kAdmin) {
-                    (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", session->username,
-                                   "caller is not a durable RBAC administrator");
-                    res.set_content(a4_error(kPermissionDenied, "administrator role required"),
-                                    "application/json");
-                    return;
-                }
                 // Empty mcp_tier guard — see assign_rbac_role's identical guard
                 // above for the full reasoning (adversarial-review PR1/A2 round-2
                 // finding, #4309 gap class).

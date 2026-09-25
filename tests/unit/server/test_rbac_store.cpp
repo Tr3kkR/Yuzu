@@ -128,6 +128,55 @@ void seed_active_user(yuzu::test::AuthDbPg& auth_db, const std::string& username
     REQUIRE(auth_db->upsert_user(username, "hash", "salt", auth::Role::user).has_value());
 }
 
+/// Doomgoose external review, PR #4985 (IMPORTANT #6): poll `pg_stat_activity`
+/// for a backend GENUINELY blocked on a Postgres lock (row lock via `FOR
+/// UPDATE`, or an advisory lock — both register `wait_event_type = 'Lock'`),
+/// rather than a blind `sleep_for` + assume-timing "prove a thread has
+/// started" (CLAUDE.md forbids sleep_for+assume-timing synchronization for
+/// correctness — a sleep-gated interleaving proof can flake on a loaded
+/// shared CI runner even though the load-bearing correctness here depends on
+/// the real lock, not the sleep duration).
+///
+/// MUST run on its OWN ad-hoc connection, opened here from `dsn` — NEVER on
+/// the lock HOLDER's own connection, even though that connection is idle and
+/// available to accept a new query. Verified empirically while building this
+/// fix (5+ minute live-PG debugging session, not a documentation guess):
+/// `pg_stat_activity` is snapshotted ONCE per transaction (PostgreSQL's own
+/// documented statistics-view behavior — "information ... is collected when
+/// any such information is first requested within a transaction, and the
+/// same information will be displayed throughout the transaction"). The lock
+/// holder's connection (e.g. `lease_a` in every caller below) is ALWAYS
+/// mid-explicit-transaction (`BEGIN` already issued) by the time this is
+/// called, so probing through it would take ONE snapshot on the first poll
+/// iteration and silently keep re-reading that SAME frozen, pre-block
+/// snapshot for every remaining iteration — never observing the waiter no
+/// matter how long or how many times it polls. This exact bug shipped in an
+/// earlier draft of this fix and hung every test using it indefinitely (the
+/// blocked backend was real — confirmed via `pg_backend_pid()` self-query
+/// and independent `psql` inspection — `pg_stat_activity` just never
+/// refreshed on the probing connection to show it). A separate, dedicated
+/// connection issuing bare autocommit statements (no explicit `BEGIN`) gets
+/// a fresh snapshot on every single statement, which is what makes polling
+/// here actually work. `own_pid` excludes the lock HOLDER's own backend so
+/// it's never mistaken for the waiter. Bounded: up to `max_attempts` x 50ms
+/// (5s by default) before giving up and returning 0.
+int poll_for_blocked_backend_pid(const std::string& dsn, int own_pid, int max_attempts = 100) {
+    pg::PgConn probe{PQconnectdb(dsn.c_str())};
+    if (PQstatus(probe.get()) != CONNECTION_OK)
+        return 0;
+    for (int i = 0; i < max_attempts; ++i) {
+        pg::PgResult r = pg::exec_params(probe.get(),
+                                         "SELECT pid FROM pg_stat_activity WHERE datname = "
+                                         "current_database() AND wait_event_type = 'Lock' "
+                                         "AND pid <> $1",
+                                         std::vector<std::string>{std::to_string(own_pid)});
+        if (r.ok() && PQntuples(r.get()) == 1)
+            return std::atoi(PQgetvalue(r.get(), 0, 0));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return 0;
+}
+
 TEST_CASE("RbacStore migration lands at v4 and poisons (not deletes) the backfill marker rows "
           "(#3623, governance unhappy-path fix)",
           "[rbac_store][pg][migration]") {
@@ -617,6 +666,8 @@ TEST_CASE("RbacStore: seed_defaults()'s grant() cannot resurrect a permission mi
     // write racing a concurrent seed_defaults() boot on another connection.
     auto lease_a = rbac_pool_fx_.acquire();
     REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
     REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
     REQUIRE(pg::exec_params(lease_a.get(),
                             "SELECT pg_advisory_xact_lock(2037545589, "
@@ -673,9 +724,11 @@ TEST_CASE("RbacStore: seed_defaults()'s grant() cannot resurrect a permission mi
     } joiner{grant_thread};
 
     // Give the grant thread time to start and genuinely block on connection
-    // A's held lock — proves this is a real blocked-then-unblocked
-    // interleaving, not a lucky race.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // A's held lock — poll pg_stat_activity for a real Lock wait rather than
+    // trust a fixed sleep duration to prove it (Doomgoose external review,
+    // PR #4985 IMPORTANT #6). MUST use a separate probe connection, never
+    // lease_a itself — see poll_for_blocked_backend_pid's own doc comment.
+    REQUIRE(poll_for_blocked_backend_pid(rbac_db_fx_.dsn(), lease_a_pid) != 0);
     CHECK(b_started.load());
     CHECK_FALSE(b_done.load());
 
@@ -888,6 +941,69 @@ TEST_CASE("RbacStore C1(c): last-admin guard refuses when the only 'other' "
     CHECK(store.get_principal_roles("user", "realadmin").size() == 1);
 }
 
+// Doomgoose external review, PR #4985 (IMPORTANT #1): the guard's post-delete
+// refusal previously fired on ANY post-delete zero count, not only when the
+// delete ITSELF removed one of the rows the earlier `SELECT ... FOR UPDATE OF
+// pr` lock query actually counted. A ghost/deactivated Administrator row is
+// never among those counted rows (it fails the `auth.users`/`is_active` JOIN)
+// -- so if it is the ONLY Administrator grant left, the active-admin count is
+// ALREADY zero before the call, and removing that ghost row cannot be what
+// drives the count from >0 to 0. Two sub-cases (never-existed vs.
+// deactivated), matching the C1(a)/(b) shape above.
+TEST_CASE("RbacStore: unassign_role SUCCEEDS removing a ghost Administrator "
+          "grant (no auth.users row at all) that is the ONLY Administrator "
+          "row left, instead of spuriously refusing",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    // "ghostadmin" has NO auth.users row — A2 explicitly permits
+    // pre-provisioning — and is the ONLY Administrator grant on this store,
+    // so the counted active-admin total is ALREADY zero before this call.
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+
+    auto result = store.unassign_role("user", "ghostadmin", "Administrator");
+    REQUIRE(result.has_value());
+    CHECK(*result); // a row was actually removed
+    CHECK(store.get_principal_roles("user", "ghostadmin").empty());
+}
+
+TEST_CASE("RbacStore: unassign_role SUCCEEDS removing a DEACTIVATED "
+          "Administrator grant that is the ONLY Administrator row left, "
+          "instead of spuriously refusing",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "deactivatedonly");
+    REQUIRE(store.assign_role({"user", "deactivatedonly", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("deactivatedonly").has_value());
+
+    auto result = store.unassign_role("user", "deactivatedonly", "Administrator");
+    REQUIRE(result.has_value());
+    CHECK(*result); // a row was actually removed
+    CHECK(store.get_principal_roles("user", "deactivatedonly").empty());
+}
+
+// MINOR (Doomgoose external review, PR #4985): the idempotent no-op shape a
+// regression here would actually spuriously refuse — unassigning
+// "Administrator" from a principal who never held it at all, on a store with
+// ZERO real (counted) admins. `removed` must be false and the call must
+// still succeed; a regression that fires the recount/refuse logic
+// unconditionally (ignoring `removed`) would wrongly reject this.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard is a true "
+          "no-op (not a refusal) for a principal who never held the role, "
+          "on a store with zero real administrators",
+          "[rbac_store][pg]") {
+    // RBAC_STORE_WITH_AUTH, not plain RBAC_STORE: role_name=="Administrator"
+    // always runs the guard's `JOIN auth.users`, which needs the `auth`
+    // schema present in this database — the shared "rbacstore" PgTestTemplate
+    // RBAC_STORE clones does NOT carry it (see RBAC_STORE_WITH_AUTH's own doc
+    // comment above).
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    REQUIRE(store.get_role_members("Administrator").empty());
+
+    auto result = store.unassign_role("user", "neverhadit", "Administrator");
+    REQUIRE(result.has_value());
+    CHECK_FALSE(*result); // no row was removed — genuine no-op
+}
+
 TEST_CASE("RbacStore: unassign_role's last-Administrator guard is scoped to the "
           "Administrator role only — a Viewer/Operator unassign on a ZERO-admin "
           "store still succeeds (fresh-install bootstrap shape, A2)",
@@ -1010,6 +1126,8 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
 
     auto lease_a = auth_db.pool().acquire();
     REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
     REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
     // Mirrors the production lock statement exactly (rbac_store.cpp) —
     // governance BLOCKING #1 re-verification: the JOIN must not weaken this
@@ -1045,8 +1163,12 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
         b_done = true;
     });
 
-    // Prove a real blocked-then-unblocked interleaving, not a lucky race.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Prove a real blocked-then-unblocked interleaving, not a lucky race:
+    // poll pg_stat_activity for the background thread's own backend
+    // registering a genuine Lock wait (Doomgoose external review, PR #4985
+    // IMPORTANT #6). MUST use a separate probe connection, never lease_a
+    // itself — see poll_for_blocked_backend_pid's own doc comment.
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
     CHECK(b_started.load());
     CHECK_FALSE(b_done.load());
 
@@ -1133,27 +1255,16 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard rolls back "
         b_done = true;
     });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Find the background thread's own backend, blocked on connection A's
+    // lock — never assume which pool slot it landed on. Poll pg_stat_activity
+    // for a genuine Lock wait rather than trust a fixed sleep duration
+    // (Doomgoose external review, PR #4985 IMPORTANT #6). MUST use a separate
+    // probe connection, never lease_a itself — see
+    // poll_for_blocked_backend_pid's own doc comment.
+    const int blocked_pid = poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid);
+    REQUIRE(blocked_pid > 0);
     CHECK(b_started.load());
     CHECK_FALSE(b_done.load());
-
-    // Find the background thread's own backend, blocked on connection A's
-    // lock — never assume which pool slot it landed on. Bounded poll: the
-    // 500ms sleep above already gives Postgres time to register the wait,
-    // so this should resolve on the first or second iteration.
-    int blocked_pid = 0;
-    for (int i = 0; i < 100 && blocked_pid == 0; ++i) {
-        pg::PgResult r = pg::exec_params(
-            lease_a.get(),
-            "SELECT pid FROM pg_stat_activity WHERE datname = current_database() "
-            "AND wait_event_type = 'Lock' AND pid <> $1",
-            std::vector<std::string>{std::to_string(lease_a_pid)});
-        if (r.ok() && PQntuples(r.get()) == 1)
-            blocked_pid = std::atoi(PQgetvalue(r.get(), 0, 0));
-        else
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    REQUIRE(blocked_pid > 0);
 
     // Sever it — the F1 ledger's "connection loss mid-txn" error path,
     // fired while the transaction is genuinely mid-flight (blocked on the

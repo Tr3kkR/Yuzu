@@ -1474,6 +1474,20 @@ bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
     return store->rbac_enabled_view_degraded();
 }
 
+RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
+    // Mirrors rbac_enforcement_in_effect()'s branch order and short-circuiting
+    // exactly (see that function's comments for the rationale on each step) —
+    // this is the SAME derivation, just split into three outcomes instead of
+    // two.
+    if (!store || !store->is_open())
+        return RbacEnforcementLabel::kDegraded;
+    if (store->is_rbac_enabled())
+        return RbacEnforcementLabel::kEnabled;
+    if (store->rbac_enabled_view_degraded())
+        return RbacEnforcementLabel::kDegraded;
+    return RbacEnforcementLabel::kDisabled;
+}
+
 // ── Roles CRUD ───────────────────────────────────────────────────────────────
 
 std::vector<RbacRole> RbacStore::list_roles() const {
@@ -1981,7 +1995,7 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // A2 last-Administrator guard ("A2 — Global human
         // role assignment/unassignment"). Scoped to role_name=="Administrator"
         // ONLY — every other unassign (including both existing engine-only
-        // callers, rest_api_v1.cpp:3232 and mcp_server.cpp:21727) stays a pure
+        // callers, rest_api_v1.cpp:3274 and mcp_server.cpp:21915) stays a pure
         // DELETE with no extra behavior. Unconditional would be WRONG, not
         // just unnecessary: a fresh install holds ZERO Administrator
         // `principal_roles` rows until A2's own assign route bootstraps the
@@ -2021,7 +2035,7 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // because `RbacStore` and `AuthDB` are ALWAYS constructed
         // on the SAME PgPool/database in production — ONE `--postgres-dsn`,
         // ONE `pg_pool_` member, both stores built from it
-        // (server.cpp:4532,6047; ADR-0006) — so `auth.users` is guaranteed
+        // (server.cpp:4603,6118; ADR-0006) — so `auth.users` is guaranteed
         // reachable from this same transaction/connection, never a
         // cross-database call. A degraded/missing `auth` schema fails the
         // whole SELECT (PGRES_TUPLES_OK check below), which aborts this
@@ -2042,6 +2056,18 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // the count against the first's now-durable delete. The LOCK set
         // and the COUNT set below both go through the identical JOIN, so
         // the lock always covers exactly the rows the count depends on.
+        // Doomgoose external review, PR #4985 (governance ledger a2-p3-doomgoose-1):
+        // the lock query's own result set is the ONLY correct membership test
+        // for "was the row being deleted itself one of the counted rows" — a
+        // ghost/deactivated Administrator grant that never appears here (it
+        // fails the `auth.users`/`is_active` JOIN) must never trip the
+        // post-delete refusal below, because deleting a row that was never
+        // counted cannot be what drove the count from >0 to 0. Capture the
+        // locked principal_ids so the refusal can be scoped to "this delete
+        // was itself one of them" rather than "the count is now 0" alone —
+        // the two are NOT equivalent when the count was already 0 going in
+        // (e.g. the only Administrator row left is a ghost/deactivated one).
+        std::unordered_set<std::string> locked_admin_principal_ids;
         if (role_name == "Administrator") {
             pg::PgResult lock_rows = pg::exec_params(
                 c,
@@ -2054,6 +2080,9 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
             if (lock_rows.status() != PGRES_TUPLES_OK) {
                 err = PQerrorMessage(c);
                 return false;
+            }
+            for (int i = 0; i < PQntuples(lock_rows.get()); ++i) {
+                locked_admin_principal_ids.insert(text_col(lock_rows.get(), i, 0));
             }
         }
 
@@ -2068,10 +2097,19 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         }
         removed = std::string(PQcmdTuples(r.get())) != "0";
 
-        // Only fire the count when this DELETE actually removed a row — an
-        // idempotent no-op unassign (the principal never held the role) must
-        // not spuriously reject.
-        if (role_name == "Administrator" && removed) {
+        // Only fire the count when this DELETE actually removed a row that was
+        // itself among the locked/counted rows above — an idempotent no-op
+        // unassign (the principal never held the role) must not spuriously
+        // reject, and neither must removing a row the count never included in
+        // the first place (a ghost/deactivated grant: `principal_type` isn't
+        // "user", or the principal_id never matched the JOIN/`is_active`
+        // filter above). Only `principal_type == "user"` rows are ever placed
+        // in `locked_admin_principal_ids`, so this also naturally excludes a
+        // group-held "Administrator" row per the "match the gate exactly"
+        // rule above.
+        const bool removed_a_counted_admin =
+            removed && principal_type == "user" && locked_admin_principal_ids.count(principal_id) > 0;
+        if (role_name == "Administrator" && removed_a_counted_admin) {
             pg::PgResult remaining = pg::exec_params(
                 c,
                 "SELECT count(*) FROM rbac_store.principal_roles pr "
