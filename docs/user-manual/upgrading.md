@@ -2994,6 +2994,21 @@ Before upgrading any component:
   `SERVICE_STOPPED` report doesn't trigger the recovery actions above
   either). See *Stopping a wedged agent* in
   [Server Administration](server-admin.md).
+- [ ] **Agent logging is now asynchronous, with a new self-exit code 5 (#4666
+  PR-2):** on upgrade, the agent stops writing log lines synchronously on the
+  thread that produced them and instead hands them off to a dedicated
+  logging worker thread over a fixed-size, pre-allocated 8192-slot queue
+  (3.34 MB of RSS, paid regardless of how much is actually logged). Under
+  sustained overload the queue drops the oldest still-queued lines
+  (`overrun_oldest`) rather than blocking or growing; there is no
+  `--log-sync` opt-out. Not a breaking change: same log format, same
+  `--log-file`/rotation behaviour, no new flags. The only new
+  operator-visible surface is a fifth self-exit code: tearing down the async
+  logger during shutdown is itself bounded by a 2-second internal watchdog,
+  and a wedge there self-terminates with **exit code 5**, distinct from the
+  existing 1, 3, and 4. A supervisor script or alert keyed to a fixed exit-code
+  set should widen it to include 5. See *Stopping a wedged agent* in
+  [Server Administration](server-admin.md).
 - [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
   as above, now applied to the server — graceful shutdown runs on a dedicated
   watcher thread (fixes the same abort/hang class on `SIGTERM`, previously

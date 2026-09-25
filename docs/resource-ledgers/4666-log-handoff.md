@@ -147,3 +147,98 @@ Verified: `[log_handoff]` green (12101 assertions/15 cases, the new U10 case inc
   `guardian_spark_runtime.cpp` are byte-for-byte unchanged by this PR. The synchronous-logging hazard
   this primitive exists to retire (`docs/spark-flip-gate.md` section 7) therefore remains exactly as it
   was before this PR until PR-2 lands.
+  **Amended (PR-2 wiring, this section's own update below): PR-2 has now landed** (`main.cpp`/`service_win.cpp` are no longer byte-for-byte unchanged); see the "PR-2 wiring" section below for the actual shipped call sites, and note that `guardian_engine.cpp`/`guardian_spark_runtime.cpp` remain untouched (a correction to an earlier PR-1-era prediction that PR-2 would also wire those two files, recorded in that section).
+
+## PR-2 wiring
+
+This section covers the resources `main.cpp`/`service_win.cpp`/`agent_log_wiring.hpp`/
+`service_completion.hpp`/`shutdown_deadline_guard.hpp` add to actually install and tear down PR-1's
+primitive in the shipped binary, matching this file's own header format (owner, acquire, release,
+failure path) for the new resources, then a narrative section for the repro evidence, the firewall
+defect, and the corrections this wiring makes to PR-1's own forward-looking claims.
+
+| Resource | Owner | Acquire | Release | Failure path |
+|---|---|---|---|---|
+| `main()`-owned `LogHandoff` (the pool/logger/sinks PR-1 built) | A single `std::unique_ptr<LogHandoff>` local in `main()` (`main.cpp:697`), constructed from `LogHandoff::create()` on the main thread | `main.cpp:681`, immediately after CLI parsing translates into `LogHandoff::Options` via `make_log_handoff_options()` (`agent_log_options.hpp`) | Implicitly, when the `unique_ptr` goes out of scope at the end of `main()` | A construction failure (`create()` returns `std::unexpected`) prints to `std::cerr` and returns `EXIT_FAILURE` before anything is installed (`main.cpp:682-686`) |
+| `LogHandoffEpilogue` (RAII teardown trigger) | Stack-local in `main()` (`main.cpp:698`), declared IMMEDIATELY after the `LogHandoff` it wraps and before `agent` is constructed | `main.cpp:698`, same statement | Its destructor, on every return path out of `main()` (normal return, the Windows-service early `return run_service(...)`, or an early `EXIT_FAILURE`), by C++ reverse-declaration-order destruction, so it runs AFTER `agent` (declared later) has already been destroyed and can no longer log | Its destructor (`agent_log_wiring.hpp:109`) calls `release_log_handoff_from_this_image()`, which is itself `noexcept` and internally `try`/`catch`-firewalled around the null-logger swap (the `h.teardown()` call below it is unconditional and already `noexcept`) |
+| Exe-image null-logger swap | `release_log_handoff_from_this_image()` (`agent_log_wiring.hpp:91-101`), called only from `LogHandoffEpilogue`'s destructor | Same call | N/A (a one-shot swap, not a held resource) | Firewalled in its own `try`/`catch(...)`; if the swap itself throws, `h.teardown()` still runs unconditionally immediately after (the comment at `agent_log_wiring.hpp:96-98` states this explicitly) |
+| `g_service_main_done` (`std::binary_semaphore`) + `SemaphoreReleaseGuard` | File-local `std::binary_semaphore` in `service_win.cpp:61`; the guard (`service_completion.hpp:20-38`) is `service_main()`'s absolute FIRST-declared local (`service_win.cpp:199`), outside its own `try` block | The guard is constructed at `service_main()` entry, before `RegisterServiceCtrlHandlerExW` | The guard's destructor releases the semaphore, and because it is declared first it is destroyed LAST (after every other local and both `catch` blocks in `service_main()`), on every exit path that function has | The release call is itself wrapped in `try`/`catch(...)` (`service_completion.hpp:24-30`); a semaphore release is not expected to throw in practice, but the guard runs during shutdown and must never propagate |
+| `run_service()`'s post-dispatcher wait | Local to `run_service()` (`service_win.cpp:454-457`); waits on `g_service_main_done` via `wait_for_service_main_completion()` (`service_completion.hpp:44-51`) | Called once, immediately after `StartServiceCtrlDispatcherW` returns `TRUE` | The wait itself is bounded (`kServiceMainDrainGrace{20'000}`, `service_win.cpp:65`); it either returns `true` (semaphore acquired in time) or `false` | On `false` (timeout), `run_service()` calls `hard_exit(kShutdownDeadlineExitCode)` (exit **4**, not 5, reusing the existing shutdown-deadline code rather than minting a new one, per `shutdown_deadline_guard.hpp:35-40`'s own doc comment) |
+| `drain_log_bounded()` call site 1 (main.cpp F3 orphan path) | No owned resource; a bounded, best-effort attempt to land a just-logged `spdlog::critical()` line before `hard_exit(3)` | `main.cpp:993`, inside the SAME `try`/`catch(...)` as the preceding `spdlog::critical()` call (see the firewall-defect note below) | Returns after at most 200ms (the literal passed at this call site) | Any exception from `drain_log_bounded()` (it is not `noexcept`, per `log_handoff.hpp`) is caught by the same `catch (...)` that guards the `critical()` call above it, so it can never skip the `hard_exit(3)` immediately following |
+| `drain_log_bounded()` call site 2 (service_win.cpp, replacing the old ad-hoc `flush()`) | Same primitive, unconditional best-effort call | `service_win.cpp:297`, right after `agent->run()` returns and before the `SERVICE_STOPPED`/specific-error `report_status()` chain | Bounded at 200ms | Not inside a `try`/`catch` at this specific call site (unlike site 1 and 3) because nothing `hard_exit()`-sensitive immediately follows it here; an uncaught exception here would propagate to `service_main()`'s own outer `catch` blocks, which still report a status before returning |
+| `drain_log_bounded()` call site 3 (service_win.cpp F3 orphan path) | Same primitive | `service_win.cpp:374`, inside the SAME `try`/`catch(...)` as its preceding `spdlog::critical()` call, mirroring site 1 | Bounded at 200ms | Same firewall reasoning as site 1: guarded so an exception here cannot skip the `hard_exit(3)` immediately following |
+
+**Empirical RED/GREEN repro (per the implementing session's own commit record, `a2929eee1`; not independently
+re-run in this docs-only pass).** Before this wiring: a 4KiB-constrained stderr pipe under trace-level
+logging and `SIGTERM` left the agent alive past 8 seconds, requiring `SIGKILL`. After this wiring: the
+same repro exits within approximately 3 seconds, self-reporting exit code 5 (the log-teardown watchdog
+firing under sustained blockage, a documented legitimate outcome given the repro holds the pipe open for
+the whole wait loop), consistently across repeated runs; the "Received signal, shutting down..." line was
+confirmed present in the log file, proving the relocated log call fires from its barriered call site. These
+figures are as recorded in the commit message that introduced the wiring, not independently reproduced by
+this docs pass.
+
+**Firewall defect independently found and fixed by both implementers before shipping.** `drain_log_bounded()`
+is not declared `noexcept` (`log_handoff.hpp`). Both the `main.cpp` F3 site and the `service_win.cpp` F3 site
+initially had their own `drain_log_bounded()` call sitting AFTER the existing `catch(...)` and BEFORE
+`hard_exit(3)`, unguarded, so an exception there would have skipped `hard_exit(3)` entirely, violating the
+block's own stated invariant ("a logging exception here must never skip hard_exit() below"). `main.cpp`'s
+instance was caught during integration review and fixed in `e2dfc811a` (moved inside the existing `try`,
+alongside the `spdlog::critical()` call it follows); `service_win.cpp`'s independently-authored equivalent
+site hit and self-corrected the identical hazard in its own draft before either was committed (see the
+comment at `main.cpp:972-977`, which cites this explicitly: "service_win.cpp's equivalent F3 site hit and
+fixed the identical hazard independently"). Recorded here because this is exactly the kind of
+governance-relevant history this ledger exists to capture: the same class of defect, reached independently
+by two separate implementation passes over two different files, both caught before merge.
+
+**PR-1's round-6 open process recommendation, now answered by this wiring's actual shape.** PR-1's own
+ledger (above, end of the round-6 section) recorded two competing views on whether PR-2 needed a structural
+shared-ownership rework of `LogHandoff` (mirroring `DrainHandle`/`DrainLease`) before a second concurrent
+`teardown()` caller could exist safely, or whether confirming single-thread ownership at PR-2's actual call
+site was enough. `grep -rn "\.teardown(" agents/core/src/*.cpp agents/core/src/*.hpp` (excluding tests) finds
+exactly ONE production call site: `agent_log_wiring.hpp:100`, inside `release_log_handoff_from_this_image()`,
+itself called only from `LogHandoffEpilogue`'s destructor, itself constructed exactly once, in `main()`, on
+the main thread. There is no second concurrent caller anywhere in the shipped binary. This confirms
+cpp-safety's round-6 recommendation held: PR-2's actual call site is the SAFE, single-threaded-owner case by
+construction, and the structural rework was correctly deferred.
+
+**Corrections to PR-1's own forward-looking claims, found while wiring this wiring's own documentation.**
+(1) `log_handoff.hpp`'s file banner (lines 13-16) states "PR-2 wires main.cpp's/service_win.cpp's real
+install()/teardown() call sites and the guardian_engine.cpp/guardian_spark_runtime.hpp drain_log_bounded()
+call sites." The first half is accurate; the second half is not, as of this PR-2: `grep -rn
+"drain_log_bounded\|log_handoff" agents/core/src/guardian_engine.cpp agents/core/src/guardian_spark_runtime.hpp`
+returns nothing. Neither file gained a `drain_log_bounded()` call in this PR-2, and on inspection neither has
+its own `hard_exit()` call site that would need one; the only production `hard_exit()`s near Guardian/Spark
+teardown are `main.cpp`'s and `service_win.cpp`'s own F3 orphan checks, both of which ARE wired (the three
+call sites in the table above). `docs/spark-flip-gate.md`'s 2026-09-25 status update records the same finding
+against the flip precondition it actually matters for; this header comment should be corrected in a future
+change, since as written it will mislead the next reader into searching for wiring that was never added.
+(2) PR-1's own ledger (round-3 section, "Forward-looking, PR-2/PR-3's job" bullet list, near the end of the
+round-3 section above) named three obligations for PR-2/PR-3: (a) `server-admin.md`'s exit-code enumeration
+needs a code-5 entry once a reachable call site exists. Done, in this same change (`docs/user-manual/server-admin.md`'s
+*Stopping a wedged agent* section). (b) PR-3's heartbeat-poller tracking issue, not this PR's job, still open.
+(c) re-deriving the sequential shutdown-grace composition arithmetic for wherever `teardown()`'s call site
+landed, against the applicable SCM/systemd stop timeout. Done, in this same change (`server-admin.md`'s "A
+third, independent watchdog..." paragraph gives the POSIX 45-second bounded-phase sum and the Windows-service
+shape, and notes the genuinely unbounded phases neither figure covers).
+
+**Trigger rows and invariants this wiring was checked against (extends the PR-1 section above).**
+
+- Spark detection layer row, clause (4): still applicable, for the same reason PR-1's own section states.
+  `main.cpp:993` and `service_win.cpp:297,374` are the actual shipped call sites into `hard_exit.hpp`'s
+  pattern this wiring adds; no new `spark_engine.*`/`spark_mechanism.*`/`guardian_spark_*` file is touched by
+  this wiring itself.
+- Durable agent command idempotency row: not triggered, for the same reason as PR-1 (no
+  `command_dedup_store.*`/Subscribe command loop code is touched by this wiring).
+- `common/include/` firewall: not triggered (`main.cpp`, `service_win.cpp`, `agent_log_wiring.hpp`,
+  `service_completion.hpp` all live in `agents/core/src/`, not `common/include/`).
+- Resource ownership / RAII: every new owner in the table above is either a stack-local RAII guard with a
+  single, clearly-stated release point, or a plain semaphore/atomic with a documented owner thread. No raw
+  `new`/`delete`, no manual thread join outside what PR-1's own primitives already own.
+- Windows service shutdown (ADR-0021 rung 7.7a family): the F3 orphan-exit contract this wiring's
+  `drain_log_bounded()` breadcrumbs sit next to is unchanged in substance by this PR; the new
+  `run_service()` drain-grace wait is a genuinely new watchdog, reusing the existing `kShutdownDeadlineExitCode`
+  (4) rather than the log-teardown-specific `kLogTeardownExitCode` (5), a deliberate choice recorded in
+  `shutdown_deadline_guard.hpp`'s own updated doc comment and cross-checked against the actual code in this
+  pass (the two are easy to conflate; they are NOT the same watchdog and do not share a grace value).
+

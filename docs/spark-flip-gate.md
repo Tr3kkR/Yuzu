@@ -1798,6 +1798,28 @@ adjudicated ACCEPT-WITH-PRECONDITION: the live legacy path and the dormant Spark
 MEDIUM for the #4606 diff, and a flip PR still carrying synchronous writes derives HIGH and is
 BLOCKING. This precondition is tracked in #4666.
 
+**Status update (2026-09-25): #4666 PR-1 and PR-2 have landed; the precondition above is
+substantially addressed, with one residual gap flagged, not fully closed.** PR-1
+(`agents/core/src/log_handoff.hpp/.cpp`, merged as #4970) built the bounded async log
+hand-off primitive standalone, wired into nothing yet. PR-2 (`main.cpp`/`service_win.cpp`,
+this doc's own #4666 references above) installs that primitive as the process's spdlog
+default logger, so every bare `spdlog::` call anywhere in the process, including the
+Spark runtime's own arm-committed/late-arm/sweep-residue lines and the `T_wire` line on
+the legacy guard worker, now enqueues onto the bounded async queue and returns rather
+than blocking on sink I/O, on Linux and Windows (confirmed single spdlog registry per
+process on both; see `docs/darwin-compat.md`'s new "spdlog registry identity across
+images" row for the still-pending macOS measurement and its own residual gap even once
+that lands). This is the mechanism the precondition asked for: it comes from installing
+one process-wide default logger, not from touching each call site individually. What PR-2
+does NOT do, despite an earlier PR-1-era header comment predicting it would: it adds no
+`drain_log_bounded()` pre-abort breadcrumb calls inside `guardian_engine.cpp` or
+`guardian_spark_runtime.hpp` (grep-confirmed absent as of this update). On inspection
+neither file has its own `hard_exit()` call site that would need one; the only production
+`hard_exit()`s near Guardian/Spark teardown are `main.cpp`'s and `service_win.cpp`'s own
+F3 orphan-exit checks, and those ARE wired with a breadcrumb. The still-future `T_server`
+piece (server-side, PR-4 in the #4666 ladder) is untouched by either PR-1 or PR-2 and
+remains separately tracked.
+
 **NEW precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
 governance review of the rule-id neutralisation): agent-side `Guardian T_detect` and `T_wire` lines may
 be used as latency evidence only if either every operator-authored identifier the agent logs is
