@@ -676,19 +676,31 @@ TEST_CASE("GuardianEngine: a push where every rule_id is valid is unaffected by 
     CHECK(f.engine->policy_generation() == 3);
 }
 
-TEST_CASE("GuardianEngine: a full_sync push correctly disarms a pre-#4665 legacy rule "
-          "the server excludes for a non-conforming rule_id (hard cutover, not preserved)",
+TEST_CASE("GuardianEngine: a full_sync push clears a pre-#4665 legacy rule's PERSISTED "
+          "state when the server excludes it for a non-conforming rule_id (hard cutover, "
+          "not preserved)",
           "[guardian][engine][apply][validation][full_sync]") {
     // Governance-external-review finding (fjarvis, PR #4979): apply_rules()'s own
     // pre-validation now rejects any push CONTAINING a non-conforming rule_id, and
     // guardian_push_builder.cpp's server-side filter (#4665) excludes such a row
     // from every push it builds -- so the only way this state exists in a real
-    // fleet is a row that predates #4665 entirely, already-armed, now silently
-    // ABSENT from every push. Seeded directly into KV here (the only way to reach
-    // it, since apply_rules() can no longer be used to create it) to prove the
-    // full_sync/exclusion interaction actually disarms it cleanly -- Dave's
-    // explicit call: this is a hard cutover, not a migration, so "cleanly disarmed"
-    // is the CORRECT outcome to pin, not a bug to route around.
+    // fleet is a row that predates #4665 entirely, now silently ABSENT from every
+    // push. Seeded directly into KV here (the only way to reach it, since
+    // apply_rules() can no longer be used to create it) to prove the
+    // full_sync/exclusion interaction actually clears its persisted state cleanly
+    // -- Dave's explicit call: this is a hard cutover, not a migration, so
+    // "cleanly cleared" is the CORRECT outcome to pin, not a bug to route around.
+    //
+    // What this pins vs. what it doesn't (Gate-8 re-verification finding, LOW,
+    // 2026-09-25): it proves the KV row is genuinely deleted -- the crux of the
+    // hard-cutover behaviour, and what apply_rules() itself controls. It does NOT
+    // prove a previously-RUNNING legacy guard gets torn down, because this
+    // codebase's own Windows-only-for-MVP legacy backends (make_registry_rule's
+    // and make_file_hash_rule's own doc comments, above) mean armed_guard_count()
+    // cannot observe a real arm on this test's Linux CI host regardless of what
+    // this fix touches -- that teardown path (stop_all_guards_locked(), already
+    // unconditional and unchanged by this fix) is proven separately by this
+    // file's other full_sync TEST_CASEs, not re-proven here.
     GuardianFixture f;
     nlohmann::json legacy;
     legacy["rule_id"] = "bad id";

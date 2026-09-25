@@ -2810,12 +2810,13 @@ rate limit as `Guardian push: rule ... has a rule_id that fails the .../256-byte
 `spec_json` is already excluded — and the agent's `full_sync` path unconditionally tears down and
 rebuilds its ENTIRE active rule set from whatever the push actually contains. Put together: **the
 first `full_sync` an upgraded agent receives permanently disarms every rule with a non-conforming
-`rule_id`** (logged at `warn` on the agent as `Guardian: full_sync is disarming N rule(s) with a
-rule_id outside the [A-Za-z0-9._-]+/256-byte charset (#4665) — hard cutover, not preserved`). This
-is not silent — both the exclusion (server-side) and the disarm (agent-side) are logged and
-metered — but it IS a real, one-time loss of a previously-enforcing control if you don't act first.
-Every OTHER rule in scope is unaffected either way — this only ever touches rows that were already
-unenforceable by the documented contract.
+`rule_id`** (logged at `warn` on the agent, matching `full_sync is disarming N rule(s) with a
+rule_id outside the [A-Za-z0-9._-]+/256-byte charset (#4665) -- hard cutover, not preserved`). This
+is not silent — the server-side exclusion is both logged AND metered
+(`yuzu_guardian_push_rule_excluded_total`); the agent-side disarm is logged only, with no metric of
+its own yet — but it IS a real, one-time loss of a previously-enforcing control if you don't act
+first. Every OTHER rule in scope is unaffected either way — this only ever touches rows that were
+already unenforceable by the documented contract.
 
 **Finding a non-conforming legacy `rule_id` — do this BEFORE upgrading, not after:** `GET
 /api/v1/guaranteed-state/rules` returns every rule regardless of its `rule_id`'s shape; filter the
