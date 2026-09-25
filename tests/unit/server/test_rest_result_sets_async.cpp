@@ -2716,8 +2716,15 @@ TEST_CASE("POST /api/v1/inventory/evaluate: no malformed record present -- "
     CHECK_FALSE(body.contains("results_excluded_by_parse_error"));
 }
 
-TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on all 8",
+TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on all 9",
           "[pg][result_set][security]") {
+    // #4980: from-inventory-query joined the other 8 hard-denied siblings —
+    // previously it gated purely via fleet_read_fn's admit-and-confine
+    // branch, which ADMITS a service-scoped caller rather than denying it,
+    // even though the result set it materializes is owner-scoped to
+    // session->username (the minting principal's identity, not the token's
+    // own service tag) — the same cross-service-reach class the other 8
+    // routes' hard-deny exists to prevent.
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -2749,12 +2756,22 @@ TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on a
     CHECK(post("/api/v1/result-sets/" + id + "/pin", "{}") == 403);
     CHECK(post("/api/v1/result-sets/" + id + "/unpin", "{}") == 403);
     CHECK(del("/api/v1/result-sets/" + id) == 403);
+    CHECK(post("/api/v1/result-sets/from-inventory-query",
+                R"({"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":"linux"}]})") ==
+          403);
 
     bool saw_list_denied = false;
     for (const auto& a : h.audits)
         if (a.action == "result_set.list.access_denied" && a.result == "denied")
             saw_list_denied = true;
     CHECK(saw_list_denied);
+
+    bool saw_from_inventory_query_denied = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create.access_denied" && a.result == "denied" &&
+            a.detail.find("from-inventory-query") != std::string::npos)
+            saw_from_inventory_query_denied = true;
+    CHECK(saw_from_inventory_query_denied);
 }
 
 TEST_CASE("owner-scoped result-set routes: an ordinary session is unaffected "

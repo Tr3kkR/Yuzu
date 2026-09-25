@@ -10390,8 +10390,36 @@ void RestApiV1::register_routes(
         // narrowed to that set's current members.
         sink.Post("/api/v1/result-sets/from-inventory-query",
                   [auth_fn, fleet_read_fn, audit_fn, result_set_store, inventory_store,
-                   metrics_registry, rs_to_json, rs_err,
-                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                   metrics_registry, rs_to_json, rs_err, load_owned,
+                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                    httplib::Response& res) {
+                      // #4980: this tool's 8 non-dispatch siblings in the
+                      // result-sets family hard-deny a service-scoped token
+                      // outright via this same helper (see the GET/POST
+                      // /api/v1/result-sets handlers above). This route
+                      // instead gated purely via fleet_read_fn's own
+                      // admit-and-confine branch, which ADMITS a service-
+                      // scoped caller (narrowed to its scope) rather than
+                      // denying it — but the result set this call
+                      // materializes is owner-scoped to session->username
+                      // (the minting PRINCIPAL's identity, not the token's
+                      // own service tag), so a service-scoped token holding
+                      // Inventory:Read could mint a result set the minting
+                      // principal's OTHER tokens/session can then read —
+                      // the exact cross-service-reach class the siblings'
+                      // hard-deny exists to prevent. No `.permission` label
+                      // (explicit "" — matches every sibling call site
+                      // above): a service-scoped caller holding
+                      // Inventory:Read is STILL denied outright after this
+                      // fix, so naming Inventory:Read as "the permission
+                      // that would help" would be a false self-remediation
+                      // claim.
+                      if (deny_fleet_wide_service_scoped(
+                              req, res, "result_set.create.access_denied", "ResultSet",
+                              "result-set-from-inventory-query create denied to a "
+                              "service-scoped token",
+                              "service-scoped tokens may not create result sets", "", ""))
+                          return;
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
