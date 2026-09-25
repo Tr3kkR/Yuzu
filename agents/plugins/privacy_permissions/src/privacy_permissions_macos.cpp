@@ -234,7 +234,8 @@ std::vector<macos::TccServiceRead> read_services(sqlite3_stmt* stmt, Deadline& d
             std::optional<std::int64_t> auth_value;
             if (sqlite3_column_type(stmt, 2) == SQLITE_INTEGER)
                 auth_value = sqlite3_column_int64(stmt, 2);
-            read.grants.push_back({client ? client : "-", auth_value});
+            // Scrubbed here so the run-wide output budget counts the bytes that reach the wire.
+            read.grants.push_back({sanitize_utf8(client ? client : "-"), auth_value});
         }
         macos::sort_grants(read.grants);
         reads.push_back(std::move(read));
@@ -352,6 +353,28 @@ std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
     return names;
 }
 
+/// The system db, then each home's db until the run-wide output budget is spent.
+void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc,
+                      const std::string& system_db, const std::string& users_dir,
+                      const macos::ReadBounds& bounds, macos::OutputBudget& output) {
+    const auto read = [&](std::string_view owner, const std::string& path, bool missing_is_absent) {
+        const auto first = rows.size();
+        read_tcc_source(owner, path, missing_is_absent, rows, acc, bounds);
+        output.charge({rows.data() + first, rows.size() - first});
+    };
+    // The system db keeps its unqualified rows; a missing system db is `unreadable`, never absent.
+    read({}, system_db, /*missing_is_absent=*/false);
+    for (const auto& user : enumerate_user_homes(rows, acc, users_dir)) {
+        if (output.exhausted()) {
+            rows.push_back(failure_row("macos", "-", "-", false,
+                                       std::string{macos::kBudgetExceededToken}, acc));
+            break;
+        }
+        read(user, users_dir + "/" + user + std::string{kUserTccRelPath},
+             /*missing_is_absent=*/true);
+    }
+}
+
 } // namespace
 
 // `collect_macos_permissions` itself (below) is excluded when
@@ -370,13 +393,9 @@ std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
 int collect_macos_permissions(yuzu::CommandContext& ctx) {
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<PermissionRow> rows;
-
-    // The system db keeps its unqualified rows; a missing system db is `unreadable`, never absent.
-    read_tcc_source({}, std::string{kTccDbPath}, /*missing_is_absent=*/false, rows, acc);
-
-    for (const auto& user : enumerate_user_homes(rows, acc))
-        read_tcc_source(user, std::string{kUsersDir} + "/" + user + std::string{kUserTccRelPath},
-                        /*missing_is_absent=*/true, rows, acc);
+    const macos::ReadBounds bounds; // one run-wide deadline, shared by every source
+    macos::OutputBudget output;
+    read_all_sources(rows, acc, std::string{kTccDbPath}, std::string{kUsersDir}, bounds, output);
 
     // Fixed four-category vocabulary (CDX-R2-005): location has no TCC service at all, so it
     // ships its own explicit `unsupported` row on EVERY collection -- including when every

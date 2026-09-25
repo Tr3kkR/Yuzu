@@ -350,6 +350,49 @@ TEST_CASE("privacy_permissions macOS: snapshot_fd sees a change made to the file
     CHECK_FALSE(macos::read_unchanged(first->stamp, snapshot_fd(fd.get())->stamp));
 }
 
+TEST_CASE("privacy_permissions macOS: one run deadline covers every source, and homes stop being "
+          "read once the run-wide output budget is spent",
+          "[privacy_permissions][macos][internals]") {
+    if (::geteuid() < 500) SKIP("homes owned by a system uid are not enumerated");
+    yuzu::test::TempDir tmp{"yuzu_test_pp_users_"};
+    const auto base = scratch_dir(tmp);
+    const auto users = base / "users";
+    const std::string honest =
+        std::string{kAccessSchema} + "INSERT INTO access VALUES('kTCCServiceCamera','x.app',0,2);";
+    for (const char* name : {"a", "b", "c"}) {
+        const auto dir = users / name / "Library/Application Support/com.apple.TCC";
+        std::filesystem::create_directories(dir);
+        make_db(dir / "TCC.db", honest);
+    }
+    make_db(base / "system.db", honest);
+    const std::string system_db = (base / "system.db").string();
+    SourceRead r;
+
+    SECTION("a spent run deadline is seen by the system db and every home") {
+        macos::ReadBounds bounds;
+        bounds.run_end = std::chrono::steady_clock::time_point{};
+        macos::OutputBudget output;
+        read_all_sources(r.rows, r.acc, system_db, users.string(), bounds, output);
+        for (const char* token : {"tcc_db:timeout", "a:tcc_db:timeout", "b:tcc_db:timeout",
+                                  "c:tcc_db:timeout"})
+            CHECK(r.has_raw(token));
+    }
+    SECTION("the home that spends the budget is kept, the next is not read") {
+        macos::OutputBudget output;
+        output.max_bytes = 20; // the system db alone stays under it; one home's rows do not
+        read_all_sources(r.rows, r.acc, system_db, users.string(), {}, output);
+        const auto from = [&](const std::string& home) {
+            return std::any_of(r.rows.begin(), r.rows.end(), [&](const auto& row) {
+                return row.app_id.rfind(home + "\\", 0) == 0;
+            });
+        };
+        CHECK(from("a"));
+        CHECK_FALSE(from("b"));
+        CHECK_FALSE(from("c"));
+        CHECK(r.has_raw("collection:budget_exceeded"));
+    }
+}
+
 } // namespace yuzu::privacy_permissions
 
 #endif // defined(__APPLE__)

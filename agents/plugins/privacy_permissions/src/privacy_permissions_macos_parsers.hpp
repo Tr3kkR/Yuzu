@@ -159,6 +159,21 @@ inline constexpr std::string_view kCutValueTooLong = "value_too_long";
 
 inline constexpr std::array<std::string_view, 3> kSidecarSuffixes{"-journal", "-wal", "-shm"};
 
+inline constexpr std::size_t kMaxRunOutputBytes = 16u * 1024u * 1024u;
+inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exceeded";
+
+/// Run-wide bound on the row text the sources have produced. Checked between sources, so the one
+/// source that crosses it (itself bounded) is kept and no further one is read.
+struct OutputBudget {
+    std::size_t max_bytes = kMaxRunOutputBytes;
+    std::size_t bytes = 0;
+
+    [[nodiscard]] bool exhausted() const noexcept { return bytes >= max_bytes; }
+    void charge(std::span<const PermissionRow> rows) noexcept {
+        for (const auto& r : rows) bytes += r.app_id.size() + r.raw.size();
+    }
+};
+
 /// sqlite's URI for `path`: immutable=1 takes no lock and touches no sidecar; `%`, `?` and `#` are
 /// the only characters a URI path reads specially.
 [[nodiscard]] inline std::string immutable_uri(std::string_view path) {

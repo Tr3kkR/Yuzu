@@ -39,10 +39,12 @@
  * PERMISSION_DENIED) or `unreadable` (CONSTRAINED) row carrying its own token in `raw`; a
  * capability or NonPackaged key that genuinely is not there is an `absent` row. One run-wide
  * retention budget (win::RetentionBudget) bounds what the walk holds -- the subtree is under each
- * profile owner's write access -- and stops it with `collection:budget_exceeded`. Only two
- * failures are not rows of their own: a failed hive UNLOAD (a token -- the read itself
- * succeeded) and a LastUsedTime* failure (a token, and the field itself reads `unreadable`; a
- * refused one still promotes PERMISSION_DENIED).
+ * profile owner's write access -- and stops it with `collection:budget_exceeded`; one profile is
+ * capped on its own (`<profile>:budget_exceeded`, the walk goes on) and the run at ~15 s
+ * (`collection:timeout`, hives unloaded normally). Only two failures are not rows of their own:
+ * a failed hive UNLOAD (a token -- the read itself succeeded) and a LastUsedTime* failure (a
+ * token, and the field itself reads `unreadable`; a refused one still promotes
+ * PERMISSION_DENIED).
  *
  * MEASURED on the-rig 2026-09-23 (Windows 11 Pro 10.0.26200, LocalSystem via a scheduled task,
  * one interactive profile with a live HKU hive): packaged per-app Allow/Deny/Prompt decode, the
@@ -190,8 +192,8 @@ struct ConsentWalk {
 /// Walks every mapped CapabilityName under `hive`'s ConsentStore: the capability-level Value
 /// (an `absent` entry when the capability key itself is not there, so every category is
 /// represented) plus every packaged and NonPackaged app child. Every entry is charged against the
-/// run-wide `budget` BEFORE it is retained; once that refuses, the walk stops where it is and the
-/// collector reports win::kBudgetExceededToken.
+/// `budget` BEFORE it is retained; once the budget stops the walk (a limit, or the run's time) it
+/// ends where it is and the collector reports which.
 ConsentWalk walk_consent_store(HKEY hive, win::RetentionBudget& budget) {
     ConsentWalk w;
     const auto keep = [&](std::vector<RawGrant>& into, RawGrant g) {
@@ -207,7 +209,7 @@ ConsentWalk walk_consent_store(HKEY hive, win::RetentionBudget& budget) {
     if (w.root_rc != ERROR_SUCCESS) return w; // the caller reports the whole-source row
 
     for (const auto& cap : win::kCapabilities) {
-        if (budget.exhausted) break;
+        if (budget.walk_stopped()) break;
         yuzu::win::RegKey cap_key;
         const LONG cap_rc = RegOpenKeyExW(store.get(), yuzu::win::to_wide(cap.capability_name).c_str(),
                                           0, KEY_READ, cap_key.put());
@@ -249,7 +251,7 @@ ConsentWalk walk_consent_store(HKEY hive, win::RetentionBudget& budget) {
         // Packaged apps: direct children of the capability key OTHER than "NonPackaged".
         const auto packaged = enumerate_subkey_names(cap_key.get());
         for (const auto& child : packaged.names) {
-            if (budget.exhausted) break;
+            if (budget.walk_stopped()) break;
             if (child == L"NonPackaged") continue;
             read_app(cap_key.get(), child, yuzu::win::from_wide(child.c_str()), "packaged_app");
         }
@@ -265,7 +267,7 @@ ConsentWalk walk_consent_store(HKEY hive, win::RetentionBudget& budget) {
                                           cap.category));
             const auto nonpackaged = enumerate_subkey_names(nonpkg.get());
             for (const auto& child : nonpackaged.names) {
-                if (budget.exhausted) break;
+                if (budget.walk_stopped()) break;
                 const std::string name = yuzu::win::from_wide(child.c_str());
                 if (win::is_nonpackaged_container_key(name)) continue;
                 read_app(nonpkg.get(), child, win::unescape_nonpackaged_app_id(name),
@@ -324,12 +326,20 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<PermissionRow> rows;
     win::RetentionBudget budget; // run-wide: every profile, HKLM, capability and level
+    // A source that hit its own cap keeps the rows it charged; this row says it is incomplete.
+    const auto note_truncated = [&](const std::string& source, const std::string& row_id) {
+        if (budget.profile_exhausted)
+            rows.push_back(failure_row("windows", row_id, "-", false,
+                                       source + ":" + std::string{win::kSourceBudgetExceededSuffix},
+                                       acc));
+    };
 
     // HKLM: machine-wide, collected once. Only its successfully read `Deny` grants override a
     // profile (win::hklm_overrides_profile -- the device toggle, most restrictive wins) and are
     // applied into each profile's merge; everything else HKLM holds is reported once below as
     // HKLM's own unqualified rows.
     const ConsentWalk hklm = walk_consent_store(HKEY_LOCAL_MACHINE, budget);
+    note_truncated("hklm", "-");
     std::vector<RawGrant> hklm_overriding;
     for (const auto& g : hklm.grants)
         if (win::hklm_overrides_profile(g)) hklm_overriding.push_back(g);
@@ -356,7 +366,9 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     // overriding grants are emitted directly (unqualified) rather than silently dropped.
     std::size_t reachable_profiles = 0;
     for (const auto& profile : profiles) {
-        if (budget.exhausted) break;
+        // The walk re-checks after with_user_hive's lock wait and mount, which count toward it.
+        if (budget.exhausted || budget.expired()) break;
+        budget.begin_profile();
         const std::string pname = profile.profile_name.empty() ? "-" : profile.profile_name;
         const std::string profile_row_id = qualify_app_id(pname, "-");
 
@@ -429,6 +441,7 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         for (const auto& g : win::merge_with_hklm(user.grants, hklm_overriding))
             emit_grant(pname, true, g, rows, acc);
         for (const auto& g : user.structural) emit_grant(pname, true, g, rows, acc);
+        note_truncated(pname, profile_row_id);
     }
 
     // HKLM's own rows, unqualified, once (win::hklm_emitted_once): everything it holds --
@@ -445,6 +458,9 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     if (budget.exhausted)
         rows.push_back(failure_row("windows", "-", "-", false,
                                    std::string{win::kBudgetExceededToken}, acc));
+    if (budget.timed_out)
+        rows.push_back(
+            failure_row("windows", "-", "-", false, std::string{win::kTimeoutToken}, acc));
 
     // A category no row mentions is `absent` unless a whole-source failure row above already
     // stands for it; a token-only failure (hive_unload_failed, a LastUsedTime* read) covers none.

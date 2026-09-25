@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -122,28 +123,68 @@ inline constexpr std::uint32_t kMaxConsentValueBytes = 64;
 inline constexpr std::size_t kMaxRetainedGrants = 65536;
 inline constexpr std::size_t kMaxRetainedBytes = 16u * 1024u * 1024u;
 
-/// The run-wide budget. charge() is called BEFORE a grant is retained; once either limit would be
-/// crossed it refuses, stays refused (sticky), and the collector stops walking, keeps every row
-/// already charged and reports `collection:budget_exceeded` (unreadable, CONSTRAINED).
+/// One profile (or HKLM) may retain at most this much, so a single owner cannot use up the run's
+/// budget and starve every later profile.
+inline constexpr std::size_t kMaxProfileGrants = 8192;
+inline constexpr std::size_t kMaxProfileBytes = 2u * 1024u * 1024u;
+
+/// The run's wall-clock bound (a stop past the agent's shutdown grace would leave a hive mounted).
+inline constexpr std::chrono::milliseconds kRunBudget{15'000};
+
+/// The run-wide budget. charge() is called BEFORE a grant is retained; once a run-wide limit would
+/// be crossed it refuses, stays refused (sticky), and the collector stops walking, keeps every row
+/// already charged and reports `collection:budget_exceeded` (unreadable, CONSTRAINED). A per-source
+/// limit (begin_profile() starts a source) refuses only that source: the walk of it stops, the
+/// run goes on. `deadline`/`expired(now)` are injectable so a test never sleeps.
 struct RetentionBudget {
     std::size_t max_grants = kMaxRetainedGrants;
     std::size_t max_bytes = kMaxRetainedBytes;
     std::size_t grants = 0;
     std::size_t bytes = 0;
     bool exhausted = false;
+    std::size_t max_profile_grants = kMaxProfileGrants;
+    std::size_t max_profile_bytes = kMaxProfileBytes;
+    std::size_t profile_grants = 0;
+    std::size_t profile_bytes = 0;
+    bool profile_exhausted = false;
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + kRunBudget;
+    bool timed_out = false;
+
+    void begin_profile() noexcept {
+        profile_grants = profile_bytes = 0;
+        profile_exhausted = false;
+    }
+
+    [[nodiscard]] bool expired(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) noexcept {
+        return timed_out = timed_out || now >= deadline;
+    }
+
+    /// Whether the walk of the current source must stop where it is.
+    [[nodiscard]] bool walk_stopped() noexcept {
+        return exhausted || profile_exhausted || expired();
+    }
 
     [[nodiscard]] bool charge(std::size_t n_bytes) noexcept {
         if (exhausted || grants + 1 > max_grants || n_bytes > max_bytes - bytes) {
             exhausted = true;
             return false;
         }
-        ++grants;
-        bytes += n_bytes;
+        if (profile_exhausted || profile_grants + 1 > max_profile_grants ||
+            n_bytes > max_profile_bytes - profile_bytes) {
+            profile_exhausted = true;
+            return false;
+        }
+        ++grants, ++profile_grants;
+        bytes += n_bytes, profile_bytes += n_bytes;
         return true;
     }
 };
 
 inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exceeded";
+inline constexpr std::string_view kTimeoutToken = "collection:timeout";
+/// `<profile>:budget_exceeded` (or `hklm:budget_exceeded`): that one source's rows are truncated.
+inline constexpr std::string_view kSourceBudgetExceededSuffix = "budget_exceeded";
 
 // ── subkey enumeration outcome ─────────────────────────────────────────
 

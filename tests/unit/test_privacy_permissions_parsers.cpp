@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -585,6 +586,67 @@ TEST_CASE("win::RetentionBudget: refuses the grant that would cross either run-w
     CHECK(win::kBudgetExceededToken == "collection:budget_exceeded");
 }
 
+TEST_CASE("win::RetentionBudget: one source at its own cap stops only its own walk -- the next "
+          "profile, its Deny included, is still retained; the run-wide cap still stops the run",
+          "[privacy_permissions][win_parsers]") {
+    const win::RetentionBudget defaults;
+    CHECK(defaults.max_profile_grants == 8192);
+    CHECK(defaults.max_profile_bytes == 2u * 1024u * 1024u);
+
+    win::RetentionBudget b;
+    b.max_profile_grants = 2;
+    b.max_grants = 4;
+    b.begin_profile();
+    CHECK(b.charge(1));
+    CHECK(b.charge(1));
+    CHECK_FALSE(b.charge(1));
+    CHECK(b.profile_exhausted);
+    CHECK_FALSE(b.exhausted);
+    CHECK(b.walk_stopped());
+    CHECK_FALSE(b.charge(0)); // sticky for the rest of this profile
+
+    b.begin_profile();
+    CHECK_FALSE(b.walk_stopped());
+    const win::RawGrant deny{"-", "camera", PermissionState::denied, "Deny"};
+    CHECK(b.charge(win::retained_bytes(deny)));
+    CHECK(b.charge(1));
+    CHECK(b.grants == 4);
+
+    b.begin_profile();
+    CHECK_FALSE(b.charge(1));
+    CHECK(b.exhausted);
+    CHECK_FALSE(b.profile_exhausted);
+    CHECK(b.walk_stopped());
+
+    win::RetentionBudget bytes;
+    bytes.max_profile_bytes = 10;
+    CHECK(bytes.charge(6));
+    CHECK_FALSE(bytes.charge(5));
+    CHECK(bytes.profile_exhausted);
+    bytes.begin_profile();
+    CHECK(bytes.charge(10));
+    CHECK_FALSE(bytes.exhausted);
+}
+
+TEST_CASE("win::RetentionBudget: the run deadline is injectable, inclusive and sticky",
+          "[privacy_permissions][win_parsers]") {
+    using Clock = std::chrono::steady_clock;
+    CHECK(win::kRunBudget == std::chrono::seconds{15});
+    CHECK(win::kTimeoutToken == "collection:timeout");
+
+    win::RetentionBudget b;
+    b.deadline = Clock::time_point::max();
+    CHECK_FALSE(b.walk_stopped());
+    const auto t = Clock::time_point{} + std::chrono::seconds{100};
+    b.deadline = t;
+    CHECK_FALSE(b.expired(t - std::chrono::nanoseconds{1}));
+    CHECK_FALSE(b.timed_out);
+    CHECK(b.expired(t));
+    b.deadline = Clock::time_point::max();
+    CHECK(b.expired(t - std::chrono::nanoseconds{1})); // once tripped it stays tripped
+    CHECK(b.walk_stopped());
+}
+
 TEST_CASE("win::coarse_failure_token: one token per kind of failure, however many apps share it",
           "[privacy_permissions][win_parsers]") {
     yuzu::shared::ConstraintAccumulator acc;
@@ -819,6 +881,21 @@ TEST_CASE("macos::read_unchanged: every field of the file stamp matters",
     CHECK(changed([](auto& s) { s.mtime_sec += 1; }));
     CHECK(changed([](auto& s) { s.mtime_nsec += 1; }));
     CHECK(changed([](auto& s) { s.change_counter += 1; }));
+}
+
+TEST_CASE("macos::OutputBudget: counts app_id and raw text and is spent at the cap",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::kMaxRunOutputBytes == 16u * 1024u * 1024u);
+    CHECK(macos::kBudgetExceededToken == "collection:budget_exceeded");
+    macos::OutputBudget b;
+    b.max_bytes = 10;
+    const std::vector<PermissionRow> rows{
+        {"macos", "abcd", "camera", PermissionState::allowed, "12", "-", "-", false}};
+    b.charge(rows);
+    CHECK(b.bytes == 6);
+    CHECK_FALSE(b.exhausted());
+    b.charge(rows);
+    CHECK(b.exhausted());
 }
 
 TEST_CASE("macos::is_user_home_entry: a real home is a non-dot name, a directory seen without "
