@@ -293,6 +293,7 @@ agent_test_exe = executable(
     'unit/test_log_handoff.cpp', # #4666 PR-1: bounded async log hand-off primitive
     'unit/test_service_completion.cpp', # #4666 PR-2: service shutdown completion handshake
     'unit/test_agent_log_wiring.cpp', # #4666 PR-2: install/release wrapper (agent_log_wiring.hpp)
+    'unit/test_log_handoff_multi_image.cpp', # #4666 PR-2 W3a: macOS multi-image topology fixture (MI-1/MI-3)
     'unit/test_spark_detached_call.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
@@ -668,6 +669,9 @@ agent_test_exe = executable(
   # plugin by path for the identical reason (PKG-NC).
   # content_dist_plugin_lib / script_exec_plugin_lib: same reasoning, for
   # test_content_dist_actions.cpp / test_script_exec_actions.cpp.
+  # agent_actions_plugin_lib (agents/plugins/agent_actions/meson.build):
+  # test_log_handoff_multi_image.cpp's MI-3 loads the real agent_actions plugin by path
+  # for the identical reason (#4666 PR-2 W3a macOS multi-image fixture).
   # echo_argv_fixture: test_content_dist_exec_seam.cpp's real B6 exec-verify
   # test stages and execs this fixture binary by path -- without it in
   # link_depends, a fresh build could leave the test executable built before
@@ -685,6 +689,7 @@ agent_test_exe = executable(
   # scripts/ci/check-plugin-spawn-lexical.sh's GRANDFATHERED set.
   link_depends: [
                 abi3_fixture_plugin,
+                agent_actions_plugin_lib,  # #4666 PR-2 W3a: MI-3 loads the real agent_actions plugin by path
                 certificates_plugin_lib,
                 content_dist_plugin_lib,
                 disk_actions_plugin_lib,
@@ -2555,6 +2560,37 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
       abi3_fixture_plugin,
       abi4_declared_fixture_plugin,
       abi4_cpp_wrapper_fixture_plugin,
+    ],
+  )
+endif
+
+# #4666 PR-2 W3a: static lexical gate over main.cpp's log-handoff wiring call sites (the
+# four textual invariants agent_log_wiring.hpp's/log_handoff.hpp's own header banners
+# describe -- see the script's own header). No build required, so gated only on bash
+# being present, same as the other lexical selftests above.
+if _bash_test.found()
+  test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
+    _bash_test,
+    args: [files('shell/test_log_handoff_wiring_lexical.sh')],
+    suite: 'agent',
+    timeout: 60,
+  )
+endif
+
+# #4666 PR-2 W3a MI-2: report-only symbol-binding probe over the built exe/core-lib/
+# agent_actions plugin (see the script's own header for what it does and does not prove).
+# Gated on build_agent the same way the capability matrix gate above is -- nothing to
+# inspect without a real agent build.
+if _bash_test.found() and meson.can_run_host_binaries() and build_agent
+  test('spdlog registry identity symbol-binding report (#4666 PR-2 W3a MI-2)',
+    _bash_test,
+    args: [files('shell/test_spdlog_registry_identity.sh'), meson.project_build_root()],
+    suite: 'agent',
+    timeout: 60,
+    depends: [
+      yuzu_agent_exe,
+      yuzu_agent_core_lib,
+      agent_actions_plugin_lib,
     ],
   )
 endif
