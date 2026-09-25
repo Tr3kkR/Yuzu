@@ -532,6 +532,33 @@ groups:
             "RbacStore — the authorization substrate".
           runbook_url: "https://docs.yuzu.io/runbooks/rbac-read-degraded"
 
+      - alert: YuzuBreakGlassLogin
+        # The armed break-glass account passed the password gate under
+        # --auth-mode=sso-only. Rare by design, so ANY increment pages
+        # (docs/observability-conventions.md). yuzu_auth_break_glass_login_total
+        # is boot-seeded to 0 in server.cpp, so increase() sees the first use
+        # after a restart; same idiom as YuzuOnBehalfAssertionRejected above.
+        expr: |
+          increase(yuzu_auth_break_glass_login_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Break-glass account used on {{ $labels.instance }}"
+          description: >-
+            yuzu_auth_break_glass_login_total increased: the armed break-glass
+            account's password was accepted under --auth-mode=sso-only (the
+            mandatory TOTP challenge still follows). Confirm this was a
+            sanctioned recovery. The audit rows carry the evidence:
+            auth.breakglass.armed (who armed it; the principal is the OS account
+            that ran --break-glass-arm, so correlate with the host's sudo /
+            docker exec log for the person) then auth.breakglass.login. If it
+            was not sanctioned, revoke the account's sessions and rotate its
+            password and TOTP. A break-glass attempt refused because the
+            account has no MFA (auth.breakglass.denied) does NOT move this
+            counter; alert on that audit row via your SIEM. See
+            docs/ops-runbooks/auth-db-recovery.md.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/auth-db-recovery.md"
+
   # ── yuzu-scim — ADR-2001 (SCIM ↔ OIDC/SAML identity-link revoke chokepoint,
   # CC6.8) ─────────────────────────────────────────────────────────────────
   # Every BARE (unlabeled) counter in this group is boot-seeded to 0 (never
@@ -1145,7 +1172,7 @@ groups:
             when nobody asked the store would under-enforce against a healthy
             one. The quarantine plugin's own control actions stay
             reachable throughout - releasing a device does not depend on this
-            read - as do the three system-reserved internal pushes
+            read - as do the four system-reserved internal pushes
             (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
             it delays the page by two minutes, it does NOT require a sustained
             episode. increase()[5m] stays true for ~5 minutes after a single
