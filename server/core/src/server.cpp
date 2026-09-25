@@ -1591,7 +1591,7 @@ public:
 
         // #3402: the internal pushes that deliberately BYPASS that gate, seeded
         // across the full capability x result product. Every combination is
-        // reachable — each of the three pushes can fail at the registry seam —
+        // reachable — each of the four pushes can fail at the registry seam —
         // so unlike the per-route targeting seed above, the product is honest
         // here rather than publishing series no code path can produce.
         // `undelivered` at zero is the point: it is the value an operator needs
@@ -2932,6 +2932,16 @@ public:
                           "DB-clock-authored, ADR-2002 section 4)",
                           "counter");
         metrics_.counter("yuzu_auth_local_clock_backward_total");
+        // Break-glass use (SOC 2 CC6.6), incremented by AuthRoutes once the armed
+        // break-glass account's password verifies. Pre-seeded to 0 because the
+        // event is rare by design: an unseeded counter is born at 1, and
+        // increase() cannot see the first sample of a series, so
+        // YuzuBreakGlassLogin would miss the first use after every restart.
+        metrics_.describe("yuzu_auth_break_glass_login_total",
+                          "Password-verified logins by the armed break-glass account under "
+                          "--auth-mode=sso-only (the TOTP challenge still follows)",
+                          "counter");
+        metrics_.counter("yuzu_auth_break_glass_login_total");
         // HA WS-1(1b), ADR-2002 section 5: command_id -> execution_id
         // correlation-table retention (ExecutionTracker's PG-backed
         // command_execution table, replacing AgentServiceImpl's former

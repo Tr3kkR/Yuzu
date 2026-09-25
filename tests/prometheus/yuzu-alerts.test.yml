@@ -1853,6 +1853,34 @@ tests:
   # (a truly isolated first failure may lag one evaluation cycle) lives in
   # the rule's own `description` in docs/prometheus/yuzu-alerts.yml instead.
 
+  # ── YuzuBreakGlassLogin ─────────────────────────────────────────────────
+
+  # A single break-glass login after the boot seed pages. The flat-0 prefix is
+  # the boot seed in server.cpp; without it the series would be born at 1 and
+  # increase() could not see the first use.
+  - interval: 1m
+    name: break-glass login - one use after the boot seed fires
+    input_series:
+      - series: 'yuzu_auth_break_glass_login_total{job="yuzu",instance="s1"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuBreakGlassLogin", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuBreakGlassLogin", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+
+  # No break-glass use, no page.
+  - interval: 1m
+    name: break-glass login - a flat seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_auth_break_glass_login_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuBreakGlassLogin"}'
+        eval_time: 45m
+        exp_samples: []
+
   # ── YuzuScimDeprovisionRoleRefusedWithActiveLink (D1) ───────────────────
 
   # CASE 41 -- D1 fires: a still-linked out-of-band admin was refused
