@@ -999,6 +999,9 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // app_control
         {"app_control.wdac_policy", "Report the configured WDAC (Code Integrity) application-control policy posture (Windows, read-only)"},
         {"app_control.applocker_policy", "Report AppLocker rule-collection enforcement mode and rule count (Windows, read-only)"},
+        // platform_security
+        {"platform_security.secure_boot", "Report Secure Boot and setup-mode state (efivars on Linux, SecureBoot registry state on Windows; unsupported on macOS)"},
+        {"platform_security.code_integrity", "Report code-signing enforcement posture (Linux LSM and lockdown, macOS Gatekeeper and SIP, Windows CI policy and Device Guard)"},
         // local_security_policy
         {"local_security_policy.password_policy", "Report local password policy posture: length, age, complexity, history (login.defs/pwquality/pam, pwpolicy, secedit; read-only)"},
         {"local_security_policy.lockout_policy", "Report local account lockout policy posture: threshold, window, duration (faillock/pam, pwpolicy, secedit; read-only)"},
@@ -1011,6 +1014,15 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"peripherals.thunderbolt", "List Thunderbolt/USB4 controllers and attached devices"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
+        // firmware_posture
+        {"firmware_posture.firmware", "Report BIOS/firmware vendor, version, release date and update-pending posture"},
+        // runtimes
+        {"runtimes.dotnet",
+         "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "
+         "install path (Linux only; standard roots only, directory walk, no subprocess)"},
+        {"runtimes.jvm",
+         "List installed JVMs by image type, version, home and vendor from each home's "
+         "release file (Linux only; standard roots only, no subprocess)"},
         // storage
         {"storage.set", "Store a key-value pair in persistent storage"},
         {"storage.get", "Retrieve a value by key from persistent storage"},
@@ -1997,10 +2009,12 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // all went dark as "fresh forever".
     for (const auto& m : kGuardianJournalAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
-    // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d) - same absent-not-
-    // zero rule and same reason it bites hardest here: the writer is sparse, so a
-    // healthy or inert (prefer_spark off) fleet must see all 3 families ABSENT, never
-    // a fabricated 0.
+    // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d; #2993 added a 4th
+    // family, #4783 added the 5th/6th/7th - legacy-sink loss visibility) - same
+    // absent-not-zero rule and same reason it bites hardest here: the writer is
+    // sparse, so a healthy fleet must see all 7 families ABSENT, never a fabricated
+    // 0; an inert (prefer_spark off) fleet still reports the 3 legacy_sink_* families
+    // live (they don't depend on the Spark flip - see guardian_health_fleet_tags.hpp).
     for (const auto& m : kGuardianHealthMetrics)
         metrics.clear_gauge_family(m.gauge);
     // rung 9c PR-3: the arm-ledger re-statable-gauge pair (Decision 1) and the

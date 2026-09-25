@@ -184,6 +184,9 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
+#include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_runtimes.hpp"
+#include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
@@ -229,6 +232,8 @@
 #include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
 #include "coord_dsn.hpp"       // WS-3: build the elector's dedicated coordination DSN (testable)
 #include "leader_elector.hpp"  // WS-3: fenced leader-election primitive (ADR-2002 §3/§6/§10)
+#include "pg_reachability_probe.hpp" // WS-8: runtime Postgres reachability for /readyz (ADR-2002 §12)
+#include "shutdown_drain_rules.hpp" // WS-8: stop() drain-wait decision + bounds
 #include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
 #include "policy_evaluator.hpp"
 #include "schedule_arming_check.hpp"
@@ -1591,7 +1596,7 @@ public:
 
         // #3402: the internal pushes that deliberately BYPASS that gate, seeded
         // across the full capability x result product. Every combination is
-        // reachable — each of the three pushes can fail at the registry seam —
+        // reachable — each of the four pushes can fail at the registry seam —
         // so unlike the per-route targeting seed above, the product is honest
         // here rather than publishing series no code path can produce.
         // `undelivered` at zero is the point: it is the value an operator needs
@@ -1839,6 +1844,21 @@ public:
                           "gauge");
         metrics_.describe("yuzu_pg_connect_failed_total",
                           "Total PostgreSQL connection attempts that failed", "counter");
+        // HA WS-8 (ADR-2002 §12): the runtime reachability probe behind /readyz.
+        metrics_.describe("yuzu_server_pg_reachable",
+                          "1 when this replica's dedicated reachability probe can reach a writable "
+                          "Postgres primary (the /readyz pg_reachable row), else 0",
+                          "gauge");
+        metrics_.describe("yuzu_server_pg_reachability_last_success_age_seconds",
+                          "Seconds since this replica's Postgres reachability probe last succeeded",
+                          "gauge");
+        metrics_.describe("yuzu_server_pg_reachability_probe_failures_total",
+                          "Total Postgres reachability probes that failed or reached a server "
+                          "that refuses writes",
+                          "counter");
+        // Pre-seeded so the series reads 0, not absent, before the first failure
+        // (docs/observability-conventions.md — keeps a future rate()/absent() rule honest).
+        (void)metrics_.counter("yuzu_server_pg_reachability_probe_failures_total");
         metrics_.describe("yuzu_pg_acquire_timeout_total",
                           "Total PostgreSQL pool acquires that timed out before a connection was "
                           "available",
@@ -1947,9 +1967,10 @@ public:
         metrics_.describe("yuzu_server_mgmt_group_read_degrade_total",
                           "Management-group confinement reads (get_agent_groups / "
                           "get_ancestor_ids / get_descendant_ids / get_member_agents_in_subtrees "
-                          "/ get_assignments_for_principal / get_visible_agents) that returned a "
-                          "degrade (nullopt/DenyAll) rather than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error)",
+                          "/ get_assignments_for_principal / get_visible_agents / "
+                          "get_members_checked, incl. the legacy get_members() wrapper - "
+                          "#1762) that returned a degrade (nullopt/DenyAll) rather than a "
+                          "result, by reason (store_not_open/pool_acquire_timeout/query_error)",
                           "counter");
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", reason}});
@@ -2931,6 +2952,16 @@ public:
                           "DB-clock-authored, ADR-2002 section 4)",
                           "counter");
         metrics_.counter("yuzu_auth_local_clock_backward_total");
+        // Break-glass use (SOC 2 CC6.6), incremented by AuthRoutes once the armed
+        // break-glass account's password verifies. Pre-seeded to 0 because the
+        // event is rare by design: an unseeded counter is born at 1, and
+        // increase() cannot see the first sample of a series, so
+        // YuzuBreakGlassLogin would miss the first use after every restart.
+        metrics_.describe("yuzu_auth_break_glass_login_total",
+                          "Password-verified logins by the armed break-glass account under "
+                          "--auth-mode=sso-only (the TOTP challenge still follows)",
+                          "counter");
+        metrics_.counter("yuzu_auth_break_glass_login_total");
         // HA WS-1(1b), ADR-2002 section 5: command_id -> execution_id
         // correlation-table retention (ExecutionTracker's PG-backed
         // command_execution table, replacing AgentServiceImpl's former
@@ -3381,12 +3412,30 @@ public:
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
+        // #4856: two sources share this counter, both by reason
+        // (store_not_open/pool_acquire_timeout/query_error) — "guardian_state"
+        // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
+        // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
+        // is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
+        // agent_rule_statuses*/rule_names*/errored_rule_count, fail-hard: the
+        // caller gets a std::expected error and aborts the push/reconcile
+        // rather than fan out empty/stale data). Pre-seeded below (same closed
+        // {reason x source} cross-product pre-seed pattern as
+        // yuzu_server_kek_operations_total above) so absent()/rate() alerting
+        // is meaningful before the first degrade ever fires.
         metrics_.describe("yuzu_server_guardian_read_degrade_total",
                           "Guardian rules/status/DEX reads that returned degraded (could not "
-                          "read) rather than a genuine result, by reason and source. A sampled "
-                          "warn accompanies each new degrade episode; the catastrophic reads "
-                          "(rules/status) abort the push/reconcile rather than fan out empty.",
+                          "read) rather than a genuine result, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(guardian_state = DEX/observation reads, fail-soft, empty result "
+                          "served; guardian_rules = authoritative rule/status reads, fail-hard, "
+                          "push/reconcile aborts rather than fans out empty). A sampled warn "
+                          "accompanies each new degrade episode.",
                           "counter");
+        for (const auto source : {"guardian_state", "guardian_rules"})
+            for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+                metrics_.counter("yuzu_server_guardian_read_degrade_total",
+                                 {{"reason", reason}, {"source", source}});
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
                           "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) - the "
@@ -3400,14 +3449,20 @@ public:
         // the fleet-wide signal that a rule silently stopped enforcing (the
         // rule's own detail page also shows an "invalid data" state, but an
         // operator who never opens that specific rule would otherwise have no
-        // tell). Pre-seed the one closed reason value so the series exists at
-        // zero on a healthy fleet.
+        // tell). A rule_id that fails the create-time charset/length contract
+        // (#4665) is excluded the same way — reason=invalid_rule_id, added
+        // alongside depth_exceeded when the push-builder's server-side filter
+        // for it landed. Pre-seed BOTH closed reason values so each series
+        // exists at zero on a healthy fleet (docs/observability-conventions.md:
+        // every known label combination of a closed-set label is initialised).
         metrics_.describe("yuzu_guardian_push_rule_excluded_total",
-                          "Guardian rules excluded from a push, by reason (currently only "
-                          "depth_exceeded)",
+                          "Guardian rules excluded from a push, by reason (depth_exceeded, "
+                          "invalid_rule_id)",
                           "counter");
         metrics_.counter("yuzu_guardian_push_rule_excluded_total",
                          {{"reason", "depth_exceeded"}});
+        metrics_.counter("yuzu_guardian_push_rule_excluded_total",
+                         {{"reason", "invalid_rule_id"}});
         // T12 (design doc §7): engine-credential overlap-pair rotation sweep.
         // Deliberately a bounded `reason` label set (currently one value,
         // "successor_unused") and NOT `event="security"` — this is an
@@ -7556,20 +7611,17 @@ public:
                 // serve-or-503, it does NOT build). Best-effort: a failure just means
                 // /ca/crl returns 503 until the next revoke republishes.
                 //
-                // WS-3 note (adversarial review CDX-P1-01/K7): this boot-time one-shot
-                // is an AUTOMATIC CRL publish that is deliberately NOT leader-gated —
-                // it runs before the elector is constructed (below), and gating it
-                // would skip the boot CRL on the single-replica deployment (leadership
-                // is acquired asynchronously). It is a SEPARATE call site from WS-10's
-                // classified `ca.publish_crl` background pass (the freshness re-publish
-                // in the health loop, which IS gated). Cross-replica crlNumber-
-                // allocation atomicity for BOTH sites is WS-6's job (durable CRL
-                // numbering); until then a concurrent multi-replica *boot* could race
-                // the number — E6-capped today (single-replica is the only supported
-                // topology). Tracked: #4126 (WS-6).
+                // Deliberately NOT leader-gated (#4126, re-decided in HA WS-6 6.1): it
+                // runs before the elector is constructed (below), and gating it would
+                // skip the boot CRL on a single replica (leadership is acquired
+                // asynchronously). It is safe ungated because publish_crl() allocates
+                // the crlNumber under CaStore::publish_next_crl's cross-replica table
+                // lock: N replicas booting together publish up to N consecutive CRLs,
+                // never a duplicate number — at most N-1 redundant versions, harmless. Distinct from WS-10's
+                // `ca.publish_crl` freshness pass in the health loop, which stays gated.
                 if (!publish_crl())
                     spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
-                                 "the next revocation republishes");
+                                 "the leader's freshness pass or the next revocation republishes");
             }
             // else: nullopt — genuinely no root (operator brought their own certs) —
             // no signer/recognizer/revocation-checker wiring, same as before.
@@ -7720,6 +7772,40 @@ public:
         // thread wedged in an uncancellable fetch.
         if (nvd_sync_) {
             nvd_sync_->start();
+        }
+
+        // HA WS-8 (ADR-2002 §12): the runtime "can this replica reach the `yuzu`
+        // primary?" signal for /readyz. Constructed past every fail-closed check
+        // (same #1867 rationale as the NVD thread above), and its FIRST probe runs
+        // SYNCHRONOUSLY here, before start_web_server() binds the listener, so
+        // there is no post-bind `not_yet_probed` 503 window (every libpq wait is
+        // deadline-bounded: a single host at most kConnectDeadline, a host list the
+        // pool's connect_timeout per host address — the same wait as one of the
+        // pool's own connects — plus kQueryDeadline; a host-name lookup is bounded
+        // by the system resolver). A failing first probe does NOT fail boot: the
+        // pool just proved Postgres reachable, so a failure here is a transient
+        // blip or a broken dedicated-connection DSN —
+        // either way /readyz reports it loudly and the node stays out of rotation,
+        // which is the correct posture, rather than refusing to start.
+        if (pg_pool_ && !startup_failed_) {
+            // The raw DSN, not build_coord_dsn's: the probe must connect exactly as
+            // the pool does (same parameters, same connect_timeout default), and
+            // its own client-side deadlines bound every socket wait.
+            pg_reachability_probe_ = PgReachabilityProbe::make_libpq(
+                cfg_.postgres_dsn,
+                PgReachabilityProbe::Observer{.on_failure = [this] {
+                    metrics_.counter("yuzu_server_pg_reachability_probe_failures_total")
+                        .increment();
+                }},
+                std::string(PgReachabilityProbe::kProbeSql), pg_pool_->connect_timeout_s());
+            pg_reachability_probe_->probe_once();
+            const auto v = pg_reachability_probe_->verdict();
+            if (v != pg_reachability::Verdict::Ready) {
+                spdlog::error("[readyz] boot-time Postgres reachability probe failed "
+                              "(pg_reachable={}); /readyz reports not ready until it succeeds",
+                              pg_reachability::reason(v));
+            }
+            pg_reachability_probe_->start();
         }
 
         // WS-3 (ADR-2002 §3/§6/§10): construct the fenced leader elector and start
@@ -8239,39 +8325,59 @@ public:
                 // eventually serves a CRL past its nextUpdate (external validators
                 // reject an expired CRL), and a failed startup pre-publish would
                 // leave /ca/crl 503 with no self-heal. Re-publish when the latest
-                // CRL is missing or within 24h of nextUpdate. publish_crl()
-                // serialises + bumps the crlNumber; once it runs, nextUpdate jumps
-                // 7 days out so this fires at most ~once/6 days in steady state.
+                // CRL is missing or within 24h of nextUpdate; once it runs,
+                // nextUpdate jumps 7 days out so this fires ~once/6 days.
+                //
+                // HA WS-6 6.1 (UP-1): ALSO re-publish when the latest CRL was not
+                // built from the current revoked set — a revoke whose own publish
+                // failed (lock timeout, pool exhaustion) would otherwise stay out of
+                // the served CRL until the nextUpdate window, and retrying the revoke
+                // returns "already revoked" without publishing. The check compares
+                // counts in the database, never timestamps from different replicas'
+                // clocks, so clock skew cannot make it fire repeatedly.
                 if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
                     // Backoff (steady_clock — immune to NTP jumps): after a failed
-                    // freshness publish, don't retry every tick — wait 5 min so a
-                    // persistent failure (bad CA key) doesn't spam logs + the
-                    // failure counter (gov L1/L5).
+                    // publish, don't retry every tick — wait 5 min so a persistent
+                    // failure (bad CA key) doesn't spam logs + the failure counter
+                    // (gov L1/L5).
                     const auto now_steady = std::chrono::steady_clock::now();
-                    if (now_steady >= crl_freshness_retry_after_) {
+                    YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly
+                    // WS-3 3.2: only the fenced leader runs this pass, so N replicas
+                    // don't each publish a redundant CRL. Numbering correctness does
+                    // NOT depend on this gate — publish_next_crl's table lock provides
+                    // it (WS-6 6.1). The OPERATOR revoke path (ca_routes.cpp) publishes
+                    // on its own plane and is deliberately NOT gated (two-dispatch-
+                    // planes rule; it carries no background-job assert).
+                    if (now_steady >= crl_freshness_retry_after_ &&
+                        leader_gate_permits<background_job_class("ca.publish_crl")>(
+                            leader_elector_.get())) {
                         // nextUpdate is a wall-clock epoch → compare with wall time.
                         const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
                         auto latest = ca_store_->latest_crl();
                         const bool stale =
                             !latest || (latest->next_update - now_epoch) < 24 * 3600;
-                        if (stale) {
-                            YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly (crlNumber)
-                            // WS-3 3.2: the background freshness re-publish bumps
-                            // crlNumber (a DB single-writer), so gate it to the fenced
-                            // leader — two replicas must not diverge the number. The
-                            // OPERATOR revoke path (ca_routes.cpp) publishes on its own
-                            // plane and is deliberately NOT gated here (two-dispatch-
-                            // planes rule; it carries no background-job assert).
-                            // Numbering correctness itself is WS-6.
-                            if (leader_gate_permits<background_job_class("ca.publish_crl")>(
-                                    leader_elector_.get())) {
-                                if (publish_crl())
-                                    spdlog::info(
-                                        "PKI: CRL re-published for freshness (nextUpdate window)");
-                                else
-                                    crl_freshness_retry_after_ =
-                                        now_steady + std::chrono::minutes(5);
+                        bool unpublished_revocation = false;
+                        if (!stale) {
+                            auto missing = ca_store_->has_unpublished_revocations();
+                            if (!missing) {
+                                // Throttle: a persistent read failure logs once a minute, not
+                                // every 15 s tick.
+                                spdlog::warn("PKI: unpublished-revocation check skipped: {}",
+                                             missing.error());
+                                crl_freshness_retry_after_ = now_steady + std::chrono::minutes(1);
+                            } else {
+                                unpublished_revocation = *missing;
                             }
+                        }
+                        if (stale || unpublished_revocation) {
+                            bool skipped = false;
+                            if (publish_crl(/*background=*/true, &skipped))
+                                spdlog::info(
+                                    "PKI: CRL re-published ({})",
+                                    stale ? "nextUpdate window"
+                                          : "the latest CRL did not cover every revocation");
+                            else if (!skipped) // another publish is running; recheck next tick
+                                crl_freshness_retry_after_ = now_steady + std::chrono::minutes(5);
                         }
                     }
                 }
@@ -9147,14 +9253,57 @@ public:
         spdlog::info("Shutting down server...");
         draining_.store(true, std::memory_order_release);
 
-        // Graceful drain: wait for in-flight executions (up to 30s)
-        if (execution_tracker_) {
-            for (int i = 0; i < 30; ++i) {
-                auto running = execution_tracker_->query_executions({.status = "running"});
-                if (running.empty())
+        // Graceful drain (HA WS-8, ADR-2002 §12): /readyz now answers 503
+        // `draining`; keep the listener open — and every other route serving —
+        // for at least --shutdown-drain-seconds so a load balancer stops routing
+        // here BEFORE the socket closes, and for as long as executions are in
+        // flight (capped at kExecutionDrainCap). Decision + bounds:
+        // shutdown_drain_rules.hpp.
+        {
+            using namespace std::chrono;
+            // The two ROLL-UPS start no new work from here on (RD-1): the catalogue
+            // roll-up is told to stop without a join (an in-flight recompute finishes
+            // and is joined later, as before); the app-perf loop watches draining_
+            // itself. Those two are the maintenance passes whose join can wait out a
+            // long statement budget (120s / 60s); a recompute starting inside the
+            // grace would otherwise add that AFTER it. Other passes are unaffected —
+            // their stops are already bounded (e.g. NVD sync's 5s cancel-then-detach).
+            if (software_catalog_rollup_)
+                software_catalog_rollup_->request_stop();
+            const seconds min_grace{std::clamp(cfg_.shutdown_drain_seconds, 0,
+                                               shutdown_drain::kMaxShutdownDrainSeconds)};
+            if (min_grace.count() > 0) {
+                spdlog::info("Draining: /readyz reports 503; holding the listener open for {}s "
+                             "so load balancers stop routing here (--shutdown-drain-seconds)",
+                             min_grace.count());
+            }
+            const auto drain_start = steady_clock::now();
+            auto last_log = drain_start;
+            for (;;) {
+                const auto elapsed = steady_clock::now() - drain_start;
+                std::size_t running = 0;
+                // Queried every tick, whatever the reachability probe says. Skipping
+                // it while the probe was not Ready (tried in governance round 1) ended
+                // the drain early on a probe false-negative — the probe refused at
+                // max_connections, or a slow probe query — while the pool still
+                // served and executions were still completing (Gate 8 UP-G8-1).
+                // Residual, pre-existing: against a FROZEN primary this pooled query
+                // has no client-side deadline and can overrun the cap.
+                if (execution_tracker_ && elapsed < shutdown_drain::kExecutionDrainCap)
+                    running = execution_tracker_->query_executions({.status = "running"}).size();
+                if (!shutdown_drain::keep_draining(elapsed, min_grace, running > 0))
                     break;
-                spdlog::info("Draining: {} executions in flight, waiting...", running.size());
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (running > 0) {
+                    spdlog::info("Draining: {} executions in flight, waiting...", running);
+                } else if (steady_clock::now() - last_log >= seconds(10)) {
+                    // A countdown, so a long grace does not read as a hang and invite
+                    // the second signal that hard-exits (UP-11).
+                    spdlog::info("Draining: {}s of the {}s grace left",
+                                 duration_cast<seconds>(min_grace - elapsed).count(),
+                                 min_grace.count());
+                    last_log = steady_clock::now();
+                }
+                std::this_thread::sleep_for(seconds(1));
             }
         }
 
@@ -9166,10 +9315,11 @@ public:
         // the server fully live and EVERY route (except /readyz, which
         // already checks draining_ above) admitted and FULLY PROCESSED for
         // the whole cascade's duration, including racing new work against
-        // stores this same function tears down a few lines later. The 30s
-        // execution-drain window above already gives a load balancer a
-        // /readyz-503 grace period before this point, so closing the
-        // listening socket here does not shorten that signal.
+        // stores this same function tears down a few lines later. The drain
+        // wait above is the load balancer's /readyz-503 grace period: it lasts
+        // at least --shutdown-drain-seconds (default 0 — set it for any
+        // LB-fronted deployment), and longer only while executions are in
+        // flight. With neither, the socket closes here immediately.
         //
         // begin_closing() BEFORE web_server_->stop(): flips the shutdown
         // signal the /events, /api/v1/events, and dashboard-executions-
@@ -9227,6 +9377,16 @@ public:
         if (web_server_) {
             web_server_->stop();
         }
+
+        // HA WS-8: stop the Postgres reachability probe's loop thread. Its OBJECT
+        // is deliberately NOT reset here — /readyz handlers already admitted may
+        // still be running until listen() returns (bounded by the web-thread wait
+        // below), and they read the probe's snapshot. The join is normally one
+        // poll slice (~200ms): every libpq wait in the probe observes stop(). Not
+        // bounded by us: a host-name lookup (system resolver timeouts) or a GSSAPI
+        // exchange inside libpq that is in progress when stop() arrives.
+        if (pg_reachability_probe_)
+            pg_reachability_probe_->stop();
 
         // Signal AuthDB's provisional-MFA reaper to stop up front (it is owned
         // inside AuthDB, not a ServerImpl member thread, so it is not in the
@@ -11026,94 +11186,114 @@ private:
     /// signed by the CA, and return its DER. Backs GET /api/v1/ca/crl (served from
     /// the recorded latest, DoS-safe) and is called by POST /api/v1/ca/revoke to
     /// republish. Loads the CA key transiently + zeroes it (RAII). nullopt on no
-    /// CA / load / sign failure.
-    std::optional<std::vector<std::uint8_t>> publish_crl() {
-        // Serialise number-allocation + record so the crlNumber stays monotonic
-        // under concurrent publishers (gov architect SHOULD).
-        std::lock_guard<std::mutex> publish_lock(crl_publish_mu_);
+    /// CA / load / sign / persist failure. Number allocation, the revoked-set read
+    /// and the insert are one transaction in CaStore::publish_next_crl, serialised
+    /// across every replica by a table lock (HA WS-6 6.1); the key is loaded BEFORE
+    /// that lock is taken. If a subordinate import swaps the root in between, the
+    /// store refuses (RootChanged) and this retries once with the new root.
+    /// `background` = the freshness pass: it skips rather than queue behind another publish in
+    /// this process, so it never delays the revocation sweep that runs after it on the same
+    /// thread. A skip is not a failure (no counter; `*skipped` is set so the caller retries on
+    /// the next tick instead of backing off).
+    std::optional<std::vector<std::uint8_t>> publish_crl(bool background = false,
+                                                         bool* skipped = nullptr) {
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root_or_err = ca_store_->get_root();
-        if (!root_or_err) {
-            spdlog::error("PKI: CRL publish aborted — ca_store read failed: {}",
-                          root_or_err.error());
-            return std::nullopt;
-        }
-        auto& root = *root_or_err;
-        if (!root)
-            return std::nullopt;
-        const std::filesystem::path dir =
-            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
-        FileKeyProvider kp(dir);
-        auto ca_key = kp.load_key(root->key_ref);
-        if (!ca_key) {
-            spdlog::error("PKI: cannot load CA issuing key — CRL not published");
+        auto fail = [this]() -> std::optional<std::vector<std::uint8_t>> {
             metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
             return std::nullopt;
-        }
-        detail::ScopedKeyZero ca_key_zero{*ca_key};
+        };
+        try {
+            for (int attempt = 1; attempt <= 2; ++attempt) {
+                auto root_or_err = ca_store_->get_root();
+                if (!root_or_err) {
+                    spdlog::error("PKI: CRL publish aborted — ca_store read failed: {}",
+                                  root_or_err.error());
+                    return fail();
+                }
+                auto& root = *root_or_err;
+                if (!root)
+                    return std::nullopt;
+                const std::filesystem::path dir =
+                    cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+                FileKeyProvider kp(dir);
+                auto ca_key = kp.load_key(root->key_ref);
+                if (!ca_key) {
+                    spdlog::error("PKI: cannot load CA issuing key — CRL not published");
+                    return fail();
+                }
+                detail::ScopedKeyZero ca_key_zero{*ca_key};
 
-        auto revoked_or_err = ca_store_->list_revoked();
-        if (!revoked_or_err) {
-            // ADR-0036/ADR-0053: never build a CRL over a possibly-incomplete revoked set — a
-            // degraded read here would publish a CRL that silently un-revokes every real
-            // revocation in every cache that trusts it. Abort the whole publish instead.
-            spdlog::error("PKI: CRL publish aborted — list_revoked failed: {}",
-                          revoked_or_err.error());
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
+                // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
+                // cert fingerprint plus the STABLE key id (invariant across a subordinate
+                // re-key) so the CRL history is attributable to the key, not just a cert.
+                std::string issuer_key_id;
+                if (auto kid = pki::issuer_key_id(root->cert_pem))
+                    issuer_key_id = *kid;
+
+                auto build = [&](std::uint64_t number, const std::vector<IssuedCertRecord>& rows)
+                    -> std::optional<CaStore::BuiltCrl> {
+                    std::vector<pki::CrlRevocation> revoked;
+                    revoked.reserve(rows.size());
+                    for (const auto& r : rows) {
+                        revoked.push_back({r.serial_hex, std::chrono::system_clock::time_point{
+                                                             std::chrono::seconds{r.revoked_at}}});
+                    }
+                    // This replica's clock, read under the lock. Across replicas with skewed
+                    // clocks thisUpdate can still run backwards relative to crlNumber.
+                    const auto now = std::chrono::system_clock::now();
+                    const pki::Validity validity{now, now + std::chrono::hours(24 * 7)};
+                    auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
+                    if (!der) {
+                        spdlog::error("PKI: build_crl failed for CRL v{}", number);
+                        return std::nullopt;
+                    }
+                    return CaStore::BuiltCrl{
+                        std::move(*der),
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            validity.not_before.time_since_epoch())
+                            .count(),
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            validity.not_after.time_since_epoch())
+                            .count()};
+                };
+
+                auto rec = background
+                               ? ca_store_->publish_next_crl(build, root->fingerprint_sha256,
+                                                             issuer_key_id,
+                                                             std::chrono::milliseconds{0})
+                               : ca_store_->publish_next_crl(build, root->fingerprint_sha256,
+                                                             issuer_key_id);
+                if (rec)
+                    return std::move(rec->der);
+                if (background && rec.error() == CaStore::PublishError::Busy) {
+                    if (skipped)
+                        *skipped = true;
+                    return std::nullopt;
+                }
+                if (rec.error() == CaStore::PublishError::RootChanged && attempt == 1) {
+                    spdlog::info("PKI: CA root changed during CRL publish — retrying with the "
+                                 "new root");
+                    continue;
+                }
+                // B-1 (#1240): never report success unless the new CRL is durably recorded.
+                // Otherwise the revoke handler would audit ca.crl.published/success while
+                // /ca/crl keeps serving the PREVIOUS CRL (missing the just-revoked serial).
+                // ADR-0036/ADR-0053: an abort on a degraded revoked-set read or number read
+                // lands here too — never publish over a possibly-incomplete set.
+                spdlog::error("PKI: CRL publish failed — see the CaStore::publish_next_crl "
+                              "log line above for the cause");
+                return fail();
+            }
+        } catch (const std::exception& e) {
+            // The store rolled back; never let a builder exception escape a background thread.
+            spdlog::error("PKI: CRL publish threw: {} — CRL not published", e.what());
+            return fail();
+        } catch (...) {
+            spdlog::error("PKI: CRL publish threw a non-standard exception — CRL not published");
+            return fail();
         }
-        std::vector<pki::CrlRevocation> revoked;
-        for (const auto& r : *revoked_or_err) {
-            revoked.push_back(
-                {r.serial_hex,
-                 std::chrono::system_clock::time_point{std::chrono::seconds{r.revoked_at}}});
-        }
-        const auto now = std::chrono::system_clock::now();
-        const pki::Validity validity{now, now + std::chrono::hours(24 * 7)}; // 7-day nextUpdate
-        auto number_or_err = ca_store_->next_crl_number();
-        if (!number_or_err) {
-            // ADR-0053: never substitute a default number on error — see next_crl_number()'s
-            // doc comment for why the pre-migration "silently return 1" default is unsafe here.
-            spdlog::error("PKI: CRL publish aborted — next_crl_number failed: {}",
-                          number_or_err.error());
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        const std::uint64_t number = *number_or_err;
-        auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
-        if (!der) {
-            spdlog::error("PKI: build_crl failed");
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        CrlVersionRecord rec;
-        rec.version = static_cast<int64_t>(number);
-        rec.der = *der;
-        rec.this_update =
-            std::chrono::duration_cast<std::chrono::seconds>(validity.not_before.time_since_epoch())
-                .count();
-        rec.next_update =
-            std::chrono::duration_cast<std::chrono::seconds>(validity.not_after.time_since_epoch())
-                .count();
-        // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
-        // cert fingerprint plus the STABLE key id (invariant across a subordinate
-        // re-key) so the CRL history is attributable to the key, not just a cert.
-        rec.issuer_fingerprint = root->fingerprint_sha256;
-        if (auto kid = pki::issuer_key_id(root->cert_pem))
-            rec.issuer_key_id = *kid;
-        if (!ca_store_->record_crl(rec)) {
-            // B-1 (#1240): do NOT report success on a persistence failure. Returning
-            // the freshly-built DER here would make the revoke handler audit
-            // ca.crl.published/success and set crl_republished:true while /ca/crl
-            // keeps serving the PREVIOUS CRL (missing the just-revoked serial) — a
-            // false success that also evades the stale-CRL alert. Fail honestly so
-            // the caller reports crl_republished:false and the failure audit fires.
-            spdlog::error("PKI: failed to record CRL v{} — reporting publish failure", number);
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        return der;
+        return fail();
     }
 
     // -- Web server -----------------------------------------------------------
@@ -14592,6 +14772,7 @@ private:
                              .draining = &draining_,
                              .server_start_time = server_start_time_,
                              .pg_pool = pg_pool_.get(),
+                             .pg_reachability_probe = pg_reachability_probe_.get(),
                              .response_store = response_store_.get(),
                              .audit_store = audit_store_.get(),
                              .instruction_store = instruction_store_.get(),
@@ -15240,13 +15421,20 @@ private:
             app_perf_rollup_thread_ = std::thread([this]() {
                 spdlog::info("App-perf roll-up thread started (cadence=1h, B2 retention=180d)");
                 bool first = true;
-                while (!stop_requested_.load(std::memory_order_acquire)) {
+                // HA WS-8: `draining_` also ends the loop. It is set at the START of
+                // stop()'s drain grace, `stop_requested_` only after it — without
+                // this, an hourly roll-up could begin inside the grace and its
+                // 120s statement budget would then stack after it in the shutdown.
+                const auto halt = [this] {
+                    return stop_requested_.load(std::memory_order_acquire) ||
+                           draining_.load(std::memory_order_acquire);
+                };
+                while (!halt()) {
                     if (!first) {
                         // ~1h in 5s steps so shutdown stays responsive.
-                        for (int i = 0;
-                             i < 720 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        for (int i = 0; i < 720 && !halt(); ++i)
                             std::this_thread::sleep_for(std::chrono::seconds{5});
-                        if (stop_requested_.load(std::memory_order_acquire))
+                        if (halt())
                             break;
                     }
                     first = false;
@@ -15268,8 +15456,7 @@ private:
                         YUZU_ASSERT_BACKGROUND_JOB("app_perf_fleet_store.run_retention_prune");
                         const std::int64_t retention_win =
                             static_cast<std::int64_t>(AppPerfFleetStore::kRetentionDays) * 86400;
-                        for (int drain = 0;
-                             drain < 12 && !stop_requested_.load(std::memory_order_acquire); ++drain) {
+                        for (int drain = 0; drain < 12 && !halt(); ++drain) {
                             const int pruned = app_perf_fleet_store_->run_retention_prune(retention_win);
                             if (pruned != static_cast<int>(AppPerfFleetStore::kPruneCapPerPass))
                                 break;
@@ -16347,78 +16534,17 @@ private:
         // empty). The fleet + picker seams read B2; the per-device drill reads B1
         // (audited at the route); the group roll-up resolves members then aggregates
         // B1 — two bounded single-store reads composed, never a held cross-store
-        // lease (ADR-0012 §1).
-        AppPerfProviders app_perf_providers;
-        app_perf_providers.fleet =
-            [this](std::string_view app, std::string_view version)
-            -> std::optional<std::vector<AppPerfFleetRow>> {
-            if (!app_perf_fleet_store_)
-                return std::nullopt;
-            return app_perf_fleet_store_->get_app_fleet_perf(app, version);
-        };
-        app_perf_providers.apps =
-            [this](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
-            if (!app_perf_fleet_store_)
-                return std::nullopt;
-            return app_perf_fleet_store_->list_apps(truncated);
-        };
-        app_perf_providers.device =
-            [this](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
-            if (!app_perf_daily_store_)
-                return std::nullopt;
-            return app_perf_daily_store_->get_agent_app_perf(agent_id);
-        };
-        app_perf_providers.group =
-            [this](std::string_view group_id, std::string_view app,
-                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
-            if (!app_perf_group_reader_ || !mgmt_group_store_)
-                return std::nullopt;
-            // Resolve members (one bounded read, lease released), THEN aggregate B1
-            // (a second bounded read) — never a lease held across the other (ADR-0012
-            // §1). An empty/unknown group → empty member list → empty 200, not a leak.
-            const auto members = mgmt_group_store_->get_members(std::string(group_id));
-            std::vector<std::string> agent_ids;
-            agent_ids.reserve(members.size());
-            for (const auto& m : members)
-                agent_ids.push_back(m.agent_id);
-            return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
-        };
-        // Device-model (tag) cohort trend for the app-perf page — same
-        // ManagementGroupStore->AppPerfGroupReader composition as `.group`
-        // above, just resolving membership via TagStore instead. A degraded
-        // tag read fails the WHOLE lookup closed (nullopt), never "no match".
-        app_perf_providers.tag_cohort =
-            [this](std::string_view tag_key, std::string_view tag_value, std::string_view app,
-                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
-            if (!app_perf_group_reader_ || !tag_store_)
-                return std::nullopt;
-            auto agents = tag_store_->agents_with_tag(std::string(tag_key), std::string(tag_value));
-            if (!agents)
-                return std::nullopt; // fail closed on a degraded tag read (TagStore contract)
-            return app_perf_group_reader_->get_group_trend(*agents, app, version);
-        };
-        app_perf_providers.tag_values =
-            [this](std::string_view tag_key) -> std::optional<std::vector<std::string>> {
-            if (!tag_store_)
-                return std::nullopt;
-            auto values = tag_store_->get_distinct_values(std::string(tag_key));
-            if (!values)
-                return std::nullopt;
-            return *values;
-        };
-        // The version-row "which devices" drill (B1, fleet-wide only — see the
-        // dashboard route's own registration comment for the documented v1
-        // group-scope gap). `visible_agent_ids` is threaded straight through
-        // from the caller's own require_fleet_read scope, never widened.
-        app_perf_providers.version_devices =
-            [this](std::string_view app, std::string_view version,
-                   const std::optional<std::vector<std::string>>& visible_agent_ids,
-                   bool& truncated) -> std::optional<std::vector<AppPerfVersionDeviceRow>> {
-            if (!app_perf_daily_store_)
-                return std::nullopt;
-            return app_perf_daily_store_->list_devices_for_version(app, version, visible_agent_ids,
-                                                                    truncated);
-        };
+        // lease (ADR-0012 §1). `AppPerfProviders` (the pre-seam callback-bundle
+        // this block used to build) is RETIRED (#4626) — `dex_perf_api` below
+        // (make_local_dex_perf_api) now does this exact composition (fleet/apps/
+        // device/group/tag_cohort/version_devices) internally, and is the SOLE
+        // consumer every surface (REST, MCP, dashboard) reads.
+        //
+        // GAP-1 CLOSED (#4857, architect D1 ruling): the model-picker's
+        // device-model scope-selector values no longer need a standalone
+        // TagStore-reading lambda here — `DexRoutes` now derives them
+        // in-seam from `dex_perf_api`'s own `fleet_snapshot` (see
+        // `DexPerfApi`'s own doc comment).
         // ADR-0031 WS-A4 #4250: the /auto VERIFY compare resource's store-reaching
         // assembly (members-then-B1-rows, ADR-0012 §1) moved verbatim behind the
         // VerifyApi seam (verify_api.{hpp,cpp}) — ONE instance, shared by the
@@ -16431,14 +16557,13 @@ private:
         auto verify_api =
             make_local_verify_api(*mgmt_group_store_, app_perf_cohort_reader_.get());
         // ADR-0031 WS-A4 (sixth family): the DEX app-perf-over-time API seam —
-        // ONE instance backing the 9 GET /api/v1/dex/perf/* resources (minus
-        // /compare, VerifyApi's above) + GET /api/v1/dex/devices/{id}/app-perf.
-        // Wired with the SAME `dex_perf_fn` closure (below) DexRoutes/the
-        // fragments already share, so the heartbeat-now denominator can never
-        // diverge between the seam and the fragments — mirrors DexApi's own
-        // FleetFn threading (dex_api, below). ADDITIONAL to app_perf_providers
-        // above (not a replacement): other consumers (the dashboard fragments)
-        // still read app_perf_providers directly until they migrate too.
+        // the SOLE instance backing the 9 GET /api/v1/dex/perf/* resources
+        // (minus /compare, VerifyApi's above) + GET /api/v1/dex/devices/{id}/
+        // app-perf, the MCP DEX perf tools, AND (#4626) the dashboard
+        // fragments (DexRoutes) — every consumer reads this one instance, so
+        // none can disagree. Wired with the SAME `dex_perf_fn` closure (below)
+        // DexRoutes shares, so the heartbeat-now denominator can never diverge
+        // — mirrors DexApi's own FleetFn threading (dex_api, below).
         auto dex_perf_api = make_local_dex_perf_api(
             dex_perf_fn, app_perf_fleet_store_.get(), app_perf_daily_store_.get(),
             app_perf_group_reader_.get(), mgmt_group_store_.get(), tag_store_.get());
@@ -16553,14 +16678,14 @@ private:
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
-            // F2a: the shared fleet perf snapshot provider (defined above).
-            dex_perf_fn,
             // Per-device scope gate (same require_scoped_permission the /device routes
             // use) + the visible-agent set resolver — so the per-device DEX drills are
             // scoped and the device-id lists never enumerate out-of-scope agents.
             scoped_perm_fn, visible_set_fn,
-            // F2b app-perf-over-time providers + the scope-selector group list.
-            app_perf_providers, dex_group_list_fn,
+            // ADR-0031 WS-A4 (sixth family, #4626): the DEX app-perf-over-time
+            // API seam (F2a heartbeat-now + F2b over-time) + the scope-selector
+            // group list — replaces the retired `app_perf_providers` bundle.
+            dex_perf_api, dex_group_list_fn,
             // The devices-by-version drill's sole gate (ADR-0017) — the SAME
             // fleet_read_fn lambda wired into RestApiV1/McpServer, so all three
             // surfaces resolve visibility identically.
@@ -16741,10 +16866,21 @@ private:
 
         // DeviceLensRoutes — the DEX + Guardian device-page lenses, split out of
         // DeviceRoutes (ADR-0031 WS-A4 wave 2, see device_lens_routes.hpp's own
-        // banner). Same store/scope/audit wiring the lenses had inside DeviceRoutes.
+        // banner) and rewired onto the DexApi/GuardianApi seams (issue #4576 +
+        // the deferred guardian-lens rewire). `dex_api` is already gated on
+        // `guaranteed_state_store_` presence above (null -> null, matching the
+        // fragment's own pre-rewire `!store_` 503-placeholder posture
+        // byte-for-byte); `guardian_api` itself is constructed unconditionally
+        // (its OWN degrade posture is per-method, not per-instance), so the
+        // SAME `guaranteed_state_store_` presence gate is applied explicitly
+        // here to preserve that byte-identical posture for this lens too.
+        // Same scope/audit wiring the lenses had inside DeviceRoutes.
         device_lens_routes_ = std::make_unique<DeviceLensRoutes>();
-        device_lens_routes_->register_routes(*web_server_, scoped_perm_fn,
-                                             guaranteed_state_store_.get(), audit_fn);
+        device_lens_routes_->register_routes(
+            *web_server_, scoped_perm_fn, dex_api,
+            guaranteed_state_store_ ? DeviceLensRoutes::GuardianApiPtr{guardian_api}
+                                    : DeviceLensRoutes::GuardianApiPtr{},
+            audit_fn);
 
         // InventoryRoutes — /inventory: the SOFTWARE inventory list (fleet catalogue +
         // installs-per-version drill + find-by-name) over SoftwareInventoryStore, gated on
@@ -18515,13 +18651,13 @@ private:
         discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
                                           instruction_store_.get(), &registry_);
 
-        // DEX app-perf-over-time read providers (slice 2). One bundle of B1/B2
-        // store seams shared by the REST endpoints and the MCP twins so both read
-        // the SAME substrate. Each lambda null-checks the store at call time and
-        // returns std::nullopt on an unwired/closed store (the read surfaces map a
-        // nullopt to a 503 degrade, never a silent empty). The `app_perf_providers`
-        // bundle is built once ABOVE (before the DexRoutes registration) so the
-        // dashboard, REST and MCP surfaces all share the same store seams.
+        // DEX app-perf-over-time read providers (slice 2). `dex_perf_api`
+        // (built once ABOVE, before the DexRoutes registration) is the ONE
+        // seam shared by the dashboard, the REST endpoints, and the MCP twins
+        // (#4626) so all three read the SAME substrate — each method
+        // null-checks its backing store at call time and returns
+        // std::nullopt on an unwired/closed store (the read surfaces map a
+        // nullopt to a 503/"unavailable" degrade, never a silent empty).
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
@@ -18860,8 +18996,6 @@ private:
             [this](const std::string& username, const std::string& agent_id) -> bool {
                 return response_agent_in_scope(username, agent_id);
             },
-            // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
-            app_perf_providers,
             // PR 4.2 — fleet-wide engine role-assignment authoring surface.
             engine_principal_store_.get(),
             // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
@@ -18938,8 +19072,8 @@ private:
             // seam — the 9 GET /api/v1/dex/perf/* handlers + the per-device
             // drill require this and answer 503 when it is null, the exact
             // same degrade the old `!dex_perf_fn`/`!app_perf_providers.<member>`
-            // guards produced (app_perf_providers stays wired above too — this
-            // is additive until every consumer migrates).
+            // guards produced. The SOLE instance (#4626) — also shared by
+            // DexRoutes (dashboard) and the MCP DEX perf tools below.
             dex_perf_api,
             // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam,
             // constructed unconditionally above — each method individually
@@ -19149,17 +19283,17 @@ private:
             // readiness guard answers "store unavailable" (byte-identical).
             mcp_server_->set_dex_api(dex_api);
             // ADR-0031 WS-A4 (sixth family): the SAME DexPerfApi seam instance
-            // the REST /api/v1/dex/perf/* handlers use (constructed above,
-            // additive alongside app_perf_providers), so the 9 MCP DEX
-            // app-perf tool twins + get_dex_device_app_perf never disagree
-            // with REST. Unlike dex_api above, dex_perf_api is constructed
+            // the REST /api/v1/dex/perf/* handlers AND DexRoutes (dashboard,
+            // #4626) use, so the 9 MCP DEX app-perf tool twins +
+            // get_dex_device_app_perf never disagree with REST/dashboard.
+            // Unlike dex_api above, dex_perf_api is constructed
             // UNCONDITIONALLY — never nullptr — because each backing store
             // pointer is checked individually INSIDE the impl (dex_perf_api.cpp),
-            // exactly matching the old per-lambda null-checks in
-            // app_perf_providers; the tools' !dex_perf_api_ guard therefore
-            // never fires in practice (dex_perf_api_local.hpp's own banner
-            // states this), but stays as defense-in-depth against a future
-            // wiring change, and every server's stores fail closed at boot
+            // exactly matching the old per-lambda null-checks the retired
+            // `AppPerfProviders` bundle used; the tools' !dex_perf_api_ guard
+            // therefore never fires in practice (dex_perf_api_local.hpp's own
+            // banner states this), but stays as defense-in-depth against a
+            // future wiring change, and every server's stores fail closed at boot
             // regardless — behaviourally identical to the old direct calls.
             mcp_server_->set_dex_perf_api(dex_perf_api);
             // ADR-0031 WS-A4 (seventh family): the SAME schedule-read API
@@ -19340,9 +19474,6 @@ private:
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
                 &metrics_,
-                // DEX app-perf-over-time read providers (slice 2) — same bundle the
-                // REST endpoints use, so MCP and REST read the SAME B1/B2 substrate.
-                app_perf_providers,
                 // #289 / Issue 13.5: the quarantine store backs the
                 // quarantine_device write tool (record + real isolate), and the
                 // tag-push closure fires the agent tag-push after set_tag exactly
@@ -19825,6 +19956,9 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
         yuzu::server::capdecls::plugin_action_catalogue_printing(),
         yuzu::server::capdecls::plugin_action_catalogue_app_control(),
+        yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),
+        yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
+        yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
         yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
         yuzu::server::capdecls::plugin_action_catalogue_local_security_policy(),
     };
@@ -20058,11 +20192,6 @@ private:
     std::string agent_ca_cert_pem_;
     std::mutex csr_issue_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> csr_issue_last_;
-    // Serialises publish_crl() so next_crl_number()+record_crl() are atomic across
-    // concurrent publishers (startup pre-publish vs a revoke, or two revokes) —
-    // otherwise both could read the same number and last-writer-wins overwrites,
-    // breaking RFC 5280 monotonic crlNumber (gov architect SHOULD).
-    std::mutex crl_publish_mu_;
     // Cache of is_yuzu_issued (immutable per cert) — avoids a per-heartbeat
     // verify_chain fleet-wide (gov UP-7). Keyed by full leaf PEM.
     std::mutex yuzu_issued_cache_mu_;
@@ -20447,6 +20576,13 @@ private:
     // leader_elector_->is_leader() via leader_gate.hpp — slice 3.2.
     std::unique_ptr<LeaderElector> leader_elector_;
     std::thread leader_thread_;
+
+    // HA WS-8 (ADR-2002 §12): the runtime Postgres-reachability probe behind
+    // /readyz's `pg_reachable` row. Dedicated connection (NOT pg_pool_), own loop
+    // thread. stop() joins the THREAD; the OBJECT lives until ~ServerImpl because
+    // /readyz handlers may still be running after web_server_->stop() (they read
+    // its snapshot under the probe's own leaf mutex) — never reset() it inside stop().
+    std::unique_ptr<PgReachabilityProbe> pg_reachability_probe_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

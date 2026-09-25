@@ -33,6 +33,9 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
+#include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_runtimes.hpp"
+#include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "command_capability.hpp"
@@ -144,6 +147,9 @@ struct LabeledSpan {
         {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
         {"app_control", capdecls::plugin_action_catalogue_app_control(), false},
+        {"firmware_posture", capdecls::plugin_action_catalogue_firmware_posture(), false},
+        {"runtimes", capdecls::plugin_action_catalogue_runtimes(), false},
+        {"platform_security", capdecls::plugin_action_catalogue_platform_security(), false},
         {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
         {"local_security_policy", capdecls::plugin_action_catalogue_local_security_policy(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
@@ -154,7 +160,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, eighteen sources exactly as a live composition site would use.
+    // literally, twenty-one sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -171,6 +177,9 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_app_control(),
+        capdecls::plugin_action_catalogue_firmware_posture(),
+        capdecls::plugin_action_catalogue_runtimes(),
+        capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::plugin_action_catalogue_local_security_policy(),
         capdecls::core_dispatch_capabilities(),
@@ -364,6 +373,87 @@ TEST_CASE("capability catalogue: a locally-constructed duplicate span makes the 
     auto other = registry.classify("content_dist", "list_staged");
     REQUIRE(other.has_value());
     CHECK(other->dispatch_class == DispatchClass::ReadOnly);
+}
+
+/// Exact-row pin for `firmware_posture.firmware` (Wave 8), the only row of its fragment.
+/// `Security`, the antivirus/bitlocker/firewall class: a read-only security posture plugin.
+TEST_CASE("capability catalogue: firmware_posture.firmware pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_firmware_posture();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows[0];
+    CHECK(row.plugin == "firmware_posture");
+    CHECK(row.action == "firmware");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Security");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK_FALSE(row.system_reserved);
+    CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+// The composed registry resolves the declared action and refuses an undeclared one: a second,
+// unreviewed `firmware_posture` action must be classified by its own row, never inherited.
+TEST_CASE("capability catalogue: firmware_posture classifies `firmware` and refuses an unknown action",
+          "[server][dispatch][capability]") {
+    const auto registry = build_registry(all_labeled_sources());
+    auto known = registry.classify("firmware_posture", "firmware");
+    REQUIRE(known.has_value());
+    CHECK(known->securable == "Security");
+    auto unknown = registry.classify("firmware_posture", "unknown");
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error() == ClassificationError::Unclassified);
+}
+
+/// Exact-row pin for `runtimes`: both actions are ReadOnly/None on the
+/// `Inventory` securable (a software-inventory fact, not a posture fact). The
+/// generic invariants above accept ANY seeded securable and ANY dispatch
+/// class, so without this pin a silent change to `Mutating` or `Security`
+/// ships green (an orchestrator probe confirmed it). Appended at the end of
+/// the file so sibling plugins' pins do not collide textually.
+TEST_CASE("capability catalogue: runtimes.dotnet and runtimes.jvm pin their exact "
+          "classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_runtimes();
+    REQUIRE(rows.size() == 2);
+    for (const auto action : {"dotnet", "jvm"}) {
+        const auto it =
+            std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
+        REQUIRE(it != rows.end());
+        CHECK(it->plugin == "runtimes");
+        CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+        CHECK(it->mutability == Mutability::None);
+        CHECK(it->securable == "Inventory");
+        CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->risk_tier == authz::RiskTier::Low);
+        CHECK_FALSE(it->system_reserved);
+        CHECK(it->execute_gate == ExecuteGate::None);
+    }
+}
+
+/// Exact-row pin for `platform_security` (Wave 8): both rows read fixed boot-integrity
+/// / code-signing state, no write, so ReadOnly/None on the `Security` securable, the
+/// antivirus/bitlocker/firewall class (2026-09-21 decision). Pinned literally:
+/// re-typing a row as Inventory, Destructive or a non-None gate fails here.
+TEST_CASE("capability catalogue: platform_security rows pin their exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_platform_security();
+    REQUIRE(rows.size() == 2);
+    const char* const kActions[] = {"secure_boot", "code_integrity"};
+    for (std::size_t i = 0; i < 2; ++i) {
+        const auto& row = rows[i];
+        INFO("action " << kActions[i]);
+        CHECK(row.plugin == "platform_security");
+        CHECK(row.action == kActions[i]);
+        CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(row.mutability == Mutability::None);
+        CHECK(row.securable == "Security");
+        CHECK(row.operation == authz::Operation::Read);
+        CHECK(row.risk_tier == authz::RiskTier::Low);
+        CHECK_FALSE(row.system_reserved);
+        CHECK(row.execute_gate == ExecuteGate::None);
+    }
 }
 
 /// Exact-row pin for `browser_inventory` (Wave 10 Forensics-class plugin,

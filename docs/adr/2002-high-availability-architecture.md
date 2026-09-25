@@ -1407,10 +1407,13 @@ FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22). One path remains genuinely open, n
 every branch this PR's own scope covers, not that one.
 
 ### 8. PKI / CA high availability (Q8)
-Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:
-- **CA root key → `SecretCodec`-wrapped blob in Postgres** (ADR-0010); distributing the key reduces
-  to **KEK availability**.
-- **`CaStore` → Postgres**; **durable CRL numbering** via a Postgres sequence — but numbering alone
+Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the
+"collapse into the KEK problem" framing and the first two bullets are superseded — see the Update
+below)*:
+- ~~**CA root key → `SecretCodec`-wrapped blob in Postgres** (ADR-0010); distributing the key reduces
+  to **KEK availability**.~~ *Superseded 2026-09-23: the key stays behind `KeyProvider`.*
+- **`CaStore` → Postgres**; **durable CRL numbering** via a Postgres sequence *(superseded
+  2026-09-23: a table lock, not a sequence)* — but numbering alone
   is insufficient: **CRL publication becomes an explicit durable state machine** (allocate → sign →
   store → make-current) with a fencing rule, since a sequence prevents collisions yet can leave gaps
   and does not make publication atomic (`ca_store.cpp:605`).
@@ -1420,6 +1423,41 @@ Collapse CA HA into the KEK problem, with the versioning/rollout gaps review sur
   includes KEK **version rollout, rollback, and node-admission** semantics (an instance without the
   current version must not silently produce unverifiable material). KMS/HSM via the existing seam is
   optional (SaaS / high-security).
+
+**Update (2026-09-23, WS-6 planning + slice 6.1).** Three points above are resolved as follows:
+- **The CA root key does NOT become a `SecretCodec` blob in Postgres.** The first bullet conflicted
+  with ADR-0010 Decision 6 (the CA root key stays behind `KeyProvider`; "no future store migration
+  may" move it) and ADR-0053 §Secrets. ADR-0010 governs. Putting the key under the secrets KEK would
+  make database + KEK sufficient to hold the CA, while saving little operationally, because the KEK
+  files must be distributed to every replica anyway. WS-6 instead uses **shared key custody**: the
+  CA key and KEK files are provisioned to every replica, and a replica must prove it can resolve
+  every required key before it is admitted (slice 6.3, with `/readyz`).
+- **`CaStore` → Postgres** was already done by ADR-0053 before WS-6 began.
+- **CRL publication (slice 6.1, closes #4126)** is one Postgres transaction:
+  `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE` → read `MAX(version)+1` → read
+  the revoked set → sign → `INSERT` → `COMMIT` (`CaStore::publish_next_crl`). Allocate, store and
+  make-current happen together at the commit ("current" is the highest committed version), a
+  rollback consumes no number, so there are no gaps and no sequence is needed. The table lock is
+  the fencing rule — in a different sense from §3's fencing token: there is no leadership to lose,
+  because the lock and the CRL write are one transaction, so a paused publisher cannot hold a
+  silently transferred right. It serialises every publisher on every replica, is released by the
+  commit, and is deliberately not a leader epoch, because the operator revoke path publishes
+  synchronously (the two-dispatch-planes rule). A table lock rather than the codebase's usual
+  `pg_advisory_xact_lock` because it also blocks writers that do not opt in (any other INSERT into
+  `ca_crl_versions`, including an older binary's during a rolling upgrade) — do not "harmonise" it
+  to an advisory lock. The lock wait is bounded per transaction (`set_config('lock_timeout', …)`),
+  and a process-local mutex keeps each replica to one pool connection waiting on it. Reading the
+  revoked set after acquiring the lock makes each CRL a superset of the one before it; re-reading
+  `ca_root`'s fingerprint under the lock stops a publish that raced a subordinate import from
+  landing a CRL under the superseded issuer. The CA key is loaded before the lock is taken; only
+  signing runs under it. A publish that fails (e.g. lock timeout) is healed by the leader's
+  freshness pass, which republishes whenever the latest CRL's recorded `revoked_count` differs from
+  the current revoked count — a count comparison, never cross-replica timestamps, which holds
+  because the revoked set is append-only (`delete_issued_by()` keeps revoked rows, and a migration-v4
+  row trigger rejects deleting or updating a revoked `ca_issued` row). A publisher
+  frozen mid-transaction is cut off by a transaction-scoped `idle_in_transaction_session_timeout`.
+- **Enrollment → Postgres** (slice 6.2) imports the existing `enrollment-tokens.cfg` /
+  `pending-agents.cfg` once at first boot rather than starting fresh.
 
 ### 9. SQLite tail migration (Q9)
 ADR-0006 Update already mandates every server store migrate to Postgres; HA makes the remaining tail
@@ -1525,6 +1563,62 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
   buffering; health targets `/readyz`; draining; optional stickiness (locality only); TLS stance.
   Owned by `docs-writer` + `release-deploy`.
 
+**Update (2026-09-24, WS-8 readyz — monolith).** The monolith's single `/readyz` plays the core role and
+is what the operator LB targets (the tier split is a no-op until ADR-1005's split lands, §1c). Two
+gaps closed:
+- **"Red when core cannot reach `yuzu`" is now true at runtime.** Every store's `is_open()` is latched
+  at construction (#3061) and the pool's connect breaker arms only on a failed *new* connect, so
+  `/readyz` used to stay green through an outage. A dedicated-connection probe
+  (`PgReachabilityProbe`, never a pool lease) now feeds a gating `pg_reachable` row: not ready after
+  two failed probes, immediately on reaching a server that refuses writes (`pg_is_in_recovery()` or
+  `transaction_read_only` — core is the sole writer, so a replica pointed at a standby, or at a primary
+  in read-only mode, cannot serve), or after 15 s without a success. Every libpq socket wait runs under a
+  client-side deadline via the non-blocking API (a host-name lookup is bounded by the system
+  resolver instead), because a blocking query against a frozen backend was
+  measured at 101 s; libpq walks a multi-host DSN itself with the pool's exact connection parameters, and the
+  probe only gives each host its own deadline (the pool's effective `connect_timeout`, timed as the
+  linked libpq's blocking connect times it),
+  restarting the walk over the untried hosts when one goes silent — and not moving on at all when that
+  timeout is unlimited, because the pool does not either (libpq's non-blocking
+  connect never advances past a silent host); and a read-only answer drops the
+  connection so the next probe re-resolves, rather than staying on a standby that a proxy, DNS name
+  or read-any port routed a new connection to. Consequence, accepted: a Postgres failover
+  turns **every** replica red for the failover window — truthful, since nothing can serve writes.
+  Leadership is deliberately not a readiness condition.
+- **Multi-host DSNs.** libpq walks the host list for the probe exactly as for the pool (order, which
+  failures move on and which end the attempt, the pool's connection parameters), so the probe
+  measures the host the pool reaches — every re-implementation of that walk diverged (governance
+  rounds 2–5); and a multi-host DSN must carry
+  `target_session_attrs=read-write` (added when absent, a weaker value refuses boot) and may not set
+  `load_balance_hosts` (refused at boot: the pool would shuffle per connection while the probe holds one),
+  because without
+  it libpq puts pool connections on standbys that no single probe connection can observe. Residual: the
+  pool does not re-validate connections it holds, so a server that turns read-only in place (without the
+  restart a demotion implies, or behind a per-node pooler that keeps server connections open) keeps
+  failing those connections. `/readyz` goes red too when a new connection reaches that server; it stays
+  green only when a new connection reaches a different, writable host.
+- **The contract, and a freeze (governance round 9, architecture review adopted by the operator).**
+  Nine review rounds each found a new divergence between the probe and the pool, all one class: the pool
+  holds N connections opened at N moments under N resolved settings and never re-validates them, so no
+  single probe connection can represent them. The promise is therefore stated precisely:
+  `pg_reachable` is a one-session signal — red when the probe's most recent connect, made with the pool's
+  own parameters (a single host capped at 5 s), could not establish a session to a server that accepts
+  writes, or when the probe's held session stops answering or turns read-only. It keeps a healthy session
+  open, so it does not observe the pool's other held connections, nor anything that changed after the
+  probe last connected. Named residuals: held pool connections to a server demoted in place (#4942);
+  anything that changes whether a new connection would succeed — service-file/environment edits, a
+  password rotation or expiry, a pg_hba or certificate change — until the probe's next reconnect (#4956);
+  a multi-address host name with one silent address (#4954); `max_connections` exhaustion (#4943); and,
+  accepted and untracked, timing — about ±1 s against the pool's connect, a single host capped at 5 s
+  (red-only). Freeze rule: no further emulation of libpq/pool behaviour in
+  the probe; a newly found divergence is an issue against this contract unless it produces a false green
+  for a fresh connect on a single-endpoint or read-write multi-host DSN, which stays blocking. The durable
+  fix for held connections is pool-side (validate on acquire / maximum lifetime), not more probe
+  emulation.
+- **Draining.** `--shutdown-drain-seconds` (0–60, default 0) holds the listener open after `/readyz`
+  turns `503 draining`, so the fronting layer drains before the socket closes.
+The BYO-LB documentation deliverable above remains open (P2, not in the safe-to-scale gate).
+
 ### 13. HA guarantees — RTO/RPO (Q12)
 Proposed targets for the team to ratify:
 - **Presentation-replica loss:** RTO ≈ 0 (operator LB removes it on `/readyz`; sessions/streams are
@@ -1569,8 +1663,8 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
 4. **Gateway routing + multi-cluster topology** — fenced agent→cluster directory **and net-new
    distributed intra-cluster agent→node routing** (§7).
 5. **Shared agent presence / health / scope population** (§7a).
-6. **PKI/CA HA** — CA key to `SecretCodec`, CRL publication state machine, KEK versioning/rollout,
-   enrollment to PG (§8).
+6. **PKI/CA HA** — shared CA key custody + node admission (not `SecretCodec`; §8 Update
+   2026-09-23), CRL publication state machine, KEK versioning/rollout, enrollment to PG (§8).
 7. **HA-PG delivery** — Patroni+etcd+HAProxy profile with **selectable durability (3-node quorum
    default)** + operator-plane LB (§11).
 8. **Health contract + BYO-LB doc** (§12).
