@@ -8,6 +8,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 
 <!-- BEGIN GENERATED: plugin-doc-gen index -->
 61 of 61 plugins document themselves this way; the rest are described in the prose below until their README lands.
+62 of 62 plugins document themselves this way; the rest are described in the prose below until their README lands.
 
 | Plugin | Platforms | What it does | Docs |
 |---|---|---|---|
@@ -34,6 +35,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `filesystem` | ✅ ✅ ✅ | Filesystem operations — exists, list_dir, file_hash, search_dir, text ops (admin-only) | [README](../../agents/plugins/filesystem/README.md) |
 | `filesystem_posture` | 🟡 ✅ 🟡 | Reports mounted filesystems, per-mount quota-subsystem state, and snapshot-capable volumes | [README](../../agents/plugins/filesystem_posture/README.md) |
 | `firewall` | ✅ ✅ ✅ | Firewall status and rule listing | [README](../../agents/plugins/firewall/README.md) |
+| `firmware_posture` | ✅ 🟡 🟡 | Reports firmware/BIOS vendor, version, release date and update-pending posture | [README](../../agents/plugins/firmware_posture/README.md) |
 | `hardware` | ✅ ✅ ✅ | Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, drivers | [README](../../agents/plugins/hardware/README.md) |
 | `http_client` | ✅ ✅ ✅ | HTTP client — download files, GET/HEAD requests with hash verification (no shell-out) | [README](../../agents/plugins/http_client/README.md) |
 | `installed_apps` | ✅ ✅ ✅ | Inventories installed applications and queries by name | [README](../../agents/plugins/installed_apps/README.md) |
@@ -56,6 +58,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `quarantine` | ✅ ✅ ✅ | Device network isolation (quarantine) with per-IP whitelisting | [README](../../agents/plugins/quarantine/README.md) |
 | `rdp_control` | ✅ ⛔ ⛔ | Remote Desktop control — enable/disable RDP (registry + firewall + TermService) | [README](../../agents/plugins/rdp_control/README.md) |
 | `registry` | ✅ ⛔ ⛔ | Windows Registry — get, set, delete, enumerate keys and values | [README](../../agents/plugins/registry/README.md) |
+| `runtimes` | 🟡 🟡 ✅ | Installed .NET and JVM runtime inventory | [README](../../agents/plugins/runtimes/README.md) |
 | `sccm` | ✅ ⛔ ⛔ | Reports SCCM/ConfigMgr client status, version, and site assignment | [README](../../agents/plugins/sccm/README.md) |
 | `script_exec` | ✅ ✅ ✅ | Executes commands and scripts with streaming output (admin-only) | [README](../../agents/plugins/script_exec/README.md) |
 | `services` | ✅ ✅ ✅ | System services — enumerate, query, and configure service startup types | [README](../../agents/plugins/services/README.md) |
