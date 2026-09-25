@@ -1588,6 +1588,24 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   build on any future unwrapped `spdlog::` call in this subsystem; it found 7 real sites the manual
   sweep missed on its first run, now also fixed. Windows-only code verified on real MSVC 19.44. No
   stored-data migration needed (fresh-build-only fleet; confirmed no production fleet exists yet).
+  **A fourth round followed PR #4979's collaborator adversarial review (fjarvis, Codex+Kimi-K3
+  panel, 2026-09-25):** a real BLOCKING finding — the push-builder exclusion fix from the third
+  round, combined with `full_sync`'s unconditional teardown-and-rebuild-from-the-push semantics,
+  meant a previously-armed legacy non-conforming rule was silently and permanently DISARMED on the
+  next `full_sync`, not "frozen at its last-applied state" as that round's own doc text claimed
+  (Codex empirically observed `full_sync cleared N prior rule(s)` on this exact path). Operator
+  decision (Dave, mid-review): accept this as a deliberate **hard cutover**, not a migration — no
+  preserve-and-re-arm mechanism was built. `docs/user-manual/upgrading.md` and
+  `docs/user-manual/guaranteed-state.md` rewritten to state the true disarm behaviour and its
+  pre-upgrade detection query honestly, and `apply_rules()`'s full_sync sweep now logs the
+  disarm-in-progress explicitly (`Guardian: full_sync is disarming N rule(s)...`) rather than
+  silently. Two further non-blocking findings from the same review also fixed: `guardian_routes.cpp`'s
+  `note_platform_matrix_stale` used the weaker `log_safe()` helper (control-bytes-only) on a
+  `k=v`-shaped line, missing the same same-line field-forgery threat this whole issue exists to
+  close — switched to `audit_token()` (folds space/`=`/`,` too); and `guardian_engine.cpp`'s "failed
+  spark validation" diagnostic printed `rule.spark().type()` (and, via `assertion.error()`, three
+  more operator-authored fields from `guardian_spark_bridge.hpp`'s own error strings) raw — now
+  wrapped at the sink with one `log_key_token()` call covering all four producers.
 - Owner: fixed ahead of PR-5 by the author of the #4665 fix series, not deferred to the PR-5 (F14
   flip) author as this entry originally assumed.
 - Milestone: #4665 itself - fix landed on `feat/4665-log-injection-neutralisation`; merge to `dev`

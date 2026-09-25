@@ -676,6 +676,49 @@ TEST_CASE("GuardianEngine: a push where every rule_id is valid is unaffected by 
     CHECK(f.engine->policy_generation() == 3);
 }
 
+TEST_CASE("GuardianEngine: a full_sync push correctly disarms a pre-#4665 legacy rule "
+          "the server excludes for a non-conforming rule_id (hard cutover, not preserved)",
+          "[guardian][engine][apply][validation][full_sync]") {
+    // Governance-external-review finding (fjarvis, PR #4979): apply_rules()'s own
+    // pre-validation now rejects any push CONTAINING a non-conforming rule_id, and
+    // guardian_push_builder.cpp's server-side filter (#4665) excludes such a row
+    // from every push it builds -- so the only way this state exists in a real
+    // fleet is a row that predates #4665 entirely, already-armed, now silently
+    // ABSENT from every push. Seeded directly into KV here (the only way to reach
+    // it, since apply_rules() can no longer be used to create it) to prove the
+    // full_sync/exclusion interaction actually disarms it cleanly -- Dave's
+    // explicit call: this is a hard cutover, not a migration, so "cleanly disarmed"
+    // is the CORRECT outcome to pin, not a bug to route around.
+    GuardianFixture f;
+    nlohmann::json legacy;
+    legacy["rule_id"] = "bad id";
+    legacy["name"] = "bad id";
+    legacy["yaml_source"] = "name: bad id\n";
+    legacy["version"] = 1;
+    legacy["enabled"] = true;
+    legacy["enforcement_mode"] = "enforce";
+    legacy["spark"] = nlohmann::json::object();
+    legacy["assertion"] = nlohmann::json::object();
+    legacy["remediation"] = nlohmann::json::object();
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "rule:bad id", legacy.dump()));
+    REQUIRE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:bad id"));
+
+    // The push the agent actually receives in production: fully valid, simply
+    // omitting the excluded legacy rule_id -- exactly what
+    // guardian_push_builder.cpp's filter produces.
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(2);
+    *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+    auto applied = f.engine->apply_rules(p);
+    REQUIRE(applied.has_value());
+
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:bad id"));
+    CHECK(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-1"));
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->policy_generation() == 2);
+}
+
 TEST_CASE("GuardianEngine: a rejected push does not latch the ack ledger against a "
           "later valid push",
           "[guardian][engine][apply][validation]") {

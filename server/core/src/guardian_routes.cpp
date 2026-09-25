@@ -429,17 +429,21 @@ void note_platform_matrix_stale(yuzu::MetricsRegistry* metrics, std::string_view
             .increment();
     const std::uint64_t n = g_matrix_stale_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n % kMatrixStaleLogSample == 1)
-        // log_safe (web_utils.hpp): agent_id/rule_id are operator/agent-controlled with
-        // no charset restriction (the same fact that motivated PairStatusKey above) —
-        // interpolating them raw would let a crafted id forge a fake multi-line log
-        // entry (e.g. an embedded '\n'). Neutralise control bytes before they reach the
-        // format string, same as every other log/audit site in this codebase that
-        // touches untrusted identifiers.
+        // #4665 governance-external-review finding (fjarvis, PR #4979): this line is
+        // "agent={} rule={} spark_type={}" -- a k=v k=v shape, so the threat here is
+        // not just a forged extra PHYSICAL line (log_safe's control-byte-only fold
+        // closes that much) but a forged ADJACENT FIELD on this same line via a
+        // space or '=' in an operator/agent-controlled value (e.g. a crafted
+        // rule_id like "x result=success"). audit_token (web_utils.hpp, forwards to
+        // yuzu::log_token) folds space/'='/',' too -- the correct neutraliser for a
+        // k=v-shaped line, not log_safe, which this site used before this fix and
+        // which the #4665 tripwire's own allowlist of "log_safe(" as safe made
+        // invisible to the regression net. Do not revert to log_safe here.
         spdlog::info("guardian: platform support-matrix stale vs. agent-observed reality — "
                      "agent={} rule={} spark_type={} (metric_label={}) already reports real "
                      "status; suppressed a synthetic not-implemented double-count (occurrence {})",
-                     log_safe(std::string(agent_id)), log_safe(std::string(rule_id)),
-                     spark_type.empty() ? "<empty>" : log_safe(std::string(spark_type)),
+                     audit_token(agent_id), audit_token(rule_id),
+                     spark_type.empty() ? "<empty>" : audit_token(spark_type),
                      label, n);
 }
 

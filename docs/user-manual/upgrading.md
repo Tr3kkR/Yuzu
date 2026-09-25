@@ -2800,29 +2800,29 @@ following the documented contract are unaffected. This only changes behaviour fo
 relying on the previously-permissive accept-anything-non-empty behaviour to create a `rule_id`
 outside `[A-Za-z0-9._-]+` or longer than 256 bytes.
 
-**What to do:** enforcement at the server is create-only — an existing rule whose `rule_id`
-predates this release and doesn't conform to the charset is never torn down, and the prior
-enforcement it already established survives on the agent unchanged. The server-side push builder
-now **excludes** a non-conforming legacy row from every push it builds (logged at `error` with a
-sampled rate limit as `Guardian push: rule ... has a rule_id that fails the .../256-byte charset
-check (#4665) — excluding it from this push`, and counted in
-`yuzu_guardian_push_rule_excluded_total{reason="invalid_rule_id"}`), the same way an
-over-depth `spec_json` is already excluded — so a single non-conforming legacy rule no longer
-blocks delivery of every OTHER rule to agents in its scope. The practical effect is narrower than
-earlier releases of this note stated: only the non-conforming rule itself stops receiving updates
-(it is frozen at its last-applied state on the agent); everything else in scope keeps updating
-normally. The separately-documented agent-side behaviour — `GuardianEngine::apply_rules()`
-rejecting an entire incoming push if any one rule in it fails validation — still exists as
-defense-in-depth and still matters for any push NOT built by `build_agent_push` (there is none in
-this release, but the invariant is agent-side, not push-builder-side, so don't rely on the server
-filter alone if you're driving pushes through a different path).
+**What to do — this is a hard cutover, not a migration, by deliberate decision:** enforcement at
+the server is create-only, so an existing rule whose `rule_id` predates this release and doesn't
+conform to the charset is never torn down *by the creation check itself*. But the server-side push
+builder now **excludes** any such row from every push it builds (logged at `error` with a sampled
+rate limit as `Guardian push: rule ... has a rule_id that fails the .../256-byte charset check
+(#4665) — excluding it from this push`, and counted in
+`yuzu_guardian_push_rule_excluded_total{reason="invalid_rule_id"}`), the same way an over-depth
+`spec_json` is already excluded — and the agent's `full_sync` path unconditionally tears down and
+rebuilds its ENTIRE active rule set from whatever the push actually contains. Put together: **the
+first `full_sync` an upgraded agent receives permanently disarms every rule with a non-conforming
+`rule_id`** (logged at `warn` on the agent as `Guardian: full_sync is disarming N rule(s) with a
+rule_id outside the [A-Za-z0-9._-]+/256-byte charset (#4665) — hard cutover, not preserved`). This
+is not silent — both the exclusion (server-side) and the disarm (agent-side) are logged and
+metered — but it IS a real, one-time loss of a previously-enforcing control if you don't act first.
+Every OTHER rule in scope is unaffected either way — this only ever touches rows that were already
+unenforceable by the documented contract.
 
-**Finding a non-conforming legacy `rule_id` before you upgrade:** `GET
+**Finding a non-conforming legacy `rule_id` — do this BEFORE upgrading, not after:** `GET
 /api/v1/guaranteed-state/rules` returns every rule regardless of its `rule_id`'s shape; filter the
 response for any `rule_id` that doesn't match `^[A-Za-z0-9._-]{1,256}$` — that's the same predicate
-the server now enforces at creation. Removing it is optional post-upgrade (the exclusion above
-means it no longer blocks anything else), but you'll want to know it's there if you're relying on
-that rule's own enforcement.
+the server now enforces at creation. For each one you find, either delete it (see below) and
+recreate it under a conforming `rule_id`, or accept the loss consciously — there is no third option
+that preserves it under its existing id.
 
 **Removing a non-conforming `rule_id`:** the two delete surfaces have DIFFERENT restrictions, not
 a simple REST-restricted/MCP-unrestricted split. REST `DELETE

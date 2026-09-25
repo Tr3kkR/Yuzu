@@ -109,17 +109,26 @@ the wrap happens INSIDE the formatter:
     be flagged, so a future direct call shaped like
     `spdlog::info("... for rule '{}'", format_arm_committed_line(rule_id, ...))`
     stays correctly unflagged too.
-  - log_safe() (server/core/src/web_utils.hpp) -- PRE-DATES this sweep (#2542
-    PR-7), independent of log_id_token/log_key_token, and folds control bytes
-    (0x00-0x1F, 0x7F) to '?' with truncation -- an adequate CWE-117 mitigation
-    (no raw CR/LF can survive it) used at guardian_routes.cpp's rate-limited
-    "platform support-matrix stale" log line, which #4665 correctly left
-    untouched (a different, older call convention, not a regression this sweep
-    missed). It is WEAKER than log_token in one respect worth a future
-    harmonisation look, not a #4665 gap: it does not fold space or '=', so on a
-    space-delimited `k=v k=v` line (which this call site is) a crafted id could
-    still forge an adjacent field, though it cannot forge a NEW physical log
-    line.
+  - log_safe() (server/core/src/web_utils.hpp) is DELIBERATELY NOT in
+    SAFE_FORMATTER_CALLS, and this is a correction, not the original design: an
+    earlier revision of this file allowlisted it as an "adequate CWE-117
+    mitigation" for guardian_routes.cpp's rate-limited "platform support-matrix
+    stale" k=v-shaped log line (#4665 governance-external-review finding,
+    fjarvis, PR #4979). That reasoning was WRONG -- log_safe() folds only
+    control bytes (0x00-0x1F, 0x7F), not space/'='/',', so on a `k=v k=v` line
+    a crafted value could still forge an ADJACENT field (e.g. a rule_id like
+    "x result=success"), the exact same-line CWE-117 threat this whole sweep
+    exists to close, just missed because log_safe's own call sites were
+    blanket-exempted rather than checked for line shape. That call site now
+    uses audit_token (web_utils.hpp, forwards to yuzu::log_token, folds
+    space/'='/',' too) instead. log_safe() remains a real, still-used helper
+    OUTSIDE this file family (instruction_routes.cpp, approval_routes.cpp) for
+    genuinely non-k=v-shaped single-value lines, where control-byte folding
+    alone is sufficient -- this scanner has no opinion on those, since its
+    scan scope never reaches them. A FUTURE log_safe(...) call appearing
+    inside a file this scanner DOES cover is deliberately left unexempted, so
+    it gets flagged and a reviewer has to consciously verify the line shape
+    rather than inherit a blanket pass.
 
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml,
 same precedent shape as test_no_connless_pq_escape.py and
@@ -145,19 +154,31 @@ SPDLOG_CALL_RE = re.compile(r"\bspdlog::(?:trace|debug|info|warn|error|critical)
 
 # Recognised wrappers that fully neutralise a rule-id/Spark-key-shaped argument.
 # Checked as a substring WITHIN the specific argument's own text slot -- see the
-# module docstring's WHY POSITION-AWARE paragraph.
+# module docstring's WHY POSITION-AWARE paragraph. audit_token (web_utils.hpp)
+# forwards to yuzu::log_token verbatim -- the same control-byte/DEL/space/'='/
+# ',' fold log_id_token itself builds on -- so it closes the same-line k=v
+# field-forgery threat just as completely for a server-side log line
+# (guardian_routes.cpp's platform-matrix-stale site, #4665
+# governance-external-review fix, fjarvis PR #4979). log_id_token additionally
+# ASCII-folds and length-truncates on top of that same core, for a different
+# concern (non-ASCII confusables / unbounded identifier length) this
+# particular site doesn't need.
 WRAP_CALLS = (
     "log_id_token(",
     "log_key_token(",
+    "audit_token(",
 )
 
 # Named list of "known safe formatter" functions -- see the module docstring's
 # SAFE FORMATTERS paragraph. Extend this list deliberately, not by accretion:
 # a new entry needs the same "read the implementation, confirm it wraps before
-# returning" justification these two got.
+# returning" justification this one got. log_safe() is deliberately NOT here
+# (see the docstring's log_safe paragraph) -- it folds only control bytes, not
+# space/'='/',', so it is not a safe substitute for a k=v-shaped log line, and
+# blanket-exempting it once already hid a real forgery gap (#4665
+# governance-external-review, fjarvis, PR #4979).
 SAFE_FORMATTER_CALLS = (
     "format_arm_committed_line(",
-    "log_safe(",
 )
 
 ALL_SAFE_CALLS = WRAP_CALLS + SAFE_FORMATTER_CALLS
@@ -318,6 +339,16 @@ SENSITIVE_PATTERNS = [
     # -- guardian_engine.cpp.
     Pattern("path={}", "path={}"),
     Pattern("service={}", "service={}"),
+    # guardian_engine.cpp's "failed spark validation (...)" reconcile_rule_locked
+    # diagnostic -- the parenthetical carries assertion.error(), whose content can
+    # originate from FOUR different producer sites (rule.spark().type() here;
+    # guardian_spark_bridge.hpp's "unrecognized {spark,file,service,registry}
+    # {assertion} type: <value>" error strings), all operator-authored free text
+    # with no charset validation before this point. #4665 governance-external-review
+    # finding (fjarvis, PR #4979) -- found because the second placeholder's literal
+    # text ("failed spark validation (") matched no existing pattern, so it carried
+    # no sensitivity signal at all, not because a wrap was present and wrong.
+    Pattern("failed spark validation (", "failed spark validation ("),
     # guard_registry.cpp's registry assertion VALUES -- operator-authored
     # `cfg_.expected` (a REG_SZ/REG_EXPAND_SZ value has no charset/format
     # constraint anywhere on its ingest path -- verified against
@@ -883,13 +914,24 @@ def _selfcheck() -> None:
     )
     if flagged(synthetic_shape):
         raise SystemExit("selfcheck: format_arm_committed_line exemption did not hold under a sensitive literal")
-    # log_safe(...) -- the second recognised safe formatter.
+    # log_safe(...) is NO LONGER exempt (#4665 governance-external-review
+    # correction, fjarvis PR #4979) -- this k=v-shaped line, log_safe-wrapped,
+    # must be FLAGGED, proving the scanner would now catch a regression back
+    # to the weaker helper on a line shape it can't safely cover.
     log_safe_shape = (
         'spdlog::info("guardian: platform support-matrix stale — agent={} rule={} spark_type={}", '
         'log_safe(std::string(agent_id)), log_safe(std::string(rule_id)), log_safe(std::string(spark_type)));'
     )
-    if flagged(log_safe_shape):
-        raise SystemExit("selfcheck: log_safe exemption did not hold")
+    if not flagged(log_safe_shape):
+        raise SystemExit("selfcheck: expected log_safe on a k=v line to be flagged, found none")
+    # The REAL current shape at that call site uses audit_token instead -- must
+    # stay unflagged.
+    audit_token_shape = (
+        'spdlog::info("guardian: platform support-matrix stale — agent={} rule={} spark_type={}", '
+        'audit_token(agent_id), audit_token(rule_id), audit_token(spark_type));'
+    )
+    if flagged(audit_token_shape):
+        raise SystemExit("selfcheck: audit_token exemption did not hold")
 
     # 7. The KNOWN, ACCEPTED GAP: a bare "{}" printing a local variable built
     # from a wrapped concatenation three lines above (guardian_engine.cpp's

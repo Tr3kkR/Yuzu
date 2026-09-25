@@ -1436,8 +1436,36 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         } else {
             std::vector<std::string> rule_keys;
             rule_keys.reserve(rule_key_rows->size());
-            for (auto& row : *rule_key_rows)
+            // #4665 governance-external-review finding (fjarvis, PR #4979): a rule_id
+            // that predates #4665's create-time charset/length enforcement can still
+            // sit in KV, and guardian_push_builder.cpp's server-side filter now
+            // excludes such a row from EVERY push it builds -- so it can never again
+            // appear in push.rules() to be re-persisted below. This IS a hard cutover,
+            // by deliberate operator decision (not a migration): the row is cleared
+            // here like any other, and its guard is torn down two blocks below like
+            // every other guard, with no attempt to preserve or re-arm it. Counted
+            // and logged SEPARATELY, at WARN, specifically because it is real,
+            // irreversible loss of a previously-enforcing control, not routine
+            // teardown-and-rebuild noise -- docs/user-manual/upgrading.md's pre-upgrade
+            // detection query exists precisely so an operator finds and fixes these
+            // BEFORE hitting this line for real. See that doc for the operational
+            // contract; do not reintroduce a "frozen"/preserved code path here.
+            std::size_t non_conforming = 0;
+            for (auto& row : *rule_key_rows) {
+                const std::string_view key_view = row.key;
+                const std::string_view rid = key_view.size() > kRulePrefix.size()
+                                                  ? key_view.substr(kRulePrefix.size())
+                                                  : std::string_view{};
+                if (!is_valid_rule_id(rid))
+                    ++non_conforming;
                 rule_keys.push_back(std::move(row.key));
+            }
+            if (non_conforming > 0)
+                spdlog::warn("Guardian: full_sync is disarming {} rule(s) with a rule_id "
+                             "outside the [A-Za-z0-9._-]+/256-byte charset (#4665) -- "
+                             "hard cutover, not preserved; see docs/user-manual/"
+                             "upgrading.md for the pre-upgrade detection query",
+                             non_conforming);
             if (!rule_keys.empty()) {
                 const int cleared = kv_->del_keys(kKvNamespace, rule_keys);
                 if (static_cast<std::size_t>(cleared) == rule_keys.size()) {
@@ -2350,11 +2378,22 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         // withdrawal here means an operator sees a rule stop being enforced
         // (e.g. on the next restart re-arm pass) with nothing in the log to
         // explain why (sre Gate 6 finding, this PR).
+        // #4665 governance-external-review finding (fjarvis, PR #4979): assertion.error()
+        // and the spec-derivation fallback string below can BOTH embed operator-authored
+        // free text raw (rule.spark().type() here; rule_assertion_from_rule's own
+        // "unrecognized {spark,file,service,registry} {assertion} type: <atype>" error
+        // strings in guardian_spark_bridge.hpp embed rule.spark().type()/the assertion's
+        // own type() the same way) -- all four producer sites feed this ONE consumer, so
+        // wrapping the WHOLE resulting message here, at the sink, covers every current AND
+        // future producer in one place rather than chasing each one individually (exactly
+        // the whack-a-mole this same function's rule_id handling already needed one prior
+        // fix round for).
         spdlog::warn("Guardian: rule '{}' failed spark validation ({}) - withdrawing from "
                      "both detection paths",
                      log_id_token(rule.rule_id()),
-                     !assertion ? assertion.error() : "spec derivation failed for spark type '" +
-                                                           rule.spark().type() + "'");
+                     log_key_token(!assertion ? assertion.error()
+                                              : "spec derivation failed for spark type '" +
+                                                    rule.spark().type() + "'"));
         if (spark_runtime_)
             spark_runtime_->detach_rule(rule.rule_id());
         withdraw_legacy_guard_locked(rule.rule_id());
