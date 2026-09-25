@@ -440,6 +440,36 @@ does not, and an un-enrolled break-glass account is hard-denied at login
 (enrolment is never offered on that path, since that would defeat the second
 factor).
 
+To enrol the break-glass account, restart the server with `--auth-mode=standard`
+and sign in as that account. This re-enables local-password login for every local
+account, so keep the window short: on bare metal consider `--web-address
+127.0.0.1`; in a container, restrict the published port instead (the image binds
+0.0.0.0). The break-glass lockout exemption does not apply in standard mode, so
+failed password attempts can lock the account for `--auth-lockout-window-secs`.
+Only with the listener restricted as above, consider `--auth-lockout-threshold=0`
+for the window (it disables throttling for every local account); otherwise an SSO
+admin, if the IdP is up, can clear a lock with `POST /api/v1/users/{name}/unlock`.
+Under
+`--mfa-enforcement=required` the sign-in itself enrols MFA; otherwise enrol at
+Settings → Multi-Factor Authentication, which needs the admin role. For a
+non-admin break-glass account, also pass `--mfa-enforcement=required` for that
+restart, and note that it applies to every user for the window: un-enrolled local
+users are enrolled at login, and SSO users whose IdP sends no `amr` cannot pass
+step-up. Then restore `--auth-mode=sso-only` and your usual `--mfa-enforcement`.
+If the arm has lapsed by then and you still need break-glass access (the IdP is
+still down), re-run `--break-glass-arm`; do not re-arm for a planned rotation.
+The mode switch itself writes no audit row, so record the window in a change
+ticket; the evidence is the startup WARN that `--break-glass-user` is ignored under
+standard mode, the missing sso-only boot banner, the
+`auth.login` and `mfa.enroll.verified` rows inside the window, and the banner
+returning on the final restart.
+
+To rotate the break-glass TOTP, clear it first with `--mfa-reset <user>` (an
+enrolled account gets a challenge at sign-in, not enrolment, and cannot re-enrol
+from Settings), then follow the enrolment sequence above. Do not restart under
+sso-only between the reset and the re-enrolment: boot refuses until the account
+is enrolled again.
+
 ## Locked out by MFA enforcement misconfiguration
 
 `--mfa-enforcement=required` (or `admin-only`) with no enrolled accounts locks
