@@ -4778,6 +4778,84 @@ TEST_CASE("MCP Guardian: create_guardian_rule denies a service-scoped token "
     CHECK(ts.audit_log.back() == "mcp.create_guardian_rule|denied");
 }
 
+TEST_CASE("MCP Guardian: create_guardian_rule rejects a charset-invalid rule_id (#4665)",
+          "[pg][mcp][integration][guardian][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+
+    int id = 210;
+    for (const std::string& bad_id :
+         {std::string("has space"), std::string("has=eq"), std::string("has\nnewline"),
+          std::string("has\xC3\xA9" "byte")}) {
+        INFO("bad_id = " << bad_id);
+        nlohmann::json req{
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", id++},
+            {"params",
+             {{"name", "create_guardian_rule"},
+              {"arguments", {{"rule_id", bad_id}, {"name", "n"}, {"yaml_source", "x"}}}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("[A-Za-z0-9._-]+") !=
+              std::string::npos);
+        CHECK(ts.audit_log.back() == "guaranteed_state.rule.create|denied");
+    }
+}
+
+TEST_CASE("MCP Guardian: create_guardian_rule rule_id at the 256-byte boundary (#4665)",
+          "[pg][mcp][integration][guardian][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+
+    const std::string id256(256, 'a');
+    nlohmann::json ok_req{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 220},
+        {"params",
+         {{"name", "create_guardian_rule"},
+          {"arguments", {{"rule_id", id256}, {"name", "n256"}, {"yaml_source", "x"}}}}}};
+    auto ok_res = ts.call(ok_req.dump());
+    REQUIRE(ok_res);
+    CHECK(ok_res->status == 200);
+    auto ok_body = nlohmann::json::parse(ok_res->body);
+    REQUIRE(ok_body.contains("result"));
+    auto ok_data =
+        nlohmann::json::parse(ok_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(ok_data["created"] == true);
+    CHECK(ok_data["rule_id"] == id256);
+    CHECK(ts.audit_log.back() == "guaranteed_state.rule.create|success");
+
+    const std::string id257(257, 'a');
+    nlohmann::json bad_req{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 221},
+        {"params",
+         {{"name", "create_guardian_rule"},
+          {"arguments", {{"rule_id", id257}, {"name", "n257"}, {"yaml_source", "x"}}}}}};
+    auto bad_res = ts.call(bad_req.dump());
+    REQUIRE(bad_res);
+    CHECK(bad_res->status == 200);
+    auto bad_body = nlohmann::json::parse(bad_res->body);
+    REQUIRE(bad_body.contains("error"));
+    CHECK(bad_body["error"]["code"] == kInvalidParams);
+    CHECK(ts.audit_log.back() == "guaranteed_state.rule.create|denied");
+}
+
 TEST_CASE("MCP Guardian: get_guardian_rule on an unknown rule_id errors, not a store degrade",
           "[pg][mcp][integration][guardian]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);

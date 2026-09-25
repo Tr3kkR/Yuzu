@@ -2631,6 +2631,30 @@ test('no conn-less libpq escape references',
   timeout: 30,
 )
 
+# #4665 lockstep: the #4606-pinned format_arm_committed_line shape
+# (tests/unit/fixtures/spark/arm_committed_line.json) still parses through the #3990
+# driver's own T2_RE, and the driver's evidence regexes still refuse a forged rule-id/Spark-key
+# free-text injection. Also runs in .github/workflows/docs-lint.yml on every PR.
+test('spark evidence format lockstep (#4665)',
+  _python3_test,
+  args: [files('test_spark_evidence_format_lockstep.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
+# subsystem (agents/core/src + server/core/src + common/include, filtered to the
+# guardian_*/guard_*/spark_*/guaranteed_state* basename glob) that fails the moment
+# a NEW spdlog:: call prints a rule-id/Spark-key-shaped argument unwrapped -- see the
+# script's own module docstring for the full design (why position-aware, file scope,
+# known limitations). Also runs in .github/workflows/docs-lint.yml on every PR.
+test('guardian/spark log-injection tripwire (#4665)',
+  _python3_test,
+  args: [files('test_guardian_spark_log_injection_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Runner-local CI telemetry contract: v2->v3 migration preserves history,
 # GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
 # flake recoveries land in the persistent per-runner test-runs.db.

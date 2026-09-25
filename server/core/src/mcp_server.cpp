@@ -85,6 +85,7 @@
 #include "plugin_config_store.hpp"
 #include "plugin_config_parsers.hpp"
 #include "upload_grant_parsers.hpp"
+#include <yuzu/log_token.hpp> // is_valid_rule_id — shared REST/MCP/agent rule id charset (#4665)
 #include <yuzu/server/auth_db.hpp> // B4: is_valid_username (unlock_account, mirrors the REST route)
 
 // B5 (api-parity #2146) — offload-target / platform-license / software-
@@ -1270,7 +1271,7 @@ static const ToolDef kTools[] = {
      "twin applies an MFA step-up check; MCP applies none for a cookie-session caller "
      "(architecture-wide gap, not specific to this tool - tracked in #4309).",
      R"j({"type":"object","properties":{)j"
-     R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"description":"Unique Guard identifier"},)j"
+     R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"pattern":"^[A-Za-z0-9._-]+$","description":"Unique Guard identifier"},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique human-authored Guard name"},)j"
      R"j("version":{"type":"integer","minimum":1,"default":1},)j"
      R"j("enabled":{"type":"boolean","default":true},)j"
@@ -13726,11 +13727,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     row.yaml_source = param_str(args, "yaml_source");
                 }
 
-                if (row.rule_id.empty() || row.name.empty() ||
+                if (!is_valid_rule_id(row.rule_id) || row.name.empty() ||
                     (!spec.structured && row.yaml_source.empty())) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.create", "denied",
+                        "GuaranteedState", row.rule_id,
+                        "invalid rule_id, missing name, or missing yaml_source");
+                    // retry-hint-exempt: validation failure, not a store fault.
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "rule_id and name are required, plus either a "
+                                       "rule_id must be non-empty, match [A-Za-z0-9._-]+, and "
+                                       "be at most 256 bytes; name is required, plus either a "
                                        "structured spark+assertion or a yaml_source"),
                         "application/json");
                     return;

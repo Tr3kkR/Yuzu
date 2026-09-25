@@ -93,6 +93,8 @@
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 
+#include "web_utils.hpp" // audit_token — CWE-117 neutralisation for a hostile target_id (#4665)
+
 #include <exception>
 #include <string>
 #include <type_traits>
@@ -136,11 +138,11 @@ template <class AuditFn>
         return audit_fn(req, action, result, target_type, target_id, detail);
     } catch (const std::exception& e) {
         spdlog::warn("audit_fn threw on behavioural-data route action={} target={}: {}", action,
-                     target_id, e.what());
+                     audit_token(target_id), e.what());
     } catch (...) {
         spdlog::warn("audit_fn threw (non-std exception) on behavioural-data route action={} "
                      "target={}",
-                     action, target_id);
+                     action, audit_token(target_id));
     }
     return false;
 }
@@ -172,11 +174,11 @@ try_persist_audit_for_principal(const PrincipalAuditFn& audit_fn, const httplib:
     try {
         return audit_fn(req, action, result, principal, target_type, target_id, detail);
     } catch (const std::exception& e) {
-        spdlog::warn("principal audit_fn threw action={} target={}: {}", action, target_id,
-                     e.what());
+        spdlog::warn("principal audit_fn threw action={} target={}: {}", action,
+                     audit_token(target_id), e.what());
     } catch (...) {
         spdlog::warn("principal audit_fn threw (non-std exception) action={} target={}", action,
-                     target_id);
+                     audit_token(target_id));
     }
     return false;
 }

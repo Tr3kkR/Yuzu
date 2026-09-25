@@ -542,17 +542,224 @@ TEST_CASE("GuardianEngine: delta merge keeps prior rules and updates overlap",
     CHECK(raw->find("\"name\":\"first-renamed\"") != std::string::npos);
 }
 
-TEST_CASE("GuardianEngine: rules with empty rule_id are skipped, not persisted",
+// ── #4665: an invalid rule_id anywhere in a push rejects the WHOLE push ────
+//
+// Pre-#4665, a push containing one rule with an empty (or otherwise invalid)
+// rule_id among otherwise-valid rules would skip just that one rule and
+// still apply/arm the rest - and, on a full_sync push, still advance
+// policy_generation_ to the pushed value even though the skipped rule's
+// prior enforcement (torn down by full_sync's own teardown) was never
+// re-armed. That silently drops a rule's enforcement while reporting the
+// agent as caught-up on the generation. The fix pre-validates every rule_id
+// BEFORE any teardown/mutation and rejects the whole push on the first
+// invalid one - these tests assert no rule mutation and no generation
+// advance happen on rejection, for both full_sync and incremental pushes.
+
+TEST_CASE("GuardianEngine: a push with an empty rule_id is rejected whole, not skipped",
           "[guardian][engine][apply][validation]") {
     GuardianFixture f;
     gpb::GuaranteedStatePush p;
     p.set_full_sync(true);
+    p.set_policy_generation(5);
     *p.add_rules() = GuardianFixture::make_rule("", "no-id");
     *p.add_rules() = GuardianFixture::make_rule("r-keep", "valid");
     auto applied = f.engine->apply_rules(p);
-    REQUIRE(applied.has_value());
-    CHECK(*applied == 1);
+    CHECK_FALSE(applied.has_value());
+    // Nothing was persisted - not even the otherwise-valid "r-keep" rule -
+    // and the generation did not advance off its fresh-KV default of 0.
+    CHECK(f.engine->rule_count() == 0);
+    CHECK(f.engine->policy_generation() == 0);
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-keep"));
+}
+
+TEST_CASE("GuardianEngine: a push with a charset-violating rule_id is rejected whole",
+          "[guardian][engine][apply][validation]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_rule("bad id\nwith control bytes", "bad");
+    *p.add_rules() = GuardianFixture::make_rule("r-keep", "valid");
+    auto applied = f.engine->apply_rules(p);
+    CHECK_FALSE(applied.has_value());
+    CHECK(f.engine->rule_count() == 0);
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-keep"));
+}
+
+TEST_CASE("GuardianEngine: a push with an over-length rule_id is rejected whole",
+          "[guardian][engine][apply][validation]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_rule(std::string(257, 'a'), "too-long");
+    *p.add_rules() = GuardianFixture::make_rule("r-keep", "valid");
+    auto applied = f.engine->apply_rules(p);
+    CHECK_FALSE(applied.has_value());
+    CHECK(f.engine->rule_count() == 0);
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-keep"));
+}
+
+TEST_CASE("GuardianEngine: a full_sync push with a mixed valid/invalid rule_id set "
+          "does not tear down the prior rule set",
+          "[guardian][engine][apply][validation][full_sync]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(1);
+        *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    REQUIRE(f.engine->rule_count() == 1);
+    REQUIRE(f.engine->policy_generation() == 1);
+
+    // A later full_sync push at a HIGHER generation, with a genuinely new
+    // valid rule alongside one with a bad id - if this silently tore down
+    // r-1 (full_sync's own teardown, ~line 1091 at the time this test was
+    // written) before validating, r-1 would be gone even though the whole
+    // push is rejected.
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(2);
+        *p.add_rules() = GuardianFixture::make_rule("r-2", "second");
+        *p.add_rules() = GuardianFixture::make_rule("", "bad");
+        auto applied = f.engine->apply_rules(p);
+        CHECK_FALSE(applied.has_value());
+    }
+
+    // r-1 survives, unarmed generation 2 rule never landed, generation held at 1.
     CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->policy_generation() == 1);
+    CHECK(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-1"));
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-2"));
+}
+
+TEST_CASE("GuardianEngine: an incremental push with a mixed valid/invalid rule_id set "
+          "leaves the prior rule set untouched",
+          "[guardian][engine][apply][validation]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(1);
+        *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(false);
+        p.set_policy_generation(2);
+        *p.add_rules() = GuardianFixture::make_rule("r-2", "second");
+        *p.add_rules() = GuardianFixture::make_rule("bad id", "bad");
+        auto applied = f.engine->apply_rules(p);
+        CHECK_FALSE(applied.has_value());
+    }
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->policy_generation() == 1);
+    CHECK(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-1"));
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-2"));
+}
+
+TEST_CASE("GuardianEngine: a push where every rule_id is valid is unaffected by the "
+          "#4665 pre-validation pass",
+          "[guardian][engine][apply][validation]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(3);
+    *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+    *p.add_rules() = GuardianFixture::make_rule("r-2", "second");
+    auto applied = f.engine->apply_rules(p);
+    REQUIRE(applied.has_value());
+    CHECK(*applied == 2);
+    CHECK(f.engine->rule_count() == 2);
+    CHECK(f.engine->policy_generation() == 3);
+}
+
+TEST_CASE("GuardianEngine: a full_sync push clears a pre-#4665 legacy rule's PERSISTED "
+          "state when the server excludes it for a non-conforming rule_id (hard cutover, "
+          "not preserved)",
+          "[guardian][engine][apply][validation][full_sync]") {
+    // Governance-external-review finding (fjarvis, PR #4979): apply_rules()'s own
+    // pre-validation now rejects any push CONTAINING a non-conforming rule_id, and
+    // guardian_push_builder.cpp's server-side filter (#4665) excludes such a row
+    // from every push it builds -- so the only way this state exists in a real
+    // fleet is a row that predates #4665 entirely, now silently ABSENT from every
+    // push. Seeded directly into KV here (the only way to reach it, since
+    // apply_rules() can no longer be used to create it) to prove the
+    // full_sync/exclusion interaction actually clears its persisted state cleanly
+    // -- Dave's explicit call: this is a hard cutover, not a migration, so
+    // "cleanly cleared" is the CORRECT outcome to pin, not a bug to route around.
+    //
+    // What this pins vs. what it doesn't (Gate-8 re-verification finding, LOW,
+    // 2026-09-25): it proves the KV row is genuinely deleted -- the crux of the
+    // hard-cutover behaviour, and what apply_rules() itself controls. It does NOT
+    // prove a previously-RUNNING legacy guard gets torn down, because this
+    // codebase's own Windows-only-for-MVP legacy backends (make_registry_rule's
+    // and make_file_hash_rule's own doc comments, above) mean armed_guard_count()
+    // cannot observe a real arm on this test's Linux CI host regardless of what
+    // this fix touches -- that teardown path (stop_all_guards_locked(), already
+    // unconditional and unchanged by this fix) is proven separately by this
+    // file's other full_sync TEST_CASEs, not re-proven here.
+    GuardianFixture f;
+    nlohmann::json legacy;
+    legacy["rule_id"] = "bad id";
+    legacy["name"] = "bad id";
+    legacy["yaml_source"] = "name: bad id\n";
+    legacy["version"] = 1;
+    legacy["enabled"] = true;
+    legacy["enforcement_mode"] = "enforce";
+    legacy["spark"] = nlohmann::json::object();
+    legacy["assertion"] = nlohmann::json::object();
+    legacy["remediation"] = nlohmann::json::object();
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "rule:bad id", legacy.dump()));
+    REQUIRE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:bad id"));
+
+    // The push the agent actually receives in production: fully valid, simply
+    // omitting the excluded legacy rule_id -- exactly what
+    // guardian_push_builder.cpp's filter produces.
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(2);
+    *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+    auto applied = f.engine->apply_rules(p);
+    REQUIRE(applied.has_value());
+
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:bad id"));
+    CHECK(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-1"));
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->policy_generation() == 2);
+}
+
+TEST_CASE("GuardianEngine: a rejected push does not latch the ack ledger against a "
+          "later valid push",
+          "[guardian][engine][apply][validation]") {
+    // The #4665 pre-validation pass deliberately does NOT call
+    // ack_ledger_->latch_failure() on rejection (it runs before
+    // begin_application(), so there is no current application to latch a
+    // failure against). This proves that choice leaves nothing "stuck" -
+    // a rejected push followed by a genuinely valid push at a higher
+    // generation must apply and advance normally.
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(1);
+        *p.add_rules() = GuardianFixture::make_rule("", "bad");
+        CHECK_FALSE(f.engine->apply_rules(p).has_value());
+    }
+    CHECK(f.engine->policy_generation() == 0);
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(2);
+        *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+        auto applied = f.engine->apply_rules(p);
+        REQUIRE(applied.has_value());
+        CHECK(*applied == 1);
+    }
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->policy_generation() == 2);
 }
 
 TEST_CASE("GuardianEngine: dispatch routes push_rules through SerializeAsString",
