@@ -226,12 +226,19 @@ TEST_CASE("is_rbac_administrator: null RbacStore -> kUnavailable regardless of "
     CHECK(gate == RbacAdminGate::kUnavailable);
 }
 
-// (cpp-safety re-review, PR #4985 fix round: rbac_enforcement_label() itself
-// was previously exercised only indirectly through is_rbac_administrator's
-// other tests, and only for the kDegraded arm above — this directly asserts
-// all 4 input classes against the classifier by name, so it stays correct
-// independent of its one current consumer.)
-TEST_CASE("rbac_enforcement_label: direct coverage of all 4 branches",
+// (cpp-safety re-review, PR #4985 fix round, corrected by a security-guardian
+// follow-up pass: rbac_enforcement_label() itself was previously exercised
+// only indirectly through is_rbac_administrator's other tests. This test
+// directly asserts 3 of its 4 input classes (null store, fresh+disabled,
+// genuinely enabled) against the classifier by name. The 4th class — a
+// degraded/stale-view store — needs the expensive starved-pool setup the
+// "is_rbac_administrator: RBAC-on branch reached via a DEGRADED..." TEST_CASE
+// above already builds; rather than duplicate that setup, this test relies
+// on that TEST_CASE's own direct `rbac_enforcement_label(&replica_b) ==
+// RbacEnforcementLabel::kDegraded` assertion for the 4th class. Together the
+// two TEST_CASEs give the classifier direct coverage of all 4 branches.)
+TEST_CASE("rbac_enforcement_label: direct coverage of the null/disabled/"
+          "enabled branches (see the DEGRADED test above for the 4th)",
           "[pg][rbac_admin_predicate]") {
     CHECK(rbac_enforcement_label(nullptr) == RbacEnforcementLabel::kDegraded);
 
