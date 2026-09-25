@@ -3,10 +3,9 @@
 ## equivalents -- read-only, one row per app per category.
 ## Plugin: privacy_permissions | Actions: permissions
 ##
-## Gated behind the SAME Forensics securable execution_artifacts uses, Administrator-only
-## (Forensics:Read + AdminOrApproval). The higher RiskTier is operator-triage metadata, not a
-## wider authorization gap -- see this plugin's README
-## (agents/plugins/privacy_permissions/README.md). See
+## Gated behind the SAME Forensics securable execution_artifacts uses (Forensics:Read +
+## AdminOrApproval: Administrator by default) and SINGLE-TARGET -- exactly one device per
+## dispatch. See this plugin's README (agents/plugins/privacy_permissions/README.md) and
 ## server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp.
 ##
 ## DEFAULT-OFF: gated behind the server-side plugin-config kill switch
@@ -15,9 +14,9 @@
 ## action will dispatch.
 ##
 ## macOS: the system TCC.db plus every /Users home's per-user TCC.db (camera and microphone
-## grants live per-user) -- all TCC-protected, so an agent without Full Disk Access reads
-## `denied`. Windows: each real profile's CapabilityAccessManager\ConsentStore (live HKU hive
-## or offline NTUSER.DAT mount) plus the HKLM mirror. Linux: xdg-desktop-portal's
+## grants normally live per-user) -- all TCC-protected, so an agent without Full Disk Access
+## reads `denied`. Windows: each real profile's CapabilityAccessManager\ConsentStore (live HKU
+## hive or offline NTUSER.DAT mount) plus the HKLM mirror. Linux: xdg-desktop-portal's
 ## PermissionStore over the AGENT'S OWN session bus only -- rows are that one session's grants,
 ## never machine-wide; `unsupported`/UNAVAILABLE (no session, no daemon) is the expected outcome
 ## for a system-service agent and says nothing about interactive users' grants.
@@ -37,11 +36,14 @@ metadata:
     |last_used_start|last_used_stop` rows. `category` is a fixed cross-OS vocabulary: camera,
     microphone, location, full_disk_access. `state`: allowed, denied, prompt_undetermined
     (mechanism-native, not yet a clear yes/no), absent (no record -- not a failure),
-    unreadable (the read failed) or unsupported (no mechanism on this OS/host). A refused read
-    (a TCC.db denial, registry access denied, a portal AccessDenied error) is always a `denied`
-    row whose `raw` names the refusal, never collapsed into `absent`. Every category gets a
-    row, or is covered by a whole-source row (category "-"). The two `last_used_*` fields are
-    Windows-only (epoch-milliseconds; "-" elsewhere).
+    unreadable (the read failed) or unsupported (no mechanism on this OS/host). A refused key or
+    value read (a TCC.db denial, registry access denied, a portal AccessDenied error) is a
+    `denied` row whose `raw` names the refusal, never collapsed into `absent`. Every category
+    gets a row, or is covered by a whole-source row (category "-"). The two `last_used_*` fields
+    are Windows-only (epoch-milliseconds; "-" elsewhere). Reads one machine per request and is
+    off until enabled: Windows is measured on one non-MDM host, macOS reads `denied` until the
+    agent has Full Disk Access, and Linux reports only the agent's own session, normally
+    `unavailable` under the shipped service.
   tags: [privacy_permissions, security, posture, privacy, forensics]
 
 spec:
@@ -96,7 +98,8 @@ spec:
           The fixed cross-OS permission category. "-" only on a whole-source row -- one row
           standing for every category of a source that could not be read at all (a TCC.db, a
           Windows profile hive, ConsentStore root or ProfileList discovery, the session
-          bus/portal, or what a Windows run left unwalked once its retention budget was spent),
+          bus/portal, or what a Windows or macOS run left unread once a budget or time limit
+          was spent),
           or that holds no file (a macOS user with no per-user TCC.db).
         values: [camera, microphone, location, full_disk_access, "-"]
         example: camera
@@ -107,10 +110,13 @@ spec:
           allowed/denied: a real, decoded grant. `denied` also covers a READ that was refused --
           one state for both, told apart by `raw`: a decoded refusal carries the native value
           (Deny, 0, no, NONE,<timestamp>), a refused read a `<subject>:<cause>` token (and
-          category "-" when the whole source was refused). prompt_undetermined: the mechanism reported a value this plugin doesn't
-          map to allowed/denied (never guessed). absent: no record for this app+category (or
-          this source) -- not a failure. unreadable: the read itself failed; `raw` names why.
-          unsupported: no mechanism reaches this category on this OS/host (macOS location; Linux
+          category "-" when the whole source was refused). prompt_undetermined: the mechanism
+          reported a value this plugin does not map to allowed/denied (never guessed) -- a
+          mapped Prompt/ask/macOS auth_value 1 and an unmapped value alike; `raw` keeps the true
+          value. absent: no record for this app+category (or this source) -- not a failure; a
+          Windows NonPackaged app row also reads `absent`, WITH its last-used times: the app stores
+          no decision of its own and its state follows the NonPackaged toggle row. unreadable:
+          the read itself failed; `raw` names why. unsupported: no mechanism reaches this category on this OS/host (macOS location; Linux
           full_disk_access; Linux with no session bus or portal daemon).
         values: [allowed, denied, prompt_undetermined, absent, unreadable, unsupported]
         example: allowed
@@ -118,10 +124,11 @@ spec:
       - name: raw
         type: string
         description: >
-          The mechanism-native value behind `state` (a TCC auth_value integer, a ConsentStore
-          Value string, a joined portal permission list); on a failure row (`denied` from a
-          refused read, or `unreadable`) the failure token that also appears in the result
-          provenance; "-" when nothing meaningful beyond the state itself.
+          The mechanism-native value behind `state` (a TCC auth_value integer: 0 denied, 2 and 3
+          allowed, anything else prompt_undetermined; a ConsentStore Value string; a joined
+          portal permission list); on a failure row (`denied` from a refused read, or
+          `unreadable`) the failure token that also appears in the agent-log provenance, with `\`
+          written `/`; "-" when nothing meaningful beyond the state itself.
         example: "2"
         platforms: [windows, linux, darwin]
       - name: last_used_start
@@ -135,9 +142,10 @@ spec:
       - name: last_used_stop
         type: string
         description: >
-          Windows ConsentStore LastUsedTimeStop, epoch milliseconds; "-" when never set or on
-          any other OS; `unreadable` when the value exists but is not an 8-byte REG_QWORD or
-          could not be read (a `...:last_used_stop_<cause>` token names it).
+          Windows ConsentStore LastUsedTimeStop, epoch milliseconds; "-" when never set (a stored
+          0 also reads "-": conventionally in use now, unmeasured) or on any other OS;
+          `unreadable` when the value exists but is not an 8-byte REG_QWORD or could not be read
+          (a `...:last_used_stop_<cause>` token names it).
         example: "1700000100000"
         platforms: [windows]
 
