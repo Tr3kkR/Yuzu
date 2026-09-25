@@ -54,6 +54,7 @@
 #include <nlohmann/json.hpp>
 
 #include <httplib.h>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <string>
@@ -126,6 +127,14 @@ struct RbacRoleHarness {
 
     std::vector<AuditRecord> audit_log;
 
+    // Live registry (not nullptr) — governance follow-up (full-pipeline
+    // round on 765bc7ec1, item 3): the last-admin-guard-refused metric's
+    // increment sites were previously guarded-but-unexercised (the branch
+    // logic that decides WHETHER to fire was already proven by the existing
+    // last-admin-refusal tests; only the metric call itself was untested).
+    // Mirrors test_mcp_server.cpp's `ts.metrics_for_test = &reg` idiom.
+    yuzu::MetricsRegistry metrics;
+
     RestApiV1 api;
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn mcp_handler;
@@ -189,7 +198,7 @@ struct RbacRoleHarness {
                             /*device_token_store=*/nullptr,
                             /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr,
-                            /*metrics_registry=*/nullptr,
+                            /*metrics_registry=*/&metrics,
                             /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr,
@@ -245,7 +254,7 @@ struct RbacRoleHarness {
             /*network_api=*/{},
             /*response_scope_fn=*/{},
             /*software_inventory_store=*/nullptr,
-            /*metrics=*/nullptr,
+            /*metrics=*/&metrics,
             /*quarantine_store=*/nullptr,
             /*tag_push_fn=*/{},
             /*agent_registry=*/nullptr,
@@ -608,6 +617,14 @@ TEST_CASE("REST unassign: removing the fleet's last remaining Administrator "
     REQUIRE(res);
     CHECK(res->status == 409);
     CHECK(h.rbac->get_principal_roles("user", "soleadmin").size() == 1);
+    // Governance follow-up (item 3): the metric fires exactly once, under
+    // the "rest" transport label.
+    CHECK(h.metrics.counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                            {{"transport", "rest"}})
+             .value() == 1);
+    CHECK(h.metrics.counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                            {{"transport", "mcp"}})
+             .value() == 0);
 }
 
 // ── REST: C1 — last-admin guard counts AUTHENTICATABLE admins, not bare
@@ -797,6 +814,14 @@ TEST_CASE("MCP unassign_rbac_role: last-Administrator refusal is a JSON-RPC "
     REQUIRE(res);
     CHECK(res->body.find("\"error\"") != std::string::npos);
     CHECK(h.rbac->get_principal_roles("user", "soleadmin").size() == 1);
+    // Governance follow-up (item 3): the metric fires exactly once, under
+    // the "mcp" transport label.
+    CHECK(h.metrics.counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                            {{"transport", "mcp"}})
+             .value() == 1);
+    CHECK(h.metrics.counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                            {{"transport", "rest"}})
+             .value() == 0);
 }
 
 // ── MCP: C1 — last-admin guard counts AUTHENTICATABLE admins, not bare

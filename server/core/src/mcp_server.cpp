@@ -2581,7 +2581,7 @@ static const ToolDef kTools[] = {
      R"j("role":{"type":"string","enum":["Administrator","PlatformEngineer","Operator","ApiTokenManager","Viewer","Reviewer"],"description":"One of the 6 fleet-wide-assignable built-in roles — see discover_permissions for the full role/securable catalog, including non-assignable roles like ITServiceOwner"})j"
      R"j(},"required":["principal_type","principal_id","role"]})j",
      R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_type":{"const":"user"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
-     R"j("target_provisioned":{"type":"string","enum":["true","false","unknown"],"description":"\"true\" iff principal_id already has an auth.users row at assignment time; \"false\" means genuinely no such row; \"unknown\" means the AuthDB read degraded and this could not be determined (never conflated with \"false\")"},)j"
+     R"j("target_provisioned":{"type":"string","enum":["true","false","unknown"],"description":"\"true\" iff principal_id has a currently-active auth.users row at assignment time; \"false\" means it does not — either no account ever existed at this username, or the account is currently deactivated (not distinguished); \"unknown\" means the AuthDB read degraded and this could not be determined (never conflated with \"false\")"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
      R"j(},"required":["assigned","principal_type","principal_id","role","target_provisioned"]})j"},
 
@@ -21943,7 +21943,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     const std::string reason =
                         role_name == "ITServiceOwner"
                             ? "ITServiceOwner: requires group-scoped confinement, not "
-                              "supported fleet-wide (delivery plan §2)"
+                              "supported fleet-wide"
                             : role_name + ": not one of the 6 fleet-wide-assignable roles";
                     (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
                                    reason);

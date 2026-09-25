@@ -2500,8 +2500,8 @@ and why this is a separate surface from `POST /api/v1/rbac/check`'s
 **durable** Administrator role held by the caller, re-read fresh from the
 store (never the session's cached role or a JIT `POST /api/v1/elevate`
 elevation) — **instead of**, not in addition to, an ordinary RBAC-securable
-permission check. A service-scoped API token and an engine session are both
-structurally denied before any store read.
+permission check — plus MFA step-up. A service-scoped API token and an engine
+session are both structurally denied before any store read.
 
 **Request body:**
 
@@ -2530,11 +2530,14 @@ structurally denied before any store read.
 ```
 
 `target_provisioned` is a **three-state string** (`"true"` / `"false"` /
-`"unknown"`), never a bare boolean: `"true"` means `principal_id` already had
-an `auth.users` row at assignment time, `"false"` means it genuinely did not
-(a pre-provisioned grant), and `"unknown"` means the `AuthDB` read itself
-degraded and could not confirm either way — the third state exists
-specifically so a degraded read is never misreported as a genuine absence.
+`"unknown"`), never a bare boolean: `"true"` means `principal_id` has an
+`auth.users` row that is currently **active** (can authenticate right now),
+`"false"` means it does not — either a genuine pre-provisioned grant (no
+account has ever existed at this username) or a grant landing on a
+currently-deactivated account; the two are not distinguished by this field
+— and `"unknown"` means the `AuthDB` read itself degraded and could not
+confirm either way — the third state exists specifically so a degraded read
+is never misreported as "no active account."
 
 **Errors:** `400` — invalid/missing JSON body, missing `principal_id`,
 `principal_type` other than `"user"`, a malformed `principal_id`, or `{name}`
@@ -2542,11 +2545,12 @@ is not one of the 6 assignable roles (`ITServiceOwner` and a genuinely
 unknown/custom role name return the identical client-facing message — no
 role-catalog oracle; the specific reason is audited server-side only; use
 `POST /api/v1/management-groups/{id}/roles` for `ITServiceOwner` instead);
-`403` — the caller does not hold a durable Administrator role, or is a
-service-scoped/engine session; `503` — the RBAC or `AuthDB` store is
-unavailable, or (on an otherwise-successful assignment) its audit row could
-not persist — treat the grant as unconfirmed and reconcile via a read.
-Audited `rbac.role.assigned` — see `docs/user-manual/audit-log.md`.
+`401` — MFA step-up not satisfied; `403` — the caller does not hold a durable
+Administrator role, or is a service-scoped/engine session; `503` — the RBAC
+or `AuthDB` store is unavailable, or (on an otherwise-successful assignment)
+its audit row could not persist — treat the grant as unconfirmed and
+reconcile via a read. Audited `rbac.role.assigned` — see
+`docs/user-manual/audit-log.md`.
 
 ---
 
@@ -2556,7 +2560,7 @@ Revoke a fleet-wide RBAC role grant from a human user. Idempotent —
 unassigning a role the principal did not hold still returns success.
 
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
-above.
+above, plus MFA step-up.
 
 **Response:**
 
@@ -2564,9 +2568,10 @@ above.
 { "data": { "unassigned": true }, "meta": { "api_version": "v1" } }
 ```
 
-**Errors:** `403` — the caller does not hold a durable Administrator role, is
-a service-scoped/engine session, or (`{name}=="Administrator"` only) is
-attempting to remove their **own** Administrator assignment (self-lockout
+**Errors:** `401` — MFA step-up not satisfied; `403` — the caller does not
+hold a durable Administrator role, is a service-scoped/engine session, or
+(`{name}=="Administrator"` only) is attempting to remove their **own**
+Administrator assignment (self-lockout
 guard — a caller can never revoke their own standing Administrator authority
 through this route, even to hand it to someone else first); `409` —
 (`{name}=="Administrator"` only) removing this grant would leave the fleet

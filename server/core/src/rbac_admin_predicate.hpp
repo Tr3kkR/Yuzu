@@ -175,6 +175,20 @@ enum class RbacAdminGate {
 /// could not check" from that single bit. Returns `"unknown"` for a null
 /// `auth_db` too (nothing to ask). Shared by both transports so the
 /// three-state rule can't drift between them.
+///
+/// `"false"` is deliberately NOT further split into "never existed" vs.
+/// "exists but deactivated" (governance full-pipeline follow-up round):
+/// `AuthDB::get_user`'s query is `WHERE username = $1 AND is_active = TRUE`
+/// (auth_db.cpp), so `AuthDBError::UserNotFound` fires for BOTH — a
+/// currently-non-authenticatable username reads identically either way,
+/// which is the exact fact this field exists to report (can whoever holds
+/// this username log in right now). Distinguishing the two is a genuine,
+/// separate, MORE suspicious-for-an-auditor case (a grant lands on a
+/// username with account-lifecycle history) but answering it would need a
+/// SECOND, unscoped query against `auth.users` outside `get_user`'s
+/// deliberately-active-only contract (every other caller of `get_user`
+/// legitimately wants only a live account) — out of scope for this field;
+/// track it separately if it becomes a real requirement.
 [[nodiscard]] inline std::string_view target_provisioned_state(AuthDB* auth_db,
                                                                 const std::string& principal_id) {
     if (!auth_db)
@@ -184,7 +198,11 @@ enum class RbacAdminGate {
         return "true";
     if (is_store_unavailable(user.error()))
         return "unknown";
-    return "false"; // UserNotFound / InvalidUsername / etc — genuine absence
+    // UserNotFound / InvalidUsername / etc — no currently-active account at
+    // this username (never existed OR exists-but-deactivated; see the
+    // function doc comment above for why those two are not distinguished
+    // here).
+    return "false";
 }
 
 } // namespace yuzu::server
