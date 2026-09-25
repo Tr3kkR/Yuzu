@@ -254,7 +254,7 @@ too (`mcp.stream.attach` / `mcp.stream.close`, the latter carrying the close rea
 ---
 
 
-[^1398]: Except the ~42 `plugin.action` pairs a compiled `ExecuteGate` marks
+[^1398]: Except the ~50 `plugin.action` pairs a compiled `ExecuteGate` marks
 `AdminOrApproval`/`AlwaysApproval` (#1398, `command_capability.hpp`) — e.g.
 `script_exec.exec`, `filesystem.delete`, `registry.set_value`. Those are denied
 at the shared dispatch chokepoint regardless of MCP tier, admin-role-holding
@@ -1441,7 +1441,7 @@ carrying a `correlation_id`, `retry_after_ms: null`, and a `remediation` hint.
 approval-gated operation when the server has no `ApprovalManager` and therefore
 cannot mint a pollable ticket (a stripped deploy); normally an approval-gated
 operation returns `-32006` (below), not `-32004`. (Most `operator`-tier executions
-are auto-approved and do not hit this path — the ~42 pairs a compiled gate marks
+are auto-approved and do not hit this path — the ~50 pairs a compiled gate marks
 approval-required[^1398] don't hit it either, since that denial happens at the
 dispatch chokepoint, not the MCP-level approval workflow this section describes.)
 
