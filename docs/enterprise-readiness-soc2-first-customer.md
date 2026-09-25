@@ -136,6 +136,27 @@ retired here. Full design: `docs/adr/1006-service-scope-default-deny.md`;
 closed route inventory:
 `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 
+**Addendum — `POST /api/v1/result-sets/from-inventory-query` service-scope
+gap closed (CC6.1/CC6.3, #4980, 2026-09-25).** The addendum above's closed
+route inventory (row 25) reported this route's service-scope gap as closed
+on 2026-08-18 alongside its CWE-862 fix. That was incorrect: row 25's fix
+gated the route on `Inventory:Read` via the ADR-0017 `fleet_read_fn`
+admit-then-filter chokepoint, not the §3a `require_permission` flip —
+`fleet_read_fn`'s service-scope branch admits-and-confines a service-scoped
+caller rather than denying it outright, so the cross-service-reach class
+the flip exists to close persisted on this one route for five weeks. #4980
+closed it with a dedicated `deny_fleet_wide_service_scoped` call, matching
+the route's 8 non-dispatch siblings. **For any assessment covering the
+period 2026-08-18 through #4980's merge, treat this one route as NOT
+covered by the flip's confinement guarantee above** — a service-scoped
+token holding `Inventory:Read` could, during that window, mint a result
+set that its minting principal's other tokens/session could then read
+back (owner-scoping keys on the minting principal's identity, not the
+token's own service tag). No other route in the closed inventory is
+affected; this is a single-route correction, not a reopening of the
+flip's broader closure. Correction also recorded in the route inventory
+doc itself.
+
 **Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
 principals (ADR-1005 class) are already least-privilege by construction —
 default-deny RBAC resolution, structurally barred from admin/built-in/

@@ -50,6 +50,17 @@ Rows 13–25 were not in the plan's original enumeration — found by the
 residual sweep of `rest_api_v1.cpp` (all 74 `auth_fn` call sites) and
 `mcp_server.cpp` (3 call sites) the plan itself flagged as outstanding.
 
+**Correction (#4980, 2026-09-25):** row 25's "closes both the CWE-862 gap
+and the service-scope gap in one call, since `perm_fn` routes through the
+§3a-flipped `require_permission`" claim was wrong. The route was actually
+gated on `Inventory:Read` via `fleet_read_fn` (the ADR-0017 admit-then-filter
+chokepoint), never `perm_fn`/`require_permission` — `fleet_read_fn`'s own
+service-scope branch admits-and-confines a service-scoped caller rather than
+denying it, which is a different posture from the §3a flip's hard 403. The
+CWE-862 half of this row's fix was real and complete; the service-scope half
+was not — that gap persisted for five weeks after this row was written and
+is what #4980 closed with a dedicated `deny_fleet_wide_service_scoped` call.
+
 ## MCP (`mcp_server.cpp`) — sweep result: 0 findings
 
 All 3 `auth_fn`-resolving call sites are self-scoped (the JSON-RPC
