@@ -1478,7 +1478,12 @@ RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
     // Mirrors rbac_enforcement_in_effect()'s branch order and short-circuiting
     // exactly (see that function's comments for the rationale on each step) —
     // this is the SAME derivation, just split into three outcomes instead of
-    // two.
+    // two. (cpp-safety re-review, PR #4985 fix round: `noexcept` here is
+    // honest only to the same degree as that sibling function's own
+    // pre-existing `noexcept` — none of is_open()/is_rbac_enabled()/
+    // rbac_enabled_view_degraded() is itself individually noexcept, so this
+    // rests on none of them actually throwing in practice, exactly like the
+    // unchanged sibling. Not a new risk this function introduces.)
     if (!store || !store->is_open())
         return RbacEnforcementLabel::kDegraded;
     if (store->is_rbac_enabled())
@@ -2056,7 +2061,7 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // the count against the first's now-durable delete. The LOCK set
         // and the COUNT set below both go through the identical JOIN, so
         // the lock always covers exactly the rows the count depends on.
-        // Doomgoose external review, PR #4985 (governance ledger a2-p3-doomgoose-1):
+        // Doomgoose external review, PR #4985 (governance ledger a2-p7-doomgoose-1):
         // the lock query's own result set is the ONLY correct membership test
         // for "was the row being deleted itself one of the counted rows" — a
         // ghost/deactivated Administrator grant that never appears here (it
@@ -2067,6 +2072,16 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // was itself one of them" rather than "the count is now 0" alone —
         // the two are NOT equivalent when the count was already 0 going in
         // (e.g. the only Administrator row left is a ghost/deactivated one).
+        // (cpp-safety re-review, PR #4985 fix round: this reasoning assumes
+        // `auth.users.is_active` is stable between the lock SELECT above and
+        // the DELETE below — `auth.users` is deliberately left unlocked by
+        // this guard, out of scope per the "never lock auth.users rows here"
+        // note further up. The only scenario this narrowing newly permits is
+        // a principal reactivated inside that same sub-millisecond window
+        // who is also the fleet's sole Administrator grant — but the fleet
+        // was already at zero COUNTED admins at lock time in that scenario,
+        // and A2 has a documented bootstrap-from-zero path, so this is not a
+        // new exposure.)
         std::unordered_set<std::string> locked_admin_principal_ids;
         if (role_name == "Administrator") {
             pg::PgResult lock_rows = pg::exec_params(

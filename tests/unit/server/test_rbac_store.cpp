@@ -160,10 +160,21 @@ void seed_active_user(yuzu::test::AuthDbPg& auth_db, const std::string& username
 /// here actually work. `own_pid` excludes the lock HOLDER's own backend so
 /// it's never mistaken for the waiter. Bounded: up to `max_attempts` x 50ms
 /// (5s by default) before giving up and returning 0.
+// (cpp-safety re-review, PR #4985 fix round: `PQntuples(r.get()) == 1` is a
+// strict-equality match — a SECOND concurrent lock-waiter on a shared/loaded
+// CI Postgres at the same moment (this box runs 4 runner agents as one OS
+// identity, #1871) makes every iteration return 0 or 2+ rows and spin to the
+// full timeout. Same shape as the blind-sleep code this replaced, not a new
+// defect — flagged since it's the kind of shared-runner collision
+// unit-test-conventions.md already tracks for fixed identifiers, and a
+// row-count predicate is the same class of thing.)
 int poll_for_blocked_backend_pid(const std::string& dsn, int own_pid, int max_attempts = 100) {
     pg::PgConn probe{PQconnectdb(dsn.c_str())};
-    if (PQstatus(probe.get()) != CONNECTION_OK)
+    if (PQstatus(probe.get()) != CONNECTION_OK) {
+        UNSCOPED_INFO("poll_for_blocked_backend_pid: probe connection failed, distinct from "
+                      "'no lock wait observed within the bound'");
         return 0;
+    }
     for (int i = 0; i < max_attempts; ++i) {
         pg::PgResult r = pg::exec_params(probe.get(),
                                          "SELECT pid FROM pg_stat_activity WHERE datname = "

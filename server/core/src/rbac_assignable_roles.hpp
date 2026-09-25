@@ -72,10 +72,16 @@ inline constexpr std::string_view kRbacAssignableRoles[] = {
 /// copy. `role_name_for_audit` is embedded in the generic branch's message
 /// VERBATIM — this function does NOT neutralize it itself, by design, so it
 /// can never silently double-neutralize a caller's own choice or silently
-/// skip one: REST passes an already-`audit_token`-neutralized value (its
-/// established CRLF/control-byte-safety convention, `web_utils.hpp`); MCP
-/// passes the raw value (its `role` input is schema-enum-constrained before
-/// this is ever reached, so nothing unsafe can reach it).
+/// skip one: EVERY caller passes an already-`audit_token`-neutralized value
+/// (REST's established CRLF/control-byte-safety convention, `web_utils.hpp`).
+/// MCP's `role` input is ALSO schema-enum-constrained before this is ever
+/// reached (security-guardian re-review, PR #4985 fix round: verified
+/// reachable only via the `supervised` tier, which runs the schema
+/// validator — every other tier is denied earlier, including an empty
+/// `mcp_tier` via the dedicated `#4309` guard) — but that reachability
+/// proof lives in a DIFFERENT file (`mcp_server.cpp`) and guard, so MCP
+/// wraps too rather than leaving this function's safety silently dependent
+/// on a guard elsewhere staying exactly as-is.
 [[nodiscard]] inline std::string rbac_role_rejection_reason(std::string_view role_name,
                                                              std::string_view role_name_for_audit) {
     if (role_name == "ITServiceOwner")

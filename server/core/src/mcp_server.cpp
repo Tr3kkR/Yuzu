@@ -22075,7 +22075,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // ITServiceOwner named exclusion (delivery plan §2) AND a
                 // genuinely unknown/custom role name, uniformly.
                 if (!is_rbac_assignable_role(role_name)) {
-                    const std::string reason = rbac_role_rejection_reason(role_name, role_name);
+                    const std::string reason =
+                        rbac_role_rejection_reason(role_name, audit_token(role_name));
                     (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
                                    reason);
                     res.set_content(error_response(id, kInvalidParams, kUniformReject),

@@ -226,6 +226,24 @@ TEST_CASE("is_rbac_administrator: null RbacStore -> kUnavailable regardless of "
     CHECK(gate == RbacAdminGate::kUnavailable);
 }
 
+// (cpp-safety re-review, PR #4985 fix round: rbac_enforcement_label() itself
+// was previously exercised only indirectly through is_rbac_administrator's
+// other tests, and only for the kDegraded arm above — this directly asserts
+// all 4 input classes against the classifier by name, so it stays correct
+// independent of its one current consumer.)
+TEST_CASE("rbac_enforcement_label: direct coverage of all 4 branches",
+          "[pg][rbac_admin_predicate]") {
+    CHECK(rbac_enforcement_label(nullptr) == RbacEnforcementLabel::kDegraded);
+
+    PredicateHarness h;
+    REQUIRE_FALSE(h.rbac->is_rbac_enabled()); // fresh install default: disabled
+    CHECK(rbac_enforcement_label(h.rbac.get()) == RbacEnforcementLabel::kDisabled);
+
+    h.rbac->set_rbac_enabled(true);
+    CHECK(rbac_enforcement_label(h.rbac.get()) == RbacEnforcementLabel::kEnabled);
+    h.rbac->set_rbac_enabled(false);
+}
+
 // ── Structural exclusions (checked before any I/O) ──────────────────────────
 
 TEST_CASE("is_rbac_administrator: an engine-classed session is denied even if "
