@@ -1009,6 +1009,13 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"peripherals.thunderbolt", "List Thunderbolt/USB4 controllers and attached devices"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
+        // runtimes
+        {"runtimes.dotnet",
+         "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "
+         "install path (Linux only; standard roots only, directory walk, no subprocess)"},
+        {"runtimes.jvm",
+         "List installed JVMs by image type, version, home and vendor from each home's "
+         "release file (Linux only; standard roots only, no subprocess)"},
         // storage
         {"storage.set", "Store a key-value pair in persistent storage"},
         {"storage.get", "Retrieve a value by key from persistent storage"},

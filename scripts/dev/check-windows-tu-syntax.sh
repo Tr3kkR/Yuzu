@@ -58,6 +58,8 @@ tus=(
     agents/plugins/peripherals/src/peripherals_win.cpp
     agents/plugins/tar/src/tar_removable_collector.cpp
     agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp
+    agents/plugins/runtimes/src/runtimes_win.cpp
+    agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
     agents/plugins/app_control/src/app_control_plugin.cpp
