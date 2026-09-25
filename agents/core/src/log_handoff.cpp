@@ -501,8 +501,21 @@ std::shared_ptr<spdlog::logger> LogHandoff::install() {
 }
 
 LogHandoff::~LogHandoff() {
-    if (!torn_down_.load(std::memory_order_acquire))
-        teardown();
+    // Unconditional (Gate 8 re-review, cpp-safety finding, governance hardening
+    // round): a prior guard here -- `if (!torn_down_.load()) teardown();` -- meant
+    // that when torn_down_ was ALREADY true (set by a concurrent explicit teardown()
+    // call on another thread whose teardown_body() had not yet finished), the
+    // destructor skipped calling teardown() entirely, so it never reached
+    // wait_for_teardown_completion() and went straight to destroying pool_/logger_/
+    // wrapped_sinks_/etc while the winner's teardown_body() could still be reading or
+    // writing those same members -- a genuine use-after-free/data race, and exactly
+    // the class of bug this whole hardening round's UP-2 fix (below) exists to close.
+    // teardown() itself is cheap and correct to call unconditionally: if torn_down_
+    // was already true because THIS SAME THREAD called teardown() explicitly earlier
+    // (the ordinary, single-threaded lifecycle), the exchange finds it already true
+    // and wait_for_teardown_completion() returns immediately (teardown_done_ is
+    // already set by that same earlier call) -- no self-deadlock, negligible cost.
+    teardown();
 }
 
 void LogHandoff::teardown_body() {
@@ -627,20 +640,32 @@ void LogHandoff::teardown_with_action_for_test(std::chrono::milliseconds grace,
         return;
     }
 
-    // T0 -- see teardown()'s own comment on why this is inside no try/catch here:
-    // this is a TEST-ONLY entry point (unlike teardown(), not noexcept/fail-closed),
-    // so an exception from T0 propagates normally and fails the calling Catch2
-    // TEST_CASE, which is the correct, already-documented behavior for this method.
-    clear_global_drain_handle(this);
-    close_drain_admission();
+    // T0, then the guard, then teardown_body() -- ALL now inside one try (Gate 8
+    // re-review, security-guardian finding, governance hardening round): an earlier
+    // version of this method left these uncovered, on the reasoning that "an
+    // exception here should fail the calling Catch2 TEST_CASE, not the whole test
+    // binary" -- true, but incomplete. ShutdownDeadlineGuard::~ShutdownDeadlineGuard()
+    // unconditionally calls cancel() on ANY unwind through its scope (RAII,
+    // shutdown_deadline_guard.hpp), which suppresses the watchdog action before it
+    // fires if it hasn't already -- and mark_teardown_complete() (previously the
+    // next statement after teardown_body()) would never run, leaving a concurrent
+    // LOSER thread blocked in wait_for_teardown_completion() on the SAME object with
+    // nothing watching it at all -- the exact unwatched-wait class this whole
+    // hardening round exists to close, reintroduced on this test-only path. The
+    // catch below preserves the documented "exception fails the TEST_CASE, not the
+    // whole binary" contract (it rethrows, never hard_exit()s) while ALSO waking any
+    // loser before doing so.
+    try {
+        clear_global_drain_handle(this);
+        close_drain_admission();
 
-    ShutdownDeadlineGuard<std::function<void()>> guard{grace, std::move(action)};
-    wait_for_drain_quiescence(); // see teardown()'s own comment on this call
-    teardown_body(); // let any exception propagate normally -- this is a TEST-ONLY
-                      // entry point; unlike teardown() (noexcept, fail-closed to
-                      // hard_exit) an exception here should fail the calling Catch2
-                      // TEST_CASE, not the whole test binary (see the header's own
-                      // comment on this method).
+        ShutdownDeadlineGuard<std::function<void()>> guard{grace, std::move(action)};
+        wait_for_drain_quiescence(); // see teardown()'s own comment on this call
+        teardown_body();
+    } catch (...) {
+        mark_teardown_complete();
+        throw;
+    }
     mark_teardown_complete();
 }
 

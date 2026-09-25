@@ -392,6 +392,13 @@ TEST_CASE("U5: teardown() on a wedged sink fires the deadline action within grac
           "without the action itself unblocking the join",
           "[log_handoff]") {
     Harness h; // initially paused
+    // GATE DISCIPLINE (file banner) -- added (Gate 8 re-review, quality-engineer,
+    // governance hardening round: this gap predates this commit but is cheap to
+    // close while already in this file). Without this, a failure of the very first
+    // REQUIRE below (before teardown_thread even exists) would unwind with the sink
+    // still paused, and ~LogHandoff()'s fail-closed teardown() would block the full
+    // (unscaled) kLogTeardownGrace and then hard_exit() the WHOLE test binary.
+    yuzu::test::ScopeExit release_on_exit{[&] { h.sink->release(); }};
     auto logger = h.handoff->logger();
     logger->info("park");
     REQUIRE(yuzu::test::spin_until([&] { return h.handoff->in_write(); }));
@@ -454,6 +461,18 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
           "thread inherits an unwatched blocking join",
           "[log_handoff]") {
     Harness h; // initially paused
+    // GATE DISCIPLINE (file banner) -- restored (Gate 8 re-review finding,
+    // quality-engineer, governance hardening round): the unconditional-cleanup fix
+    // below only covers the two threads spawned further down; the FIRST assertion
+    // (in_write(), right below) runs BEFORE either thread exists, so if IT fails --
+    // exactly the kind of regression it exists to catch -- `h` would otherwise unwind
+    // with the sink still paused, and ~LogHandoff()'s fail-closed teardown() would
+    // block the full (unscaled) kLogTeardownGrace and then hard_exit() the WHOLE test
+    // binary -- the identical whole-binary-death class this commit's BLOCKING fix
+    // was written to eliminate, reopened on a different trigger by dropping this
+    // guard. release() is safely idempotent (BLOCKER round-2 already relies on that,
+    // keeping both this guard and an explicit release() call).
+    yuzu::test::ScopeExit release_on_exit{[&] { h.sink->release(); }};
 
     h.handoff->logger()->info("park");
     REQUIRE(yuzu::test::spin_until([&] { return h.handoff->in_write(); }));

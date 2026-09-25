@@ -373,8 +373,15 @@ struct DrainHandle;
 /// mutex+condvar+bool distinct from torn_down_) for the WINNER's teardown_body() to
 /// actually finish before returning -- bounded by the winner's own watchdog, since a
 /// wedge there either lets teardown_body() finish normally (which wakes the loser) or
-/// hard_exit()s the whole process (which ends the loser's wait too, by ending
-/// everything). So two threads calling teardown() (or one calling it while another
+/// fires the watchdog action (production teardown(): hard_exit()s the whole process,
+/// which ends the loser's wait too, by ending everything; the test-only
+/// teardown_with_action_for_test(): the winner's try/catch calls
+/// mark_teardown_complete() before rethrowing on ANY escaping exception -- including
+/// one from T0 or a genuinely-thrown teardown_body() -- specifically because
+/// ShutdownDeadlineGuard::~ShutdownDeadlineGuard() unconditionally cancels on unwind,
+/// so without that catch a loser blocked on the SAME object would hang with nothing
+/// watching it; Gate 8 re-review finding, governance hardening round). So two threads
+/// calling teardown() (or one calling it while another
 /// drops the last `unique_ptr<LogHandoff>`, triggering the destructor) no longer race
 /// each other for use-after-free purposes: the loser's `teardown()` call does not
 /// return until the object's live state is genuinely quiescent. Separately, they are NOT synchronized against a
