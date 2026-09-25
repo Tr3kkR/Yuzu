@@ -2581,7 +2581,7 @@ static const ToolDef kTools[] = {
      R"j("role":{"type":"string","enum":["Administrator","PlatformEngineer","Operator","ApiTokenManager","Viewer","Reviewer"],"description":"One of the 6 fleet-wide-assignable built-in roles — see discover_permissions for the full role/securable catalog, including non-assignable roles like ITServiceOwner"})j"
      R"j(},"required":["principal_type","principal_id","role"]})j",
      R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_type":{"const":"user"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
-     R"j("target_provisioned":{"type":"boolean","description":"True iff principal_id already has an auth.users row at assignment time"},)j"
+     R"j("target_provisioned":{"type":"string","enum":["true","false","unknown"],"description":"\"true\" iff principal_id already has an auth.users row at assignment time; \"false\" means genuinely no such row; \"unknown\" means the AuthDB read degraded and this could not be determined (never conflated with \"false\")"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
      R"j(},"required":["assigned","principal_type","principal_id","role","target_provisioned"]})j"},
 
@@ -21894,27 +21894,39 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Governance BLOCKING #2 (audit-log-injection, CWE-117):
+                // every audit call below uses `audit_target_id`, never raw
+                // `principal_id`, as its target_id — matches this file's
+                // established `audit_token`/`log_token` convention
+                // (web_utils.hpp).
+                const std::string audit_target_id = audit_token(principal_id);
+                // Strict username charset — validated BEFORE the
+                // principal_type check below and BEFORE any other audit
+                // call (governance BLOCKING #2's "ordering bug") — matches
+                // the REST route's own reasoning (nothing accepted here is
+                // unreachable via the DELETE twin's URL-path-captured
+                // principal_id).
+                if (!is_valid_username(principal_id)) {
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
+                                   "invalid principal_id format");
+                    res.set_content(error_response(id, kInvalidParams, "invalid principal_id format"),
+                                    "application/json");
+                    return;
+                }
                 // A2 scope: principal_type=="user" ONLY — see the REST
                 // route's own comment (rest_api_v1.cpp) for why group-scoped
-                // assignment is deferred.
+                // assignment is deferred. principal_type is free-text JSON
+                // (never charset-validated, only equality-checked), so it
+                // is ALSO neutralized before embedding.
                 if (principal_type != "user") {
-                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", principal_id,
-                                   "principal_type '" + principal_type + "' not supported (user only)");
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
+                                   "principal_type '" + audit_token(principal_type) +
+                                       "' not supported (user only)");
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "principal_type must be \"user\" (group-scoped assignment "
                                        "is not supported yet)"),
                         "application/json");
-                    return;
-                }
-                // Strict username charset — matches the REST route's own
-                // reasoning (nothing accepted here is unreachable via the
-                // DELETE twin's URL-path-captured principal_id).
-                if (!is_valid_username(principal_id)) {
-                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", principal_id,
-                                   "invalid principal_id format");
-                    res.set_content(error_response(id, kInvalidParams, "invalid principal_id format"),
-                                    "application/json");
                     return;
                 }
 
@@ -21933,7 +21945,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             ? "ITServiceOwner: requires group-scoped confinement, not "
                               "supported fleet-wide (delivery plan §2)"
                             : role_name + ": not one of the 6 fleet-wide-assignable roles";
-                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", principal_id,
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
                                    reason);
                     res.set_content(error_response(id, kInvalidParams, kUniformReject),
                                     "application/json");
@@ -21941,7 +21953,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // Defense-in-depth — see the REST route's own comment.
                 if (!rbac_store->get_role(role_name)) {
-                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", principal_id,
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
                                    role_name + ": assignable role name missing from store "
                                                 "(internal inconsistency)");
                     res.set_content(error_response(id, kInvalidParams, kUniformReject),
@@ -21951,8 +21963,10 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 // Pre-provisioning IS allowed — see the REST route's own
                 // comment. Recorded either way via target_provisioned.
-                const bool target_provisioned =
-                    auth_db && auth_db->get_user(principal_id).has_value();
+                // Three-state ("true"/"false"/"unknown" — governance SHOULD
+                // #4): see rbac_admin_predicate.hpp's target_provisioned_state.
+                const std::string_view target_provisioned =
+                    target_provisioned_state(auth_db, principal_id);
 
                 PrincipalRole assignment;
                 assignment.principal_type = "user";
@@ -21963,15 +21977,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     // retry-hint-exempt: validate_assignment's business-rule
                     // rejection (malformed/reserved-namespace principal_id),
                     // not a store fault.
-                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", principal_id,
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
                                    role_name + ": " + result.error());
                     res.set_content(error_response(id, kInvalidParams, kUniformReject),
                                     "application/json");
                     return;
                 }
                 bool audit_ok = yuzu::server::detail::try_persist_audit(
-                    audit_fn, req, "rbac.role.assigned", "success", "User", principal_id,
-                    role_name + "; target_provisioned=" + (target_provisioned ? "true" : "false"));
+                    audit_fn, req, "rbac.role.assigned", "success", "User", audit_target_id,
+                    role_name + "; target_provisioned=" + std::string(target_provisioned));
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466). The grant
                     // committed but its audit row did not persist —
@@ -21990,7 +22004,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                           {"principal_type", "user"},
                                           {"principal_id", principal_id},
                                           {"role", role_name},
-                                          {"target_provisioned", target_provisioned}};
+                                          {"target_provisioned", std::string(target_provisioned)}};
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");
@@ -22061,16 +22075,29 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Governance BLOCKING #2 (audit-log-injection, CWE-117):
+                // principal_id is charset-safe past is_valid_username above,
+                // but role_name is DELIBERATELY unrestricted here (schema:
+                // maxLength:64 only, no enum/charset — unlike
+                // assign_rbac_role's closed enum) so this tool can still
+                // clean up an out-of-band grant (a custom role, or
+                // ITServiceOwner, assigned by direct SQL — see this tool's
+                // own schema comment). That means role_name can reach a
+                // SUCCESSFUL Administrator-revoke audit row completely raw
+                // unless neutralized here. Matches this file's established
+                // `audit_token`/`log_token` convention (web_utils.hpp).
+                const std::string audit_target_id = audit_token(principal_id);
+                const std::string audit_role = audit_token(role_name);
 
                 // Self-target guard (#397/#403 — third call site; shared via
                 // rbac_admin_predicate.hpp's is_self_target). Scoped to
                 // role_name=="Administrator" ONLY — see the REST route's own
                 // comment for why.
                 if (role_name == "Administrator" && is_self_target(*session, principal_id)) {
-                    (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", principal_id,
+                    (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
                                    "self_admin_unassign_blocked");
                     res.set_content(
-                        error_response(id, kInvalidParams,
+                        error_response(id, kPermissionDenied,
                                        "cannot remove your own Administrator role assignment"),
                         "application/json");
                     return;
@@ -22084,11 +22111,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // only the genuine fault carries a retry hint.
                 auto result = rbac_store->unassign_role("user", principal_id, role_name);
                 if (!result) {
-                    (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", principal_id,
+                    (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
                                    result.error());
                     if (is_rbac_last_admin_refusal(result.error())) {
                         // retry-hint-exempt: business-rule outcome (last
                         // remaining Administrator), not a store fault.
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                                         {{"transport", "mcp"}})
+                                .increment();
                         res.set_content(error_response(id, kInvalidParams, result.error()),
                                         "application/json");
                         return;
@@ -22099,8 +22131,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // removed=<bool> (governance SHOULD #10) lets an auditor
+                // tell an actual revoke apart from an idempotent no-op from
+                // the log alone.
                 bool audit_ok = yuzu::server::detail::try_persist_audit(
-                    audit_fn, req, "rbac.role.unassigned", "success", "User", principal_id, role_name);
+                    audit_fn, req, "rbac.role.unassigned", "success", "User", audit_target_id,
+                    audit_role + "; removed=" + (*result ? "true" : "false"));
                 if (!audit_ok) {
                     mcp_audit("error", "audit_persist_failed");
                     res.set_content(

@@ -5553,38 +5553,57 @@ void RestApiV1::register_routes(
                 return;
             }
 
+            // Governance BLOCKING #2 (audit-log-injection, CWE-117): every
+            // audit call below uses `audit_target_id`, never raw
+            // `principal_id`, as its target_id argument — an authenticated
+            // durable Administrator (the only actor who can reach this
+            // route) supplying a CRLF/control-byte/ANSI-escape payload in
+            // principal_id must not be able to forge an adjacent audit
+            // field or inject terminal escapes into the audit trail that is
+            // supposed to hold THEM accountable. Matches this file's
+            // established `audit_token`/`log_token` convention
+            // (web_utils.hpp) used 8+ times elsewhere in this file.
+            const std::string audit_target_id = audit_token(principal_id);
+
+            // Strict username charset — validated BEFORE the principal_type
+            // check below and BEFORE any other audit call in this handler
+            // (governance BLOCKING #2's "ordering bug": the raw-embed
+            // sites must never fire ahead of validation) — the SAME set the
+            // DELETE twin's URL-path-captured principal_id is constrained
+            // to, so nothing POST accepts here is unreachable via DELETE.
+            // Deliberately excludes a durable SSO principal
+            // ("oidc:<iss>#<sub>", #1852): its '#' is a URL-fragment
+            // separator a browser/HTTP client never sends past, so the
+            // DELETE route below could never address it via a path
+            // segment. SSO-principal role assignment is out of scope for
+            // this PR.
+            if (!is_valid_username(principal_id)) {
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
+                                                    "denied", "User", audit_target_id,
+                                                    "invalid principal_id format");
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid principal_id format"),
+                                "application/json");
+                return;
+            }
+
             // A2 scope: principal_type=="user" ONLY. Group-scoped assignment
             // is deferred — rbac_store.group_members is written solely by
             // IdP group-sync (reconcile_idp_memberships), so a group-held
             // Administrator grant would make the IdP the admin-authority
-            // source, a decision this PR does not make.
+            // source, a decision this PR does not make. principal_type is
+            // free-text JSON (never charset-validated, only equality-
+            // checked), so it is ALSO neutralized before embedding.
             if (principal_type != "user") {
                 (void)detail::emit_behavioral_audit(
-                    audit_fn, req, res, "rbac.role.assigned", "denied", "User", principal_id,
-                    "principal_type '" + principal_type + "' not supported (user only)");
+                    audit_fn, req, res, "rbac.role.assigned", "denied", "User", audit_target_id,
+                    "principal_type '" + audit_token(principal_type) + "' not supported (user "
+                    "only)");
                 res.status = 400;
                 res.set_content(
                     detail::a4_error(res, "principal_type must be \"user\" (group-scoped "
                                           "assignment is not supported yet)"),
                     "application/json");
-                return;
-            }
-
-            // Strict username charset — the SAME set the DELETE twin's
-            // URL-path-captured principal_id is constrained to, so nothing
-            // POST accepts here is unreachable via DELETE. Deliberately
-            // excludes a durable SSO principal ("oidc:<iss>#<sub>", #1852):
-            // its '#' is a URL-fragment separator a browser/HTTP client
-            // never sends past, so the DELETE route below could never
-            // address it via a path segment. SSO-principal role assignment
-            // is out of scope for this PR.
-            if (!is_valid_username(principal_id)) {
-                (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
-                                                    "denied", "User", principal_id,
-                                                    "invalid principal_id format");
-                res.status = 400;
-                res.set_content(detail::a4_error(res, "invalid principal_id format"),
-                                "application/json");
                 return;
             }
 
@@ -5616,7 +5635,7 @@ void RestApiV1::register_routes(
                           "fleet-wide (delivery plan §2)"
                         : role_name + ": not one of the 6 fleet-wide-assignable roles";
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
-                                                    "denied", "User", principal_id, reason);
+                                                    "denied", "User", audit_target_id, reason);
                 res.status = 400;
                 res.set_content(detail::a4_error(res, kUniformReject), "application/json");
                 return;
@@ -5631,7 +5650,7 @@ void RestApiV1::register_routes(
             // by an error.
             if (!rbac_store->get_role(role_name)) {
                 (void)detail::emit_behavioral_audit(
-                    audit_fn, req, res, "rbac.role.assigned", "denied", "User", principal_id,
+                    audit_fn, req, res, "rbac.role.assigned", "denied", "User", audit_target_id,
                     role_name + ": assignable role name missing from store (internal "
                                 "inconsistency)");
                 res.status = 400;
@@ -5645,8 +5664,12 @@ void RestApiV1::register_routes(
             // admin may grant a role to a username ahead of that person's
             // first login (e.g. pre-staging an OIDC principal's eventual
             // access). Recorded either way via target_provisioned in the
-            // audit detail, never silently assumed.
-            const bool target_provisioned = auth_db && auth_db->get_user(principal_id).has_value();
+            // audit detail, never silently assumed. Three-state
+            // ("true"/"false"/"unknown", not a bool — governance SHOULD #4):
+            // a genuinely-absent user and a degraded AuthDB read must not
+            // both collapse to the same "false".
+            const std::string_view target_provisioned =
+                target_provisioned_state(auth_db, principal_id);
 
             PrincipalRole assignment;
             assignment.principal_type = "user";
@@ -5660,7 +5683,7 @@ void RestApiV1::register_routes(
                 // uniform client message as the unknown-role/ITServiceOwner
                 // cases (M1); specific reason audited.
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
-                                                    "denied", "User", principal_id,
+                                                    "denied", "User", audit_target_id,
                                                     role_name + ": " + result.error());
                 res.status = 400;
                 res.set_content(detail::a4_error(res, kUniformReject), "application/json");
@@ -5670,9 +5693,8 @@ void RestApiV1::register_routes(
             // persist FAILS CLOSED — never return success on an unrecorded
             // grant of standing authority.
             if (!detail::emit_behavioral_audit(
-                    audit_fn, req, res, "rbac.role.assigned", "success", "User", principal_id,
-                    role_name + "; target_provisioned=" +
-                        (target_provisioned ? "true" : "false"))) {
+                    audit_fn, req, res, "rbac.role.assigned", "success", "User", audit_target_id,
+                    role_name + "; target_provisioned=" + std::string(target_provisioned))) {
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res, "the role assignment took effect but its audit record "
@@ -5694,8 +5716,8 @@ void RestApiV1::register_routes(
 
     sink.Delete(
         R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments/([A-Za-z0-9._-]+))",
-        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped](
-            const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped,
+         metrics_registry](const httplib::Request& req, httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "rbac.role.unassigned", "User",
                     "service-scoped token blocked from RBAC role unassignment",
@@ -5763,10 +5785,18 @@ void RestApiV1::register_routes(
             // runtime query failure (503) or the store-layer A2
             // last-Administrator guard refusing to leave the fleet with
             // zero administrators (409 — a conflict with current state, not
-            // a client input error).
+            // a client input error). principal_id/role_name here are the
+            // URL-path-captured groups (`[A-Za-z0-9._-]+`), so both are
+            // already regex-charset-safe by construction — no audit_token
+            // needed on this transport (unlike POST's JSON-body fields).
             auto result = rbac_store->unassign_role("user", principal_id, role_name);
             if (!result) {
                 const bool last_admin = is_rbac_last_admin_refusal(result.error());
+                if (last_admin && metrics_registry)
+                    metrics_registry
+                        ->counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                                 {{"transport", "rest"}})
+                        .increment();
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.unassigned",
                                                     "denied", "User", principal_id,
                                                     result.error());
@@ -5775,9 +5805,12 @@ void RestApiV1::register_routes(
                 return;
             }
             // #2466/#2406: fail closed — never report an unassign that was
-            // not audited.
-            if (!detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.unassigned",
-                                               "success", "User", principal_id, role_name)) {
+            // not audited. `removed=<bool>` (governance SHOULD #10) lets an
+            // auditor tell an actual revoke apart from an idempotent no-op
+            // (the principal never held the role) from the log alone.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "rbac.role.unassigned", "success", "User", principal_id,
+                    role_name + "; removed=" + (*result ? "true" : "false"))) {
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res,

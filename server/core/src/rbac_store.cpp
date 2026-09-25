@@ -1968,16 +1968,17 @@ std::expected<void, std::string> RbacStore::assign_role(const PrincipalRole& pr)
     return {};
 }
 
-std::expected<void, std::string> RbacStore::unassign_role(const std::string& principal_type,
-                                                          const std::string& principal_id,
-                                                          const std::string& role_name) {
+std::expected<bool, std::string> RbacStore::unassign_role(const std::string& principal_type,
+                                                           const std::string& principal_id,
+                                                           const std::string& role_name) {
     if (!open_)
         return std::unexpected("database not open");
     std::optional<std::uint64_t> new_gen;
     bool last_admin_reject = false;
+    bool removed = false;
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
-        // A2 last-Administrator guard (delivery plan §2 "A2 — Global human
+        // A2 last-Administrator guard ("A2 — Global human
         // role assignment/unassignment"). Scoped to role_name=="Administrator"
         // ONLY — every other unassign (including both existing engine-only
         // callers, rest_api_v1.cpp:3232 and mcp_server.cpp:21727) stays a pure
@@ -1998,21 +1999,53 @@ std::expected<void, std::string> RbacStore::unassign_role(const std::string& pri
         // removed whenever a group row also exists — a false sense of safety
         // from a row nothing can authenticate as. Match the gate exactly.
         //
+        // JOIN auth.users u ON u.username = pr.principal_id, WHERE u.is_active
+        // (governance BLOCKING #1, full-pipeline review on 765bc7ec1): a bare
+        // `principal_roles` row count is a count of GRANTS, not of
+        // AUTHENTICATABLE administrators. A2 explicitly permits pre-
+        // provisioning (assigning Administrator to a username with no
+        // `auth.users` row yet — see `target_provisioned` at the assign
+        // route), and `AuthDB::remove_user` is a SOFT delete
+        // (`UPDATE auth.users SET is_active = FALSE ...`, auth_db.cpp — there
+        // is no hard-delete/cascade path anywhere in this codebase), so
+        // BOTH a ghost (never-logged-in) row AND a deactivated/removed
+        // account would previously count as a "surviving" administrator
+        // while nobody can actually authenticate as either. The JOIN
+        // excludes a nonexistent username (no matching row) and `u.is_active`
+        // excludes both deactivated and (soft-)deleted accounts — the same
+        // filter covers all three sub-cases named in the finding. This is
+        // safe ONLY because `RbacStore` and `AuthDB` are ALWAYS constructed
+        // on the SAME PgPool/database in production — ONE `--postgres-dsn`,
+        // ONE `pg_pool_` member, both stores built from it
+        // (server.cpp:4532,6047; ADR-0006) — so `auth.users` is guaranteed
+        // reachable from this same transaction/connection, never a
+        // cross-database call. A degraded/missing `auth` schema fails the
+        // whole SELECT (PGRES_TUPLES_OK check below), which aborts this
+        // transaction and returns `unexpected` — fail-closed by
+        // construction, no separate degraded-vs-absent branch needed.
+        //
         // Concurrency: lock the CANDIDATE Administrator rows with `FOR
-        // UPDATE` before the DELETE. Without this, two concurrent unassigns
-        // each removing one of the last two Administrator grants can both
-        // read "1 remaining" under READ COMMITTED (neither sees the other's
+        // UPDATE OF pr` (the `principal_roles` alias only — never lock
+        // `auth.users` rows here, which would serialize unassigns against
+        // unrelated logins/role-changes, out of scope for this guard)
+        // before the DELETE. Without this, two concurrent unassigns each
+        // removing one of the last two Administrator grants can both read
+        // "1 remaining" under READ COMMITTED (neither sees the other's
         // still-uncommitted delete) and both commit, landing at zero — the
         // exact TOCTOU a route-level pre-check would also be vulnerable to.
-        // `FOR UPDATE` blocks the second transaction on the first's row lock
-        // until it commits/rolls back, so the second re-evaluates the count
-        // against the first's now-durable delete.
+        // `FOR UPDATE OF pr` blocks the second transaction on the first's
+        // row lock until it commits/rolls back, so the second re-evaluates
+        // the count against the first's now-durable delete. The LOCK set
+        // and the COUNT set below both go through the identical JOIN, so
+        // the lock always covers exactly the rows the count depends on.
         if (role_name == "Administrator") {
             pg::PgResult lock_rows = pg::exec_params(
                 c,
-                "SELECT principal_id FROM rbac_store.principal_roles "
-                "WHERE role_name = 'Administrator' AND principal_type = 'user' "
-                "FOR UPDATE",
+                "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+                "JOIN auth.users u ON u.username = pr.principal_id "
+                "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' "
+                "AND u.is_active "
+                "FOR UPDATE OF pr",
                 std::vector<std::string>{});
             if (lock_rows.status() != PGRES_TUPLES_OK) {
                 err = PQerrorMessage(c);
@@ -2029,15 +2062,18 @@ std::expected<void, std::string> RbacStore::unassign_role(const std::string& pri
             err = PQerrorMessage(c);
             return false;
         }
+        removed = std::string(PQcmdTuples(r.get())) != "0";
 
         // Only fire the count when this DELETE actually removed a row — an
         // idempotent no-op unassign (the principal never held the role) must
         // not spuriously reject.
-        if (role_name == "Administrator" && std::string(PQcmdTuples(r.get())) != "0") {
+        if (role_name == "Administrator" && removed) {
             pg::PgResult remaining = pg::exec_params(
                 c,
-                "SELECT count(*) FROM rbac_store.principal_roles "
-                "WHERE role_name = 'Administrator' AND principal_type = 'user'",
+                "SELECT count(*) FROM rbac_store.principal_roles pr "
+                "JOIN auth.users u ON u.username = pr.principal_id "
+                "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' "
+                "AND u.is_active",
                 std::vector<std::string>{});
             if (remaining.status() != PGRES_TUPLES_OK || PQntuples(remaining.get()) != 1) {
                 err = PQerrorMessage(c);
@@ -2059,7 +2095,7 @@ std::expected<void, std::string> RbacStore::unassign_role(const std::string& pri
     if (!ok)
         return std::unexpected(err.empty() ? "unassign_role failed" : err);
     apply_local_generation(*new_gen);
-    return {};
+    return removed;
 }
 
 // ── Groups CRUD ──────────────────────────────────────────────────────────────

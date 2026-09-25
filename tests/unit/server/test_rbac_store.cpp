@@ -20,6 +20,7 @@
 #include "rbac_generation_rules.hpp"
 #include "rbac_store.hpp"
 
+#include "test_auth_db_pg_helper.hpp" // RBAC_STORE_WITH_AUTH — the last-admin guard's auth.users JOIN
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -96,6 +97,36 @@ void seed_group_raw(PgPool& pool, const std::string& name, const std::string& de
     REQUIRE(rbac_pool_fx_.valid());                                                                 \
     RbacStore store_var{rbac_pool_fx_};                                                             \
     REQUIRE(store_var.is_open())
+
+// Fixture for the A2 last-Administrator guard (governance BLOCKING #1,
+// full-pipeline review on 765bc7ec1): `RbacStore::unassign_role`'s guard now
+// JOINs `auth.users`, so these tests need BOTH schemas in the SAME
+// database — unlike `RBAC_STORE` above, which uses the shared "rbacstore"
+// `PgTestTemplate` name that 9+ OTHER test files also register verbatim
+// (the registry's replay-verification requires every registration of one
+// template name stay behaviorally identical), so extending THAT template to
+// also carry `auth.users` is out of scope for this fix — it would have to
+// change in lockstep across every one of those files. Instead: construct
+// `RbacStore` DIRECTLY on a real `AuthDbPg` fixture's own pool (mirrors
+// `server.cpp`'s own composition — ONE `pg_pool_`, both stores built from
+// it, ADR-0006) rather than via the shared template. Slower than a
+// template clone (a fresh RbacStore migration+seed every case, not a
+// pre-migrated clone) but this fixture backs a small, dedicated set of
+// cases, not the whole file.
+#define RBAC_STORE_WITH_AUTH(store_var, auth_var)                                                 \
+    yuzu::test::AuthDbPg auth_var;                                                                \
+    RbacStore store_var{auth_var.pool()};                                                         \
+    REQUIRE(store_var.is_open())
+
+/// Seed an ACTIVE auth.users row for `username` (a genuinely authenticatable
+/// account) — the shared building block for every last-admin-guard test
+/// below. `role` doesn't matter to `unassign_role`'s guard (it JOINs only on
+/// `is_active`), so this defaults to a plain non-admin `auth::Role::user`
+/// row; RBAC administrator authority comes entirely from the
+/// `principal_roles` grant, a separate table this helper does not touch.
+void seed_active_user(yuzu::test::AuthDbPg& auth_db, const std::string& username) {
+    REQUIRE(auth_db->upsert_user(username, "hash", "salt", auth::Role::user).has_value());
+}
 
 TEST_CASE("RbacStore migration lands at v4 and poisons (not deletes) the backfill marker rows "
           "(#3623, governance unhappy-path fix)",
@@ -745,7 +776,8 @@ TEST_CASE("RbacStore: unassign role", "[rbac_store][pg]") {
 TEST_CASE("RbacStore: unassign_role refuses to remove the fleet's last remaining "
           "Administrator grant",
           "[rbac_store][pg]") {
-    RBAC_STORE(store);
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "onlyadmin");
     REQUIRE(store.assign_role({"user", "onlyadmin", "Administrator"}).has_value());
 
     auto result = store.unassign_role("user", "onlyadmin", "Administrator");
@@ -761,14 +793,99 @@ TEST_CASE("RbacStore: unassign_role refuses to remove the fleet's last remaining
 TEST_CASE("RbacStore: unassign_role removes an Administrator grant when another "
           "Administrator remains",
           "[rbac_store][pg]") {
-    RBAC_STORE(store);
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "admin1");
+    seed_active_user(auth_db, "admin2");
     REQUIRE(store.assign_role({"user", "admin1", "Administrator"}).has_value());
     REQUIRE(store.assign_role({"user", "admin2", "Administrator"}).has_value());
 
     auto result = store.unassign_role("user", "admin1", "Administrator");
     REQUIRE(result.has_value());
+    CHECK(*result); // a row was actually removed
     CHECK(store.get_principal_roles("user", "admin1").empty());
     CHECK(store.get_principal_roles("user", "admin2").size() == 1);
+}
+
+// ── Governance BLOCKING #1 (full-pipeline review on 765bc7ec1) — C1: the
+// guard counts AUTHENTICATABLE administrators, not bare grant rows. Three
+// sub-cases, each proving the "other" Administrator row does NOT save the
+// real admin's removal from refusal, because nobody can actually log in as
+// it. `remove_user()` is a SOFT delete in this codebase (auth_db.cpp:
+// `UPDATE auth.users SET is_active = FALSE ...` — there is no hard-delete
+// path anywhere), so (b) deactivated and (c) deleted are the SAME code path
+// here; both are kept as distinct cases anyway (matching the finding's own
+// three named sub-cases) to document that equivalence explicitly rather
+// than assuming a reader already knows it. ────────────────────────────────
+
+TEST_CASE("RbacStore C1(a): last-admin guard refuses when the only 'other' "
+          "Administrator row names a NONEXISTENT username (pre-provisioned, "
+          "never logged in)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    // "ghostadmin" has NO auth.users row at all — A2 explicitly permits
+    // pre-provisioning a grant ahead of an account existing.
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+
+    auto result = store.unassign_role("user", "realadmin", "Administrator");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(is_rbac_last_admin_refusal(result.error()));
+    CHECK(store.get_principal_roles("user", "realadmin").size() == 1);
+
+    // Negative control: documents the PRE-FIX behavior this test would have
+    // observed — a bare grant-row count (ignoring auth.users entirely) sees
+    // TWO rows ("realadmin", "ghostadmin") and would have allowed the
+    // delete, reaching zero AUTHENTICATABLE administrators. Reproduced here
+    // directly against the raw table, independent of unassign_role, so this
+    // assertion can never silently start exercising the real (fixed) code
+    // path instead of the historical defect shape.
+    {
+        auto lease = auth_db.pool().acquire();
+        REQUIRE(lease);
+        auto bare_count = pg::exec_params(
+            lease.get(),
+            "SELECT count(*) FROM rbac_store.principal_roles WHERE role_name = "
+            "'Administrator' AND principal_type = 'user'",
+            std::vector<std::string>{});
+        REQUIRE(bare_count.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(bare_count.get(), 0, 0)) == "2"); // would have allowed it
+    }
+}
+
+TEST_CASE("RbacStore C1(b): last-admin guard refuses when the only 'other' "
+          "Administrator row names a DEACTIVATED account",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    seed_active_user(auth_db, "deactivatedadmin");
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "deactivatedadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("deactivatedadmin").has_value());
+
+    auto result = store.unassign_role("user", "realadmin", "Administrator");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(is_rbac_last_admin_refusal(result.error()));
+    CHECK(store.get_principal_roles("user", "realadmin").size() == 1);
+}
+
+TEST_CASE("RbacStore C1(c): last-admin guard refuses when the only 'other' "
+          "Administrator row names a DELETED account (this codebase's "
+          "remove_user() is a soft-delete — is_active=FALSE, no hard-delete "
+          "path exists — so this is mechanically the SAME guard as C1(b), "
+          "kept distinct to document that equivalence explicitly)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    seed_active_user(auth_db, "deletedadmin");
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "deletedadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("deletedadmin").has_value());
+
+    auto result = store.unassign_role("user", "realadmin", "Administrator");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(is_rbac_last_admin_refusal(result.error()));
+    CHECK(store.get_principal_roles("user", "realadmin").size() == 1);
 }
 
 TEST_CASE("RbacStore: unassign_role's last-Administrator guard is scoped to the "
@@ -794,7 +911,8 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard IGNORES a group-h
           "(adversarial-review PR1/A2 finding: the guard must match "
           "is_rbac_administrator's gate, which never resolves group membership)",
           "[rbac_store][pg]") {
-    RBAC_STORE(store);
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "soleadmin");
     // A group-held Administrator row (however it got there today — no
     // production caller writes one — the guard is a property of
     // unassign_role, shared by any future caller) must NOT be treated as a
@@ -831,32 +949,28 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard under real "
           "concurrency still refuses to remove the last USER administrator "
           "even with a group-held Administrator row present",
           "[rbac_store][pg]") {
-    RBAC_STORE(store);
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "concadmin1");
+    seed_active_user(auth_db, "concadmin2");
     REQUIRE(store.assign_role({"group", "admins-group", "Administrator"}).has_value());
     REQUIRE(store.assign_role({"user", "concadmin1", "Administrator"}).has_value());
     REQUIRE(store.assign_role({"user", "concadmin2", "Administrator"}).has_value());
 
     std::atomic<bool> ok1{false}, ok2{false};
     std::atomic<bool> done1{false}, done2{false};
-    std::thread t1([&] {
+    // std::jthread (C++23), not std::thread + a hand-rolled join-guard
+    // struct: its destructor joins unconditionally, so there is no window
+    // where a live thread is unguarded (e.g. `t2`'s constructor throwing
+    // between `t1`'s spawn and a guard's construction would otherwise call
+    // std::terminate() when `t1` unwinds joinable — governance NICE finding).
+    std::jthread t1([&] {
         ok1 = store.unassign_role("user", "concadmin1", "Administrator").has_value();
         done1 = true;
     });
-    std::thread t2([&] {
+    std::jthread t2([&] {
         ok2 = store.unassign_role("user", "concadmin2", "Administrator").has_value();
         done2 = true;
     });
-    // Same join-on-unwind hazard as the deterministic race test below — see
-    // its comment for why a bare REQUIRE between spawn and join is unsafe.
-    struct ThreadJoiner2 {
-        std::thread &a, &b;
-        ~ThreadJoiner2() {
-            if (a.joinable())
-                a.join();
-            if (b.joinable())
-                b.join();
-        }
-    } joiner2{t1, t2};
     t1.join();
     t2.join();
     CHECK(done1.load());
@@ -888,17 +1002,24 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
           "concurrent unassigns of the last two Administrator grants — exactly "
           "one succeeds, never zero remain",
           "[rbac_store][pg]") {
-    RBAC_STORE(store);
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "raceadmin1");
+    seed_active_user(auth_db, "raceadmin2");
     REQUIRE(store.assign_role({"user", "raceadmin1", "Administrator"}).has_value());
     REQUIRE(store.assign_role({"user", "raceadmin2", "Administrator"}).has_value());
 
-    auto lease_a = rbac_pool_fx_.acquire();
+    auto lease_a = auth_db.pool().acquire();
     REQUIRE(lease_a);
     REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    // Mirrors the production lock statement exactly (rbac_store.cpp) —
+    // governance BLOCKING #1 re-verification: the JOIN must not weaken this
+    // deterministic interleaving proof.
     REQUIRE(pg::exec_params(lease_a.get(),
-                            "SELECT principal_id FROM rbac_store.principal_roles WHERE "
-                            "role_name = 'Administrator' AND principal_type = 'user' "
-                            "FOR UPDATE",
+                            "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+                            "JOIN auth.users u ON u.username = pr.principal_id "
+                            "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
+                            "'user' AND u.is_active "
+                            "FOR UPDATE OF pr",
                             std::vector<std::string>{})
                 .ok());
 
@@ -906,7 +1027,16 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
     std::atomic<bool> b_done{false};
     std::atomic<bool> b_ok{false};
     std::string b_error;
-    std::thread unassign_thread([&] {
+    // std::jthread (C++23), not std::thread + a hand-rolled join-guard
+    // struct — its destructor joins unconditionally, so a REQUIRE failure
+    // anywhere below (before the explicit .join() call further down) can
+    // never leave this thread live-and-unguarded (governance NICE finding).
+    // Runtime bound, stated explicitly (governance SHOULD #11 / NICE):
+    // `unassign_thread` blocks on connection A's row lock for at most
+    // PgPool's default `lock_timeout_ms` (10000ms, pg_pool.hpp:94), never
+    // indefinitely, so this test's worst case is bounded even if connection
+    // A's own COMMIT below never ran (e.g. a REQUIRE above it failed).
+    std::jthread unassign_thread([&] {
         b_started = true;
         auto res = store.unassign_role("user", "raceadmin2", "Administrator");
         b_ok = res.has_value();
@@ -914,13 +1044,6 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
             b_error = res.error();
         b_done = true;
     });
-    struct ThreadJoiner {
-        std::thread& t;
-        ~ThreadJoiner() {
-            if (t.joinable())
-                t.join();
-        }
-    } joiner{unassign_thread};
 
     // Prove a real blocked-then-unblocked interleaving, not a lucky race.
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -950,6 +1073,129 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
     // Exactly one Administrator remains — never zero.
     CHECK(store.get_principal_roles("user", "raceadmin1").empty());
     CHECK(store.get_principal_roles("user", "raceadmin2").size() == 1);
+}
+
+// C2 (governance BLOCKING #1's required regression test, full-pipeline
+// review on 765bc7ec1): a connection lost MID-TRANSACTION, while blocked on
+// the guard's own `FOR UPDATE OF pr` lock, must roll back cleanly — no
+// partial delete, no generation bump — and must not wedge the pool.
+// Precedent for the pg_terminate_backend idiom: test_pg_pool.cpp's "PgPool
+// discards a connection lost mid-use", test_api_token_store.cpp,
+// test_kek_op_lock_holder.cpp. Reuses the deterministic-race scaffold above
+// (connection A holds the lock; the background thread blocks on it) but
+// instead of A committing cleanly, A TERMINATES the blocked backend instead.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard rolls back "
+          "cleanly and never bumps the generation when its connection is "
+          "lost mid-transaction (governance BLOCKING #1 C2)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "killadmin1");
+    seed_active_user(auth_db, "killadmin2");
+    REQUIRE(store.assign_role({"user", "killadmin1", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "killadmin2", "Administrator"}).has_value());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    // Mirrors the production lock statement exactly (rbac_store.cpp) — locks
+    // BOTH candidate rows, so the background unassign below has no
+    // unlocked row left to race past.
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+                            "JOIN auth.users u ON u.username = pr.principal_id "
+                            "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
+                            "'user' AND u.is_active "
+                            "FOR UPDATE OF pr",
+                            std::vector<std::string>{})
+                .ok());
+
+    // Durable write_generation baseline, read before the background call
+    // ever starts.
+    pg::PgResult gen_before_res{
+        PQexec(lease_a.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key = "
+                              "'write_generation'")};
+    REQUIRE(gen_before_res.ok());
+    REQUIRE(PQntuples(gen_before_res.get()) == 1);
+    const std::string gen_before = PQgetvalue(gen_before_res.get(), 0, 0);
+
+    std::atomic<bool> b_started{false};
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_ok{false};
+    std::string b_error;
+    std::jthread unassign_thread([&] {
+        b_started = true;
+        auto res = store.unassign_role("user", "killadmin2", "Administrator");
+        b_ok = res.has_value();
+        if (!res)
+            b_error = res.error();
+        b_done = true;
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(b_started.load());
+    CHECK_FALSE(b_done.load());
+
+    // Find the background thread's own backend, blocked on connection A's
+    // lock — never assume which pool slot it landed on. Bounded poll: the
+    // 500ms sleep above already gives Postgres time to register the wait,
+    // so this should resolve on the first or second iteration.
+    int blocked_pid = 0;
+    for (int i = 0; i < 100 && blocked_pid == 0; ++i) {
+        pg::PgResult r = pg::exec_params(
+            lease_a.get(),
+            "SELECT pid FROM pg_stat_activity WHERE datname = current_database() "
+            "AND wait_event_type = 'Lock' AND pid <> $1",
+            std::vector<std::string>{std::to_string(lease_a_pid)});
+        if (r.ok() && PQntuples(r.get()) == 1)
+            blocked_pid = std::atoi(PQgetvalue(r.get(), 0, 0));
+        else
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    REQUIRE(blocked_pid > 0);
+
+    // Sever it — the F1 ledger's "connection loss mid-txn" error path,
+    // fired while the transaction is genuinely mid-flight (blocked on the
+    // row lock), not merely idle.
+    pg::PgResult kill{pg::exec_params(lease_a.get(),
+                                      "SELECT pg_terminate_backend($1)",
+                                      std::vector<std::string>{std::to_string(blocked_pid)})};
+    REQUIRE(kill.ok());
+
+    // Release connection A's lock so the (now-dying) background transaction
+    // isn't also waiting on anything else; its own connection loss is what
+    // ends it, not this rollback.
+    REQUIRE(pg::exec_params(lease_a.get(), "ROLLBACK", std::vector<std::string>{}).ok());
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    // The killed transaction must report failure — never a false success on
+    // a connection that died before COMMIT.
+    CHECK_FALSE(b_ok.load());
+    CHECK_FALSE(b_error.empty());
+
+    // No partial delete: both grants survive, untouched by the aborted txn.
+    CHECK(store.get_principal_roles("user", "killadmin1").size() == 1);
+    CHECK(store.get_principal_roles("user", "killadmin2").size() == 1);
+
+    // The generation counter must NOT have bumped — a killed transaction
+    // rolls back in Postgres itself (no COMMIT ever reached), so
+    // bump_generation_in_txn's own write is discarded along with everything
+    // else in that transaction.
+    pg::PgResult gen_after_res{
+        PQexec(lease_a.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key = "
+                              "'write_generation'")};
+    REQUIRE(gen_after_res.ok());
+    REQUIRE(PQntuples(gen_after_res.get()) == 1);
+    CHECK(std::string(PQgetvalue(gen_after_res.get(), 0, 0)) == gen_before);
+
+    // Pool recovery: the dead connection must have been discarded (never
+    // recycled into the idle pool — PgPool::release's health check), and a
+    // fresh call through the SAME store must still work normally.
+    lease_a.reset();
+    REQUIRE(store.assign_role({"user", "postkill-canary", "Viewer"}).has_value());
+    CHECK(store.get_principal_roles("user", "postkill-canary").size() == 1);
 }
 
 TEST_CASE("RbacStore: get role members", "[rbac_store][pg]") {
@@ -1891,10 +2137,13 @@ TEST_CASE("RbacStore: every authz read fails closed (DENY) on a broken store",
 // in-txn and clears the local cache, so the next check re-reads and denies.
 TEST_CASE("RbacStore: a revoke invalidates a cached allow (generation token)",
           "[rbac_store][pg]") {
-    RBAC_STORE(store);
+    RBAC_STORE_WITH_AUTH(store, auth_db);
     // A second Administrator holder so the revoke below doesn't trip the A2
-    // last-Administrator guard (delivery plan §2) — this test is about cache
-    // invalidation, not that guard, which has its own dedicated test cases.
+    // last-Administrator guard — this test is about cache invalidation, not
+    // that guard, which has its own dedicated test cases. Both need a real
+    // auth.users row now that the guard JOINs on it.
+    seed_active_user(auth_db, "otheradmin");
+    seed_active_user(auth_db, "cacheuser");
     store.assign_role({"user", "otheradmin", "Administrator"});
     store.assign_role({"user", "cacheuser", "Administrator"}); // Administrator = allow-all
     // Warm perm_cache_ with an ALLOW verdict.

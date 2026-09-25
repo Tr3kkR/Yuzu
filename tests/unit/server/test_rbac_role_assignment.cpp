@@ -40,19 +40,22 @@
 
 #include "mcp_jsonrpc.hpp" // mcp::kApprovalRequired — the ticket-then-recall dance
 #include "mcp_server.hpp"
+#include "mcp_server_testonly.hpp" // input_schemas_for_test — SHOULD #3's schema<->header sync test
+#include "rbac_assignable_roles.hpp"
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
+#include "web_utils.hpp" // audit_token — C5's expected-neutralization oracle
 
 #include "test_approval_manager_pg_helper.hpp"
 #include "test_auth_db_pg_helper.hpp"
-#include "test_rbac_store_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <httplib.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -66,16 +69,44 @@ struct AuditRecord {
     std::string action, result, target_id, detail;
 };
 
+/// RbacStore co-located on AuthDbPg's own pool/database, NOT RbacStorePg's
+/// separate ephemeral one (governance BLOCKING #1, full-pipeline review on
+/// 765bc7ec1): `unassign_role`'s last-admin guard now runs a same-transaction
+/// `rbac_store.principal_roles JOIN auth.users` (rbac_store.cpp), which is
+/// safe ONLY because production always constructs both stores on the SAME
+/// PgPool/database (ADR-0006, server.cpp:4532,6047) — an `auth` schema that
+/// does not exist in THIS harness's rbac database would make every
+/// `role_name=="Administrator"` unassign fail the lock query outright (a raw
+/// Postgres "relation does not exist" error, not the intended 409 refusal).
+/// Exposes the same `get()`/`operator->`/`operator*` shape as `RbacStorePg`
+/// so every existing `rbac->`/`h.rbac->` call site below is unchanged.
+class RbacStoreOnAuthPool {
+public:
+    explicit RbacStoreOnAuthPool(yuzu::server::pg::PgPool& pool) : store_(pool) {
+        REQUIRE(store_.is_open());
+    }
+    [[nodiscard]] yuzu::server::RbacStore* get() noexcept { return &store_; }
+    yuzu::server::RbacStore* operator->() noexcept { return &store_; }
+    yuzu::server::RbacStore& operator*() noexcept { return store_; }
+
+private:
+    yuzu::server::RbacStore store_;
+};
+
 /// One harness driving BOTH the REST TestRouteSink and the MCP JSON-RPC
-/// handler off the SAME RbacStore/AuthDB/ApprovalManager (independent PG
-/// databases — the predicate takes two independent store pointers with no
-/// cross-store transaction requirement, mirrors test_rest_access_review.cpp's
-/// AuthDbPgShared-alongside-RbacStore composition).
+/// handler off the SAME RbacStore/AuthDB/ApprovalManager. RbacStore and
+/// AuthDB share ONE database (RbacStoreOnAuthPool, above) — the last-admin
+/// guard's auth.users JOIN needs it; ApprovalManager stays on its own
+/// independent database (no cross-store transaction requirement with either
+/// store), mirroring test_rest_access_review.cpp's AuthDbPgShared-alongside-
+/// RbacStore composition for that one piece.
 struct RbacRoleHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    yuzu::test::RbacStorePg rbac;
+    // Declaration order is construction order: auth_db's pool must exist
+    // before rbac borrows it.
     yuzu::test::AuthDbPg auth_db;
+    RbacStoreOnAuthPool rbac{auth_db.pool()};
     yuzu::test::ApprovalManagerPg appr;
 
     std::string session_user{"admin"};
@@ -376,6 +407,39 @@ TEST_CASE("REST assign: ITServiceOwner is rejected 400, never assigned",
     CHECK(h.rbac->get_principal_roles("user", "jane").empty());
 }
 
+TEST_CASE("REST assign: a malformed JSON body is rejected 400 (governance "
+          "SHOULD #13)",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    auto res = h.assign_rest("Operator", "not json");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("REST assign: a JSON body missing principal_id is rejected 400 "
+          "(governance SHOULD #13)",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    auto res = h.assign_rest("Operator", R"({"principal_type":"user"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("REST assign: an empty JSON body ({}) is rejected 400, missing "
+          "principal_id (governance SHOULD #13)",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    auto res = h.assign_rest("Operator", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
 TEST_CASE("REST assign: unknown role rejected 400 with the SAME message as "
           "ITServiceOwner (M1 uniform reject)",
           "[pg][rest][rbac][a2]") {
@@ -409,6 +473,68 @@ TEST_CASE("REST assign: non-\"user\" principal_type rejected 400",
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.rbac->get_principal_roles("group", "engineers").empty());
+}
+
+// ── REST: C5 — audit-log-injection neutralization (governance BLOCKING #2,
+// CWE-117, full-pipeline review on 765bc7ec1). A CRLF/ANSI-escape payload in
+// a JSON-body field must never reach the audit trail raw — every site is
+// wrapped in audit_token()/log_token() (web_utils.hpp). Both cases here are
+// DENIED rows: principal_id fails is_valid_username's charset check before
+// ever reaching the store, and principal_type is free-text (only equality-
+// checked, never charset-validated) so the injection surfaces in the
+// principal_type-rejection detail instead. ─────────────────────────────────
+
+TEST_CASE("REST assign C5: a CRLF/ANSI-escape principal_id is rejected and "
+          "its audit target_id is neutralized, never embedded raw",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    const std::string evil_id = "carol\r\nrbac.role.assigned result=success\x1B[31mFAKE\x1B[0m";
+    nlohmann::json body = {{"principal_type", "user"}, {"principal_id", evil_id}};
+    auto res = h.assign_rest("Operator", body.dump());
+    REQUIRE(res);
+    CHECK(res->status == 400);
+
+    bool found = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action != "rbac.role.assigned" || a.result != "denied")
+            continue;
+        found = true;
+        CHECK(a.target_id == yuzu::server::audit_token(evil_id));
+        CHECK(a.target_id.find('\r') == std::string::npos);
+        CHECK(a.target_id.find('\n') == std::string::npos);
+        CHECK(a.target_id.find('\x1B') == std::string::npos);
+    }
+    CHECK(found);
+}
+
+TEST_CASE("REST assign C5: a CRLF/ANSI-escape principal_type is rejected and "
+          "the audit detail's embedded copy is neutralized, never raw",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    const std::string evil_type = "user\r\nrbac.role.assigned result=success\x1B[31mFAKE\x1B[0m";
+    nlohmann::json body = {{"principal_type", evil_type}, {"principal_id", "jane"}};
+    auto res = h.assign_rest("Operator", body.dump());
+    REQUIRE(res);
+    CHECK(res->status == 400);
+
+    bool found = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action != "rbac.role.assigned" || a.result != "denied")
+            continue;
+        if (a.detail.find("not supported") == std::string::npos)
+            continue; // the principal_type-rejection row specifically
+        found = true;
+        CHECK(a.detail.find(yuzu::server::audit_token(evil_type)) != std::string::npos);
+        CHECK(a.detail.find('\r') == std::string::npos);
+        CHECK(a.detail.find('\n') == std::string::npos);
+        CHECK(a.detail.find('\x1B') == std::string::npos);
+    }
+    CHECK(found);
+    CHECK(h.rbac->get_principal_roles("user", "jane").empty());
 }
 
 // ── REST: durable-admin gate (not perm_fn) ──────────────────────────────────
@@ -482,6 +608,81 @@ TEST_CASE("REST unassign: removing the fleet's last remaining Administrator "
     REQUIRE(res);
     CHECK(res->status == 409);
     CHECK(h.rbac->get_principal_roles("user", "soleadmin").size() == 1);
+}
+
+// ── REST: C1 — last-admin guard counts AUTHENTICATABLE admins, not bare
+// principal_roles rows (governance BLOCKING #1, full-pipeline review on
+// 765bc7ec1). Store-level coverage of the guard itself lives in
+// test_rbac_store.cpp's "RbacStore C1(a/b/c)" cases; these three prove the
+// SAME refusal surfaces correctly through the REST transport (409, not a
+// raw 503/500 from an unqualified guard).  ───────────────────────────────
+
+TEST_CASE("REST unassign C1(a): removing the fleet's real Administrator is "
+          "refused when the only OTHER Administrator row names a NONEXISTENT "
+          "username",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.auth_db->upsert_user("realadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "realadmin", "Administrator"}).has_value());
+    // "ghostadmin" holds an Administrator grant but NO auth.users row at
+    // all — exactly the pre-fix false "surviving admin".
+    REQUIRE(h.rbac->assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+
+    auto res = h.unassign_rest("Administrator", "realadmin");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    // Negative control: the row a naive unjoined count would have counted
+    // as "one other admin remaining" is still there, unaffected by the
+    // refusal — proving the refusal came from the JOIN excluding it, not
+    // from it having been removed by some other path.
+    CHECK(h.rbac->get_principal_roles("user", "ghostadmin").size() == 1);
+    CHECK(h.rbac->get_principal_roles("user", "realadmin").size() == 1);
+}
+
+TEST_CASE("REST unassign C1(b): removing the fleet's real Administrator is "
+          "refused when the only OTHER Administrator row names a "
+          "DEACTIVATED account",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.auth_db->upsert_user("realadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(h.auth_db->upsert_user("deactivatedadmin", "hash", "salt", auth::Role::user)
+               .has_value());
+    REQUIRE(h.rbac->assign_role({"user", "deactivatedadmin", "Administrator"}).has_value());
+    REQUIRE(h.auth_db->remove_user("deactivatedadmin").has_value());
+
+    auto res = h.unassign_rest("Administrator", "realadmin");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(h.rbac->get_principal_roles("user", "deactivatedadmin").size() == 1);
+    CHECK(h.rbac->get_principal_roles("user", "realadmin").size() == 1);
+}
+
+TEST_CASE("REST unassign C1(c): removing the fleet's real Administrator is "
+          "refused when the only OTHER Administrator row names a DELETED "
+          "account",
+          "[pg][rest][rbac][a2]") {
+    // This codebase has no hard-delete/cascade path for a user account
+    // (AuthDB::remove_user is a soft delete — `is_active = FALSE`), so
+    // "deleted" and C1(b)'s "deactivated" are mechanically the identical
+    // case here; kept as its own test because the finding named it as a
+    // separate sub-case and a future hard-delete path must not silently
+    // stop being covered by SOME test named after it.
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.auth_db->upsert_user("realadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(h.auth_db->upsert_user("deletedadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "deletedadmin", "Administrator"}).has_value());
+    REQUIRE(h.auth_db->remove_user("deletedadmin").has_value());
+
+    auto res = h.unassign_rest("Administrator", "realadmin");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(h.rbac->get_principal_roles("user", "deletedadmin").size() == 1);
+    CHECK(h.rbac->get_principal_roles("user", "realadmin").size() == 1);
 }
 
 // ── REST: audit fail-closed ──────────────────────────────────────────────────
@@ -598,6 +799,135 @@ TEST_CASE("MCP unassign_rbac_role: last-Administrator refusal is a JSON-RPC "
     CHECK(h.rbac->get_principal_roles("user", "soleadmin").size() == 1);
 }
 
+// ── MCP: C1 — last-admin guard counts AUTHENTICATABLE admins, not bare
+// principal_roles rows (governance BLOCKING #1). MCP twin of the REST C1(a/
+// b/c) cases above — same guard, same refusal, through the JSON-RPC
+// transport. ─────────────────────────────────────────────────────────────
+
+TEST_CASE("MCP unassign_rbac_role C1(a): removing the fleet's real "
+          "Administrator is refused when the only OTHER Administrator row "
+          "names a NONEXISTENT username",
+          "[pg][mcp][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.auth_db->upsert_user("realadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+
+    auto res = h.mcp_call_tool_approved(
+        "unassign_rbac_role", {{"principal_id", "realadmin"}, {"role", "Administrator"}});
+    REQUIRE(res);
+    CHECK(res->body.find("\"error\"") != std::string::npos);
+    CHECK(h.rbac->get_principal_roles("user", "ghostadmin").size() == 1);
+    CHECK(h.rbac->get_principal_roles("user", "realadmin").size() == 1);
+}
+
+TEST_CASE("MCP unassign_rbac_role C1(b): removing the fleet's real "
+          "Administrator is refused when the only OTHER Administrator row "
+          "names a DEACTIVATED account",
+          "[pg][mcp][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.auth_db->upsert_user("realadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(h.auth_db->upsert_user("deactivatedadmin", "hash", "salt", auth::Role::user)
+               .has_value());
+    REQUIRE(h.rbac->assign_role({"user", "deactivatedadmin", "Administrator"}).has_value());
+    REQUIRE(h.auth_db->remove_user("deactivatedadmin").has_value());
+
+    auto res = h.mcp_call_tool_approved(
+        "unassign_rbac_role", {{"principal_id", "realadmin"}, {"role", "Administrator"}});
+    REQUIRE(res);
+    CHECK(res->body.find("\"error\"") != std::string::npos);
+    CHECK(h.rbac->get_principal_roles("user", "deactivatedadmin").size() == 1);
+    CHECK(h.rbac->get_principal_roles("user", "realadmin").size() == 1);
+}
+
+TEST_CASE("MCP unassign_rbac_role C1(c): removing the fleet's real "
+          "Administrator is refused when the only OTHER Administrator row "
+          "names a DELETED account",
+          "[pg][mcp][rbac][a2]") {
+    // Same soft-delete-only note as REST C1(c) — see that test's comment.
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.auth_db->upsert_user("realadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(h.auth_db->upsert_user("deletedadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "deletedadmin", "Administrator"}).has_value());
+    REQUIRE(h.auth_db->remove_user("deletedadmin").has_value());
+
+    auto res = h.mcp_call_tool_approved(
+        "unassign_rbac_role", {{"principal_id", "realadmin"}, {"role", "Administrator"}});
+    REQUIRE(res);
+    CHECK(res->body.find("\"error\"") != std::string::npos);
+    CHECK(h.rbac->get_principal_roles("user", "deletedadmin").size() == 1);
+    CHECK(h.rbac->get_principal_roles("user", "realadmin").size() == 1);
+}
+
+// ── MCP: C5 — audit-log-injection neutralization (governance BLOCKING #2,
+// CWE-117). unassign_rbac_role's `role` field is the one MCP-reachable raw-
+// embed site: unlike `principal_id` (schema `pattern` locked to
+// `[A-Za-z0-9._-]{1,64}` on BOTH tools, so a CRLF/ANSI payload there never
+// reaches the handler at all), `role` is deliberately unrestricted
+// (maxLength:64 only — see the tool schema's own comment, so it can clean
+// up an out-of-band/custom role grant) and previously reached a SUCCESSFUL
+// Administrator-revoke audit row completely raw. ───────────────────────────
+
+TEST_CASE("MCP unassign_rbac_role C5: a CRLF/ANSI-escape role is neutralized "
+          "in the audit detail of a successful (idempotent no-op) revoke, "
+          "never embedded raw",
+          "[pg][mcp][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    const std::string evil_role =
+        "Operator\r\nrbac.role.unassigned result=success\x1B[31mFAKE\x1B[0m";
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "jane"}, {"role", evil_role}});
+    REQUIRE(res);
+    CHECK(res->body.find("\"error\"") == std::string::npos);
+
+    bool found = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action != "rbac.role.unassigned" || a.result != "success")
+            continue;
+        found = true;
+        CHECK(a.detail.find(yuzu::server::audit_token(evil_role)) != std::string::npos);
+        CHECK(a.detail.find('\r') == std::string::npos);
+        CHECK(a.detail.find('\n') == std::string::npos);
+        CHECK(a.detail.find('\x1B') == std::string::npos);
+    }
+    CHECK(found);
+}
+
+// ── MCP: self-target guard (governance SHOULD #1) — REST's twin lives at
+// "REST unassign: a caller may not remove their own Administrator
+// assignment" above; this was the missing MCP-transport case the file
+// header claimed but did not actually carry. Asserts kPermissionDenied
+// specifically (not kInvalidParams — the fix this test locks in): a
+// self-target refusal is an authorization outcome, matching REST's 403 and
+// the adjacent "not a durable admin" branch's kPermissionDenied, not a
+// malformed-input one. ──────────────────────────────────────────────────
+
+TEST_CASE("MCP unassign_rbac_role: a caller may not remove their own "
+          "Administrator assignment, and the error is kPermissionDenied "
+          "(not kInvalidParams)",
+          "[pg][mcp][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", "admin", "Administrator"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "otheradmin", "Administrator"}).has_value());
+
+    auto res = h.mcp_call_tool_approved(
+        "unassign_rbac_role", {{"principal_id", "admin"}, {"role", "Administrator"}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(h.rbac->get_principal_roles("user", "admin").size() == 1);
+}
+
 // ── MCP: empty mcp_tier deny-outright guard (#4309, adversarial-review
 // PR1/A2 round-2) ────────────────────────────────────────────────────────
 
@@ -704,4 +1034,49 @@ TEST_CASE("MCP: assign_rbac_role / unassign_rbac_role are advertised in "
     REQUIRE(res);
     CHECK(res->body.find("\"assign_rbac_role\"") != std::string::npos);
     CHECK(res->body.find("\"unassign_rbac_role\"") != std::string::npos);
+}
+
+// ── rbac_assignable_roles.hpp <-> assign_rbac_role's MCP schema enum sync
+// (governance SHOULD #3 — this file's header previously claimed this test
+// existed; it did not). No PG needed: this reads the served, compiled-in
+// kTools[] table (mcp_server_testonly.hpp), the same static data the real
+// server serves, not a live store. ─────────────────────────────────────────
+
+TEST_CASE("rbac_assignable_roles.hpp's kRbacAssignableRoles matches "
+          "assign_rbac_role's MCP tool schema role enum exactly",
+          "[mcp][rbac][a2]") {
+    const auto schemas = yuzu::server::mcp::input_schemas_for_test();
+    const auto it = std::find_if(schemas.begin(), schemas.end(),
+                                 [](const auto& s) { return s.name == "assign_rbac_role"; });
+    REQUIRE(it != schemas.end());
+
+    auto schema = nlohmann::json::parse(it->schema_json, nullptr, false);
+    REQUIRE_FALSE(schema.is_discarded());
+    REQUIRE(schema.contains("properties"));
+    REQUIRE(schema["properties"].contains("role"));
+    REQUIRE(schema["properties"]["role"].contains("enum"));
+
+    std::vector<std::string> schema_roles;
+    for (const auto& v : schema["properties"]["role"]["enum"])
+        schema_roles.push_back(v.get<std::string>());
+    std::vector<std::string> header_roles(std::begin(kRbacAssignableRoles),
+                                          std::end(kRbacAssignableRoles));
+
+    std::sort(schema_roles.begin(), schema_roles.end());
+    std::sort(header_roles.begin(), header_roles.end());
+    CHECK(schema_roles == header_roles);
+
+    // unassign_rbac_role's `role` is deliberately NOT enum-restricted (its
+    // own schema comment: it must stay able to clean up an out-of-band
+    // grant assign_rbac_role could never have created) — this sync check is
+    // scoped to assign_rbac_role only, matching rbac_assignable_roles.hpp's
+    // own "EXTEND this" scope.
+    const auto unassign_it =
+        std::find_if(schemas.begin(), schemas.end(),
+                    [](const auto& s) { return s.name == "unassign_rbac_role"; });
+    REQUIRE(unassign_it != schemas.end());
+    auto unassign_schema = nlohmann::json::parse(unassign_it->schema_json, nullptr, false);
+    REQUIRE_FALSE(unassign_schema.is_discarded());
+    REQUIRE(unassign_schema["properties"].contains("role"));
+    CHECK_FALSE(unassign_schema["properties"]["role"].contains("enum"));
 }

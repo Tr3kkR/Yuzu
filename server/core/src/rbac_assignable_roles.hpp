@@ -32,14 +32,22 @@
 /// future 8th seeded role does NOT become assignable here by default.
 ///
 /// EXTEND this, never fork it — REST route validation
-/// (`rest_api_v1.cpp`), MCP route validation, AND the MCP tool's `role`
-/// input schema `enum` (mcp_server.cpp's `kTools` entries for
-/// `assign_rbac_role`/`unassign_rbac_role`) must all agree with this ONE
+/// (`rest_api_v1.cpp`) and `assign_rbac_role`'s MCP tool `role` input schema
+/// `enum` (mcp_server.cpp's `kTools` entry) must both agree with this ONE
 /// list. The MCP schema enum is a hand-typed JSON string literal (this
 /// codebase's existing convention for every MCP input schema — there is no
 /// C++-to-JSON-schema generation step anywhere in this file), so it cannot
-/// include this header directly; `test_rbac_role_assignment.cpp` carries a
-/// dedicated test asserting the two stay in sync.
+/// include this header directly; `test_rbac_role_assignment.cpp`'s
+/// "rbac_assignable_roles.hpp's kRbacAssignableRoles matches
+/// assign_rbac_role's MCP tool schema role enum exactly" test asserts the
+/// two stay in sync, by parsing the SERVED schema (mcp_server_testonly.hpp's
+/// `input_schemas_for_test()`), not a second hand-copied literal.
+/// `unassign_rbac_role`'s `role` field is DELIBERATELY unrestricted (its own
+/// schema comment: unassign must stay able to clean up an out-of-band grant
+/// — e.g. ITServiceOwner, or a custom role assigned by direct SQL — that
+/// `assign_rbac_role` could never have created), so this sync guarantee is
+/// scoped to `assign_rbac_role` only; there is no enum on the unassign side
+/// for it to drift from.
 namespace yuzu::server {
 
 inline constexpr std::string_view kRbacAssignableRoles[] = {

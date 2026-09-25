@@ -274,31 +274,41 @@ public:
 
     std::expected<void, std::string> assign_role(const PrincipalRole& pr);
 
-    /// A2 last-Administrator guard (`.claude/plans/rbac-industry-leading-
-    /// DELIVERY-PLAN.md` §2): when `role_name == "Administrator"`, refuses
-    /// (and rolls back) a delete that would leave ZERO `principal_roles` rows
-    /// naming `role_name = 'Administrator'` AND `principal_type = 'user'` —
-    /// deliberately NOT `principal_type IN ('user', 'group')`: matches
-    /// `rbac_admin_predicate.hpp::is_rbac_administrator`'s gate exactly,
-    /// which never resolves a group-held Administrator row either (a
-    /// documented A2 scope exclusion) — counting a gate-invisible group row
-    /// as a "surviving" administrator would be a false sense of safety
-    /// (adversarial-review PR1/A2 finding). The count runs INSIDE the same
-    /// transaction as the delete, under a `FOR UPDATE` row lock on the
-    /// candidate rows, so two concurrent unassigns racing to remove the last
-    /// two Administrator grants serialize instead of both observing "1
-    /// remaining" and both committing. Every other role/principal_type
-    /// combination — including
-    /// both existing engine-only callers (`rest_api_v1.cpp:3232`,
-    /// `mcp_server.cpp:21727`) — is unaffected: a pure idempotent DELETE,
-    /// exactly as before. The refusal's error string always contains
-    /// `kRbacLastAdminRefusalMarker` (below) — callers that need to
-    /// distinguish this business-rule refusal from a genuine store/query
-    /// failure match on that constant rather than inventing their own
-    /// substring.
-    std::expected<void, std::string> unassign_role(const std::string& principal_type,
-                                                   const std::string& principal_id,
-                                                   const std::string& role_name);
+    /// A2 last-Administrator guard: when `role_name == "Administrator"`,
+    /// refuses (and rolls back) a delete that would leave ZERO
+    /// `principal_roles` rows naming `role_name = 'Administrator'` AND
+    /// `principal_type = 'user'` for a genuinely AUTHENTICATABLE
+    /// administrator — deliberately NOT a bare grant-row count. The guard
+    /// JOINs `auth.users` (`u.username = pr.principal_id AND u.is_active`)
+    /// so a pre-provisioned grant on a nonexistent username, or a
+    /// deactivated/(soft-)deleted account, never counts as a "surviving"
+    /// administrator — see the `.cpp` for the full reasoning (this is safe
+    /// only because `RbacStore` and `AuthDB` always share one PgPool in
+    /// production, ADR-0006). Also matches
+    /// `rbac_admin_predicate.hpp::is_rbac_administrator`'s gate exactly on
+    /// the `principal_type` axis — it never resolves a group-held
+    /// Administrator row either (a documented A2 scope exclusion),
+    /// deliberately NOT `principal_type IN ('user', 'group')`. The count
+    /// runs INSIDE the same transaction as the delete, under a
+    /// `FOR UPDATE OF pr` row lock on the candidate `principal_roles` rows
+    /// (never locking `auth.users`), so two concurrent unassigns racing to
+    /// remove the last two Administrator grants serialize instead of both
+    /// observing "1 remaining" and both committing. Every other
+    /// role/principal_type combination — including both existing
+    /// engine-only callers (`rest_api_v1.cpp:3240`, `mcp_server.cpp:21789`)
+    /// — is unaffected: a pure idempotent DELETE, exactly as before. The
+    /// refusal's error string always contains `kRbacLastAdminRefusalMarker`
+    /// (below) — callers that need to distinguish this business-rule
+    /// refusal from a genuine store/query failure match on that constant
+    /// rather than inventing their own substring.
+    ///
+    /// Returns `true` iff a row was actually removed (idempotent — an
+    /// unassign of a role the principal never held returns `false`, not an
+    /// error) — surfaced so a caller's audit trail can distinguish an actual
+    /// revoke from a no-op, rather than auditing both identically.
+    std::expected<bool, std::string> unassign_role(const std::string& principal_type,
+                                                    const std::string& principal_id,
+                                                    const std::string& role_name);
 
     // ── Groups CRUD (minimal — for future AD/Entra) ──────────────────────
     std::vector<RbacGroup> list_groups() const;

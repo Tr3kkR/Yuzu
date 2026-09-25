@@ -1,11 +1,11 @@
 #pragma once
 
+#include <string_view>
+
 #include "rbac_store.hpp"
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
-
-#include <string_view>
 
 /// @file rbac_admin_predicate.hpp
 /// THE gate for "is this caller allowed to author a fleet-wide RBAC role
@@ -163,6 +163,28 @@ enum class RbacAdminGate {
     if (session.username.empty())
         return true;
     return session.username == target_principal;
+}
+
+/// The A2 assign routes' `target_provisioned` answer, as a THREE-state
+/// string ("true" / "false" / "unknown") rather than the two-state bool the
+/// naive `auth_db->get_user(id).has_value()` collapses to (governance
+/// SHOULD #4): a genuine "no such user" (`AuthDBError::UserNotFound`) and a
+/// transient/degraded `AuthDB` read (`is_store_unavailable`, e.g. a
+/// pool-acquire timeout) both read `false` from `has_value()` alone — an
+/// auditor cannot tell "this really is a pre-provisioned grant" from "we
+/// could not check" from that single bit. Returns `"unknown"` for a null
+/// `auth_db` too (nothing to ask). Shared by both transports so the
+/// three-state rule can't drift between them.
+[[nodiscard]] inline std::string_view target_provisioned_state(AuthDB* auth_db,
+                                                                const std::string& principal_id) {
+    if (!auth_db)
+        return "unknown";
+    auto user = auth_db->get_user(principal_id);
+    if (user.has_value())
+        return "true";
+    if (is_store_unavailable(user.error()))
+        return "unknown";
+    return "false"; // UserNotFound / InvalidUsername / etc — genuine absence
 }
 
 } // namespace yuzu::server
