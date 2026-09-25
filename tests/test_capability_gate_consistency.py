@@ -132,21 +132,15 @@ FRAGMENT_FILES = [
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
 # 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
-# 2 (browser_inventory) + 1 (system_hardening) = 217.
-# Both this branch and dev independently bumped this constant to 214 over the
-# same 209 baseline (platform_security's own +2 here, browser_inventory's own
-# +2 there) with neither aware of the other's addition -- merging both means
-# adding both increments on top of the shared base, not picking one side's 214.
-EXPECTED_TOTAL_ROWS = 217
-# 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) = 219.
-# This constant has been bumped independently on both sides of a merge several times
-# (PR #4719 CI is the trail; #4721 tracks deriving it per fragment). The rule is
-# always the same: find the shared baseline both sides agree on and add EVERY side's new
-# plugin on top of it, never pick one side's total. Dev is at 216 here (209 baseline +
-# printing.clear_queue 1 + app_control 2 + platform_security 2 + browser_inventory 2);
-# firmware_posture's 1 row and runtimes' 2 rows (dotnet, jvm) landed independently on the
-# two sides of the merge: 216 + 1 + 2 = 219.
-EXPECTED_TOTAL_ROWS = 219
+# 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) +
+# 1 (system_hardening) = 220. This constant has been bumped independently on
+# several sides of several merges (PR #4719 and PR #4964 CI are the trail; #4721
+# tracks deriving it per fragment). The rule is always the same: find the shared
+# baseline all sides agree on and add EVERY side's new plugin on top of it, never
+# pick one side's total -- and re-derive by RUNNING parse_fragment_gate_rows over
+# FRAGMENT_FILES rather than trusting hand arithmetic, which has drifted before
+# (206, then 203, then repeatedly since).
+EXPECTED_TOTAL_ROWS = 220
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
