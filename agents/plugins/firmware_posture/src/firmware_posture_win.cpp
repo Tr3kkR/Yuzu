@@ -125,9 +125,10 @@ void collect_wmi(FirmwareReport& report) {
 
     if (query.error.has_value()) {
         // Stage-aware, in the pure layer (apply_wmi_error_token): a missing namespace or class
-        // (connect/query stage, or INVALID_CLASS delivered at the first Next) is an explicit absent
-        // row; any other fault is an unreadable row plus a token; a refusal is denied.
-        apply_wmi_error_token(report, *query.error);
+        // (connect/query stage, or INVALID_CLASS delivered at the first Next, i.e. with no row read
+        // before it) is an explicit absent row; any other fault is an unreadable row plus a token;
+        // a refusal is denied.
+        apply_wmi_error_token(report, *query.error, query.rows_before_error);
         return;
     }
     if (query.truncated)

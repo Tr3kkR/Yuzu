@@ -128,25 +128,30 @@ enum class ReadOutcome { ok, absent, denied, failed };
 /// the thing really is missing, and nothing else:
 ///   - WBEM_E_INVALID_NAMESPACE (0x8004100E) from `wmi_connect_failed_*`: the namespace is not
 ///     there (a namespace is resolved at ConnectServer);
-///   - WBEM_E_INVALID_CLASS (0x80041010) from `wmi_query_failed_*` or `wmi_next_failed_*`: the
-///     class is not there. The query runs semisynchronously (FORWARD_ONLY | RETURN_IMMEDIATELY),
-///     so ExecQuery can succeed without resolving the class and the answer then arrives at the
+///   - WBEM_E_INVALID_CLASS (0x80041010) from `wmi_query_failed_*`, or from `wmi_next_failed_*`
+///     when NO row had been returned before the failure (`rows_before_error == 0`): the class is
+///     not there. The query runs semisynchronously (FORWARD_ONLY | RETURN_IMMEDIATELY), so
+///     ExecQuery can succeed without resolving the class and the answer then arrives at the
 ///     first Next(); tests/unit/test_wmi_bounded.cpp records that WQL validation is deferred to
 ///     Next(), and a probe on the rig saw a non-existent class fail at Next with InvalidClass
-///     (issue #4900 tracks a committed real-WMI test).
+///     (issue #4900 tracks a committed real-WMI test). The same answer after a row WAS returned
+///     cannot mean "the class is missing" (the class just answered), so it reads `failed`: the
+///     token carries no iteration index, so the caller passes the count wmi_bounded records.
 /// Every other absence-looking HRESULT is a FAULT and reads `failed`: WBEM_E_NOT_FOUND
 /// (0x80041002) anywhere (Microsoft lists it at connect as a repository-corruption symptom), and
 /// INVALID_NAMESPACE / INVALID_CLASS at a stage that cannot legitimately produce them. The
 /// proxy-blanket stage (CoSetProxyBlanket, after connect and before the query) carries no WBEM
 /// schema answer, so it never reads `absent`. A damaged repository that presents AS one of the two
 /// answers is indistinguishable from a real absence (README caveat 4; decision in #4900).
-[[nodiscard]] inline ReadOutcome classify_wmi_error_token(std::string_view token) noexcept {
+[[nodiscard]] inline ReadOutcome classify_wmi_error_token(std::string_view token,
+                                                          std::size_t rows_before_error = 0) noexcept {
     const auto hr = hresult_from_token(token);
     const ReadOutcome o = hr ? classify_hresult(*hr) : ReadOutcome::failed;
     if (o != ReadOutcome::absent) return o == ReadOutcome::ok ? ReadOutcome::failed : o;
     if (token.starts_with("wmi_connect_failed_") && *hr == 0x8004100Eu) return ReadOutcome::absent;
-    if ((token.starts_with("wmi_query_failed_") || token.starts_with("wmi_next_failed_")) &&
-        *hr == 0x80041010u)
+    if (*hr == 0x80041010u &&
+        (token.starts_with("wmi_query_failed_") ||
+         (token.starts_with("wmi_next_failed_") && rows_before_error == 0)))
         return ReadOutcome::absent;
     return ReadOutcome::failed;
 }
@@ -650,12 +655,13 @@ inline void record_dmi_read_error(FirmwareReport& report, std::vector<std::strin
 }
 
 /// The pure half of the Windows leg's failed WMI query: classifies the wmi_bounded error token
-/// (classify_wmi_error_token) and maps it onto the report. `absent` writes the explicit absent
-/// rows with NO token (a definitive absence is a row, never silence); a refusal or any other
-/// failure writes an `unreadable` vendor row plus `wmi:<token>`, and a refusal sets the denial
-/// flag.
-inline void apply_wmi_error_token(FirmwareReport& report, std::string_view token) {
-    const ReadOutcome o = classify_wmi_error_token(token);
+/// (classify_wmi_error_token, given the rows read before the failure) and maps it onto the report.
+/// `absent` writes the explicit absent rows with NO token (a definitive absence is a row, never
+/// silence); a refusal or any other failure writes an `unreadable` vendor row plus
+/// `wmi:<token>`, and a refusal sets the denial flag.
+inline void apply_wmi_error_token(FirmwareReport& report, std::string_view token,
+                                  std::size_t rows_before_error = 0) {
+    const ReadOutcome o = classify_wmi_error_token(token, rows_before_error);
     if (o == ReadOutcome::absent) {
         report.add_all(wmi_bios_rows({}));
         return;

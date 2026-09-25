@@ -568,6 +568,13 @@ TEST_CASE("classify_wmi_error_token: absent only for the two answers WMI gives w
     CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041010") == ReadOutcome::failed);
     CHECK(classify_wmi_error_token("wmi_query_failed_0x8004100e") == ReadOutcome::failed);
     CHECK(classify_wmi_error_token("wmi_next_failed_0x8004100e") == ReadOutcome::failed);
+    // INVALID_CLASS at Next() after a row was already returned: the class just answered, so this is
+    // a fault, never absence (the token has no iteration index; wmi_bounded records the row count)
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010", 0) == ReadOutcome::absent);
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010", 1) == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010", 512) == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041010", 0) == ReadOutcome::absent);
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041003", 3) == ReadOutcome::denied);
     // the proxy blanket runs before the query and carries no WBEM schema answer
     CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x80041002") == ReadOutcome::failed);
     CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x80041010") == ReadOutcome::failed);
@@ -601,6 +608,15 @@ TEST_CASE("apply_wmi_error_token: absent rows only for a missing namespace or cl
         CHECK_FALSE(rep.constraints.any_failure());
         CHECK_FALSE(rep.denied);
         CHECK(select_verdict(rep.constraints, rep.denied).status == YUZU_RESULT_STATUS_OK);
+    }
+    {   // one row came back, THEN the enumeration failed with INVALID_CLASS: a fault, never absence
+        FirmwareReport rep;
+        apply_wmi_error_token(rep, "wmi_next_failed_0x80041010", 1);
+        REQUIRE(rep.rows.size() == 1);
+        CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|wmi");
+        const auto v = select_verdict(rep.constraints, rep.denied);
+        CHECK(v.status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(v.reason == "wmi:wmi_next_failed_0x80041010");
     }
     {   // a missing namespace at connect: explicit absent rows, OK
         FirmwareReport rep;
