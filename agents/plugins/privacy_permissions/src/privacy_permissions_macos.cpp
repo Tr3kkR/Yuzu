@@ -104,11 +104,18 @@ struct Deadline {
 };
 
 /// sqlite3_errmsg, or a fixed literal when sqlite3 could not even allocate a handle. The text can
-/// echo hostile schema identifiers, so it is cut, scrubbed and escaped before it reaches a token.
+/// echo hostile schema identifiers, so it is cut, scrubbed, stripped of control characters and
+/// line separators (U+2028/2029) and escaped before it reaches a token.
 std::string sqlite_errmsg(sqlite3* db) {
     if (!db) return "no_handle";
-    return yuzu::util::safe_output_field(
-        sanitize_utf8(std::string_view{sqlite3_errmsg(db)}.substr(0, 200)));
+    auto msg = sanitize_utf8(std::string_view{sqlite3_errmsg(db)}.substr(0, 200));
+    for (std::size_t i = 0; i < msg.size(); ++i) {
+        const auto c = static_cast<unsigned char>(msg[i]);
+        if (c < 0x20 || c == 0x7F) msg[i] = ' ';
+        else if (msg.compare(i, 3, "\xE2\x80\xA8") == 0 || msg.compare(i, 3, "\xE2\x80\xA9") == 0)
+            msg.replace(i, 3, " ");
+    }
+    return yuzu::util::safe_output_field(msg);
 }
 
 /// Opens `db_path` (default: the system TCC.db) read-only through an immutable URI (no lock, so no

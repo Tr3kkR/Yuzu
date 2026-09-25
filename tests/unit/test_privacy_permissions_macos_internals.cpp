@@ -382,12 +382,13 @@ TEST_CASE("privacy_permissions macOS: the bounded schema and untrusted-database 
 
     make_db(dir / "msg.db",
             "CREATE VIEW access AS SELECT 'kTCCServiceCamera' AS service, 'c' AS client, 0 AS "
-            "client_type, 2 AS auth_value FROM \"a\nINFO forged log line" +
+            "client_type, 2 AS auth_value FROM \"a\nINFO forged\x1b\xE2\x80\xA8log line" +
                 std::string(50000, 'm') + "\";");
     const auto msg = read_source(dir / "msg.db").rows.at(0).raw;
-    CHECK(msg.rfind("evil:tcc_db:prepare_failed:no such table: main.a INFO forged log", 0) == 0);
+    CHECK(msg.rfind("evil:tcc_db:prepare_failed:no such table: main.a INFO forged  log", 0) == 0);
     CHECK(msg.size() <= std::string_view{"evil:tcc_db:prepare_failed:"}.size() + 200);
-    CHECK(msg.find('\n') == std::string::npos);
+    CHECK(std::none_of(msg.begin(), msg.end(), [](unsigned char c) { return c < 0x20; }));
+    CHECK(msg.find("\xE2\x80\xA8") == std::string::npos); // ESC and U+2028 fold to spaces too
 }
 
 TEST_CASE("privacy_permissions macOS: one source keeps at most kMaxSourceBytes of client text; "

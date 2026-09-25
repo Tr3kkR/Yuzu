@@ -653,7 +653,7 @@ TEST_CASE("macos: the documented bounds and the tokens a bound produces",
     CHECK(macos::kMaxValueBytes == 1024);
     CHECK(macos::kMaxRowsPerService == 1024);
     CHECK(macos::kMaxSourceBytes == 1024u * 1024u);
-    CHECK(macos::kMaxDbBytes == 16LL * 1024 * 1024);
+    CHECK(macos::kMaxDbBytes == 4LL * 1024 * 1024);
     CHECK(macos::kSourceBudget == std::chrono::milliseconds{500});
     CHECK(macos::kRunBudget == std::chrono::seconds{10});
     CHECK(macos::kCutRowCap == "row_cap");

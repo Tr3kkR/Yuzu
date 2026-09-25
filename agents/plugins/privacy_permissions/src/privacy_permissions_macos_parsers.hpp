@@ -140,7 +140,7 @@ inline constexpr std::size_t kMaxRowsPerService = 1024; // real max: 6
 inline constexpr int kMaxSchemaBytes = 64 * 1024; // schema text and any SQL, until the schema loads
 inline constexpr int kMaxValueBytes = 1024;       // after it: real max client 112 B
 inline constexpr std::size_t kMaxSourceBytes = 1024 * 1024; // retained client text per source
-inline constexpr std::int64_t kMaxDbBytes = 16LL << 20;
+inline constexpr std::int64_t kMaxDbBytes = 4LL << 20;
 inline constexpr std::chrono::milliseconds kRunBudget{10'000};
 inline constexpr std::chrono::milliseconds kSourceBudget{500};
 
