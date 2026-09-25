@@ -524,6 +524,21 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   `yuzu_pg_acquire_wait_seconds` histogram. Pool live-probe + every store's `is_open()` join
   the `/readyz` conjunction. Chaos coverage: CH-9/10/11 (pool exhaustion, PG down at boot,
   PG lost at runtime).
+- **`is_open()` is BOOT STATE — recorded decision (#3061, HA WS-8)**: a store latches `open_`
+  at the end of its constructor and never clears it, and construction failure is already
+  fail-closed (`startup_failed_`). So a store's `/readyz` row reports whether it opened and
+  migrated at boot, nothing more — do not describe it as catching a "runtime `is_open()`
+  flip", and do not add a per-store runtime probe. RUNTIME reachability is ONE shared
+  signal: `/readyz`'s `pg_reachable` row, fed by `PgReachabilityProbe`
+  (`server/core/src/pg_reachability_probe.hpp`) on its own dedicated connection. Per-store
+  runtime degradation (a revoked grant, a dropped table) is deliberately out of scope for
+  `/readyz`: every replica shares the database, so evicting one fixes nothing — it surfaces
+  as the store's own request-path 503s (or, for a store that fails open, its degraded answers)
+  and, where the store emits one, its `*_read_degrade_total` counter; several existing stores
+  (e.g. `deployment_store`, `result_set_store`, `notification_store`) have no
+  such counter, so only the HTTP 5xx rate shows it. A NEW store adds its `/readyz` (and
+  `/health`) row for boot-state parity AND a `*_read_degrade_total{reason}` counter, so this
+  decision holds for it.
 - **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
   refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
   serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match

@@ -112,6 +112,7 @@
 
 #include "guard_win_handle.hpp" // detail::DirHandle, detail::EventHandle
 #include "spark_detached_call.hpp"
+#include <yuzu/log_token.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -1492,7 +1493,7 @@ private:
         mark_coverage_locked(w, SparkCoverage::None);
         spdlog::warn("spark_file: establishing '{}' failed ({}, err={}) - watch is deaf until the "
                      "retry",
-                     fs::path(w.dir).string(), reason, err);
+                     ::yuzu::log_key_token(fs::path(w.dir).string()), reason, err);
     }
 
     /// Genuine backend failure with a dispatch pass behind it: the
@@ -1976,7 +1977,7 @@ private:
                 resolve_log_fail_hook_(w.dir); // test seam: may throw to model the log
                                                // call's own allocation failing
             spdlog::warn("spark_file: probe for '{}' failed at {} (err={})",
-                         fs::path(w.dir).string(), stage_for_log, err);
+                         ::yuzu::log_key_token(fs::path(w.dir).string()), stage_for_log, err);
         }
     }
 
@@ -2624,7 +2625,7 @@ private:
                         try {
                             spdlog::warn("spark_file: an establishment report for '{}' was "
                                          "dropped (sink threw); further drops are not logged",
-                                         e.key);
+                                         ::yuzu::log_key_token(e.key));
                         } catch (...) {
                         }
                     }
@@ -2787,7 +2788,7 @@ private:
                 try {
                     spdlog::warn("spark_file: synthetic fire for '{}' threw on submit (attempt "
                                  "{}) - retrying",
-                                 fs::path(w.dir).string(), w.resync_attempts);
+                                 ::yuzu::log_key_token(fs::path(w.dir).string()), w.resync_attempts);
                 } catch (...) {
                     // Diagnostic only — every state write above already
                     // landed; losing this log line must never abort the
