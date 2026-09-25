@@ -184,6 +184,87 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## ⚠️ Breaking: a multi-host `--postgres-dsn` now needs `target_session_attrs=read-write`, and `load_balance_hosts` is refused (HA WS-8)
+
+Affects you only if the server's Postgres connection names **more than one host** — `host=n1,n2,n3`,
+`postgresql://n1,n2/yuzu`, a `PGHOST`/`PGHOSTADDR` list in the server's environment, or a host list in
+the `pg_service.conf` entry a `service=` DSN or `PGSERVICE` names — or sets `load_balance_hosts` (in
+the DSN, `PGLOADBALANCEHOSTS` or that service entry). A single host without `load_balance_hosts`,
+including a proxy or managed endpoint (RDS, Azure Flexible Server, Cloud SQL, the shipped HAProxy
+compose), is unaffected.
+
+Check before upgrading — look for a host list or load balancing in the DSN and the server's environment:
+
+```bash
+grep -rnE 'YUZU_POSTGRES_DSN|postgres-dsn|PGHOST|PGHOSTADDR|PGLOADBALANCEHOSTS|PGSERVICE' \
+  /etc/yuzu/ /etc/systemd/system/yuzu-server.service* <your compose/env files> 2>/dev/null
+```
+
+If that shows `service=` or `PGSERVICE`, also read the named entry in the service file libpq uses
+(`PGSERVICEFILE`, else `~/.pg_service.conf` of the server's user, else `pg_service.conf` in
+`PGSYSCONFDIR`) for `host`, `hostaddr`, `load_balance_hosts` and `target_session_attrs`.
+
+- **No `target_session_attrs` set:** the server adds `target_session_attrs=read-write` and logs a
+  warning at startup (`... using target_session_attrs=read-write ...`). It will no longer connect to a
+  standby, which it previously could do silently whenever a standby was listed first. The DSN is
+  rebuilt from libpq's own parse — the same settings in keyword form — and checked option by option
+  before use. Set the attribute yourself to silence the warning.
+- **`read-write` or `primary`:** unchanged.
+- **Any other value** (`any`, `read-only`, `standby`, `prefer-standby`, or an unrecognised one): **the
+  server refuses to start** with `Invalid --postgres-dsn: ...`. Change it to `read-write` (or remove it)
+  before upgrading.
+- **`load_balance_hosts` set to anything but `disable`** (in the DSN or `PGLOADBALANCEHOSTS`), with any
+  number of hosts: **the server refuses to start**. Remove it (or set `disable`) before upgrading. The
+  server writes to one primary, so with read-write the shuffle balances nothing — and `/readyz` holds
+  one connection, so it cannot see a host that fails only some of the pool's shuffled connections.
+- **A `service=` entry or `PGSERVICE`:** libpq applies the service file only when it connects, so
+  the server checks what libpq resolved on its first Postgres connection at startup, and refuses to
+  start (`Invalid Postgres connection settings: ...`) if the resolved settings set
+  `load_balance_hosts`, or list several hosts without `target_session_attrs=read-write` (or
+  `primary`) — it cannot add the attribute to a service file, so set it there yourself. The readiness
+  probe repeats the check each time it opens a connection, but it keeps a healthy one open, so a
+  later edit that breaks these rules shows on `/readyz` only at its next reconnect — **restart the
+  server after editing the service file**.
+- **Not checked — set `target_session_attrs=read-write` yourself:** one host *name* that resolves to
+  several servers (DNS round-robin, a Kubernetes headless service).
+
+## Behaviour change: `/readyz` now goes red when Postgres is unreachable, and shutdown can hold for a drain grace (HA WS-8, ADR-2002 §12)
+
+`/readyz` gains a gating `pg_reachable` row, fed by a small probe on its own Postgres connection. Before
+this change, `/readyz` stayed **200** through a Postgres outage whenever the server had idle pooled
+connections or no traffic (the pool's connect breaker only notices a failed *new* connection, and every
+store's row only reports whether it opened at startup). A load balancer health-checking `/readyz` kept
+sending traffic to a server that could not serve it.
+
+What you may observe after upgrading:
+
+- **`/readyz` answers 503 during a database outage or failover**, with `"failed_stores":["pg_reachable"]`
+  and a `"pg"` reason (`unreachable`, `stale`, `read_only`, `not_yet_probed`). During a Postgres failover
+  every replica goes red at once, for roughly the failover time. If an orchestrator's **liveness** probe
+  points at `/readyz`, move it to `/livez` before upgrading — otherwise a database blip restarts every
+  server.
+- **One more Postgres connection per server** (the probe). Budget `N_servers × 2` connections beyond the
+  pool against `max_connections` (the other extra one is the leader-election connection).
+- **A new alert, `YuzuServerPostgresUnreachable`**, and three `yuzu_server_pg_reachab*` metrics — see
+  `docs/user-manual/metrics.md`.
+- **New flag `--shutdown-drain-seconds`** (`YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, max 60). On
+  `SIGTERM` the server keeps serving for at least that long after `/readyz` turns `503 draining`, so a load
+  balancer stops routing to it before the listener closes. The default 0 keeps today's shutdown timing;
+  set it for any deployment behind a load balancer, **and raise your orchestrator's stop timeout by the
+  same amount** (guidance in `docs/user-manual/server-admin.md`, "Load balancers and shutdown drain"). The
+  execution-drain wait it sits alongside is now timed in wall-clock seconds (at most 30 s) rather than
+  counted as 30 polls.
+- **`/readyz` also goes red on a primary that refuses writes** (`default_transaction_read_only` on — some
+  managed Postgres services do this when storage fills), reported as `"pg":"read_only"`.
+- **Multi-host `--postgres-dsn` now requires `target_session_attrs=read-write`** — a breaking change
+  with its own section above.
+- **Docker healthchecks.** The demo and viz-UAT composes healthcheck `/readyz`; that is right for
+  readiness, but under Docker Swarm or an auto-heal sidecar an outage longer than the healthcheck's
+  retry window marks the container unhealthy and restarts it. Point restart-driving checks at `/livez`.
+
+**What to do:** point liveness probes at `/livez`, readiness at `/readyz`; check your Postgres
+`max_connections` headroom; set `--shutdown-drain-seconds` if a load balancer fronts the server.
+
 ## Behaviour change: legacy `/api/executions*` routes are now management-group confined (#3789)
 
 The legacy pre-v1 `GET /api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`,
@@ -238,7 +319,9 @@ section has the per-route reference including the `503` shape and the `rerun` es
 `tar.rollup`, `filesystem.delete_lines`, `registry.delete_value`, `registry.delete_key`,
 `storage.clear`, `content_dist.stage`, `content_dist.execute_staged`, `content_dist.cleanup`,
 `content_dist.upload_file`, `tags.clear`, `script_exec.exec`, `script_exec.powershell`,
-`script_exec.bash`, `http_client.download`, `certificates.delete`, and `quarantine.quarantine`.
+`script_exec.bash`, `http_client.download`, `certificates.delete`, and `quarantine.quarantine`
+(19 as of this writing — `power_health.set_power_plan` and `printing.clear_queue` have since joined
+them, under the same rule).
 Dispatching any of them without explicit, non-empty `agent_ids` — an omitted/empty target, or a
 `scope` (including `"__all__"`, even alongside `agent_ids`) — is now refused with `400`
 (`"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are
@@ -1627,7 +1710,8 @@ a rollback is genuinely needed.
 - **Shutdown grace bounds now stack; raise your orchestrator's termination
   grace period, but understand what that does and does not buy you.** A
   graceful `SIGTERM` walks several independently-bounded waits — up to 30 s
-  draining in-flight executions, up to 5 s on the gRPC shutdown deadline
+  draining in-flight executions (plus any `--shutdown-drain-seconds` grace, HA WS-8, which runs
+  before everything listed here and adds to it — raise your stop timeout by the same amount), up to 5 s on the gRPC shutdown deadline
   (moved up by #3495 to run earlier in the sequence, ahead of the four
   joins below and several other quick housekeeping joins not separately
   listed here, though still after the execution drain — see below),
@@ -2784,6 +2868,60 @@ matching correctly treats as "must re-request" rather than a corruption state.
 There is no flag to disable the new gate. An admin caller, or a caller dispatching via the
 governed path with a redeemed approval ticket, is not subject to it.
 
+## Behaviour change: a `rule_id` outside the documented charset is now rejected at creation (#4665)
+
+`POST /api/v1/guaranteed-state/rules` and MCP `create_guardian_rule` now enforce the documented
+`rule_id` charset (`[A-Za-z0-9._-]+`, at most 256 bytes) at creation — a request whose `rule_id`
+violates it now gets `400` (REST) or an error (MCP), audited as `guaranteed_state.rule.create`
+`denied`, instead of being accepted on any non-empty string. This closes an operator-authored
+log-injection exposure (#4665): log lines across the Guardian/Spark subsystem now also neutralise
+a rule id or Spark key before printing it, but a `rule_id` that never conformed to the documented
+shape (a space, a newline, or any other disallowed byte) could previously still be created.
+
+**Who this affects:** almost nobody — the charset was already documented before this release, just
+not enforced, so create requests generated by the dashboard, the REST/MCP tooling, or any client
+following the documented contract are unaffected. This only changes behaviour for a caller that was
+relying on the previously-permissive accept-anything-non-empty behaviour to create a `rule_id`
+outside `[A-Za-z0-9._-]+` or longer than 256 bytes.
+
+**What to do — this is a hard cutover, not a migration, by deliberate decision:** enforcement at
+the server is create-only, so an existing rule whose `rule_id` predates this release and doesn't
+conform to the charset is never torn down *by the creation check itself*. But the server-side push
+builder now **excludes** any such row from every push it builds (logged at `error` with a sampled
+rate limit as `Guardian push: rule ... has a rule_id that fails the .../256-byte charset check
+(#4665) — excluding it from this push`, and counted in
+`yuzu_guardian_push_rule_excluded_total{reason="invalid_rule_id"}`), the same way an over-depth
+`spec_json` is already excluded — and the agent's `full_sync` path unconditionally tears down and
+rebuilds its ENTIRE active rule set from whatever the push actually contains. Put together: **the
+first `full_sync` an upgraded agent receives permanently disarms every rule with a non-conforming
+`rule_id`** (logged at `warn` on the agent, matching `full_sync is disarming N rule(s) with a
+rule_id outside the [A-Za-z0-9._-]+/256-byte charset (#4665) -- hard cutover, not preserved`). This
+is not silent — the server-side exclusion is both logged AND metered
+(`yuzu_guardian_push_rule_excluded_total`); the agent-side disarm is logged only, with no metric of
+its own yet — but it IS a real, one-time loss of a previously-enforcing control if you don't act
+first. Every OTHER rule in scope is unaffected either way — this only ever touches rows that were
+already unenforceable by the documented contract.
+
+**Finding a non-conforming legacy `rule_id` — do this BEFORE upgrading, not after:** `GET
+/api/v1/guaranteed-state/rules` returns every rule regardless of its `rule_id`'s shape; filter the
+response for any `rule_id` that doesn't match `^[A-Za-z0-9._-]{1,256}$` — that's the same predicate
+the server now enforces at creation. For each one you find, either delete it (see below) and
+recreate it under a conforming `rule_id`, or accept the loss consciously — there is no third option
+that preserves it under its existing id.
+
+**Removing a non-conforming `rule_id`:** the two delete surfaces have DIFFERENT restrictions, not
+a simple REST-restricted/MCP-unrestricted split. REST `DELETE
+/guaranteed-state/rules/{rule_id}` routes on the same charset regex the create path now enforces
+(`[A-Za-z0-9._-]+`, no length bound), so it **can't** reach a `rule_id` containing a byte outside
+that charset, but it has no length cap of its own and so **can** reach one that's charset-clean but
+over 256 bytes (a shape only possible pre-#4665, when creation had no length bound either). MCP
+`delete_guardian_rule`'s own input schema caps at `maxLength: 256` with no charset `pattern`, so it
+has the exact opposite gap: it **can** reach a charset-violating id (any length up to 256), but
+**can't** reach one that's charset-clean and over 256 bytes — the request is rejected by schema
+validation before the handler's own logic ever runs. A `rule_id` that violates BOTH (wrong charset
+AND over-length) is reachable by neither REST nor MCP; fall back to a direct database delete
+(`guaranteed_state_store.guaranteed_state_rules`) for that case.
+
 ## Upgrade Order
 
 Always upgrade in this order:
@@ -2798,10 +2936,11 @@ Never upgrade agents before the server -- the server must understand the agent's
 
 Before upgrading any component:
 
-- [ ] Back up all data (see [Server Administration](server-administration.md))
-  - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
-  - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
-  - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
+- [ ] Back up all data (see [Server Administration](server-admin.md))
+  - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`, `auto-approve.cfg`
+  - The NVD cache `nvd_cves.db` in `--data-dir` (the one remaining server SQLite store) — use `sqlite3 <path> ".backup ..."` rather than `cp` against a live database
+  - The blob directories `agent-updates/` (or your `--update-dir`) and `upload-blobs/` in `--data-dir` — the database holds only the OTA-package and completed-upload records that point into them, so a restored dump without these directories leaves records with no files
+  - The **PostgreSQL database** (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) **and the whole `--ca-dir`**, taken at the same point in time — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
 - [ ] **Verify the server's clock before upgrading** (`timedatectl status` or
   `chronyc tracking`; under Docker it is the host's clock that matters). Rows
   already stamped cannot be protected retroactively by any setting, and a server

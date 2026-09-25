@@ -51,6 +51,7 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -297,12 +298,12 @@ std::optional<std::string> guardian_seed_baseline(KvStore& kv, const std::string
     case BaselineReadOutcome::ReadError:
         spdlog::error("Guardian: baseline lookup for rule '{}' failed (KV read error) - "
                      "arming as if no baseline is on record",
-                     rule_id);
+                     log_id_token(rule_id));
         return std::nullopt;
     case BaselineReadOutcome::Malformed:
         spdlog::error("Guardian: baseline record for rule '{}' is malformed (bad JSON or hash) "
                      "- discarding and arming as if no baseline is on record",
-                     rule_id);
+                     log_id_token(rule_id));
         return std::nullopt;
     case BaselineReadOutcome::Ok:
         break;
@@ -354,7 +355,7 @@ void guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
                         "fresh capture for the SAME target - a capture attempt only reaches "
                         "here for an already-baselined target via a failed seed lookup "
                         "(adversarial-review K1/C2-1); keeping the existing record",
-                        rule_id);
+                        log_id_token(rule_id));
             return;
         }
         break; // different fingerprint - a genuine retarget, write below
@@ -365,7 +366,7 @@ void guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
         spdlog::warn("Guardian: could not re-check rule '{}''s persisted baseline before "
                     "writing (KV read error) - writing the fresh capture anyway rather than "
                     "risk wedging the rule out of ever getting a persisted baseline",
-                    rule_id);
+                    log_id_token(rule_id));
         break;
     }
     nlohmann::json j;
@@ -376,7 +377,7 @@ void guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
         spdlog::error("Guardian: failed to persist captured baseline for rule '{}' - a later "
                      "full_sync or restart will re-capture current content instead of this "
                      "one (#4021)",
-                     rule_id);
+                     log_id_token(rule_id));
     }
 }
 
@@ -805,7 +806,8 @@ std::expected<void, std::string> GuardianEngine::start_local() {
             // exists to prevent. Degrade further on a secondary failure rather than risk that.
             try {
                 const std::string degrade_msg =
-                    "Guardian: rule '" + rule.rule_id() + "' failed to re-arm (" + e.what() +
+                    "Guardian: rule '" + log_id_token(rule.rule_id()) + "' failed to re-arm (" +
+                    e.what() +
                     ") - NOT enforcing this rule; agent continues with the remaining rules";
                 spdlog::error("{}", degrade_msg);
                 last_rearm_degrade_message_for_test_ = degrade_msg;
@@ -1284,6 +1286,34 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     if (!kv_)
         return std::unexpected("kv store unavailable");
 
+    // #4665: reject the WHOLE push on ANY invalid rule_id, before touching
+    // anything else - including the full_sync teardown below AND
+    // ack_ledger_->begin_application()'s own bookkeeping mutation further
+    // down. A full_sync push that tore down every existing guard, then
+    // skipped just the one rule with a bad id while arming the rest, would
+    // still advance policy_generation_ to the pushed value - silently
+    // dropping that rule's enforcement while reporting the agent as
+    // caught-up on the generation. Pure read-only scan over push.rules() -
+    // no reconcile_rule_locked call, no guard/spark state touched, and (by
+    // running before begin_application()) no ack-ledger application exists
+    // yet for this push to disturb, so a PRIOR push's still-pending
+    // application is left completely untouched by this push's rejection.
+    // Same rationale as the UP-1 comment on begin_application()'s own
+    // allocation firewall below: nothing has been reconciled or staged yet
+    // at this point, so returning std::unexpected here is a clean,
+    // side-effect-free abort - ack_ledger_->latch_failure() is deliberately
+    // NOT called (unlike put_rule_locked's failure path further down): it is
+    // a no-op with no current application (its own doc comment), and there
+    // is no current application until begin_application() runs, below this
+    // check.
+    for (const auto& rule : push.rules()) {
+        if (!is_valid_rule_id(rule.rule_id())) {
+            return std::unexpected(
+                "rejecting push: rule '" + log_id_token(rule.rule_id()) + "' (name='" +
+                log_key_token(rule.name()) + "') has an invalid or missing rule_id");
+        }
+    }
+
     // rung 9c PR-2 Unit 6 (§R5.3 duplicate-retry suppression): the server's 25s
     // full_sync heartbeat retry re-sends an identical push while episodes from the
     // PRIOR call are still genuinely pending - without this, every such retry would
@@ -1406,8 +1436,36 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         } else {
             std::vector<std::string> rule_keys;
             rule_keys.reserve(rule_key_rows->size());
-            for (auto& row : *rule_key_rows)
+            // #4665 governance-external-review finding (fjarvis, PR #4979): a rule_id
+            // that predates #4665's create-time charset/length enforcement can still
+            // sit in KV, and guardian_push_builder.cpp's server-side filter now
+            // excludes such a row from EVERY push it builds -- so it can never again
+            // appear in push.rules() to be re-persisted below. This IS a hard cutover,
+            // by deliberate operator decision (not a migration): the row is cleared
+            // here like any other, and its guard is torn down two blocks below like
+            // every other guard, with no attempt to preserve or re-arm it. Counted
+            // and logged SEPARATELY, at WARN, specifically because it is real,
+            // irreversible loss of a previously-enforcing control, not routine
+            // teardown-and-rebuild noise -- docs/user-manual/upgrading.md's pre-upgrade
+            // detection query exists precisely so an operator finds and fixes these
+            // BEFORE hitting this line for real. See that doc for the operational
+            // contract; do not reintroduce a "frozen"/preserved code path here.
+            std::size_t non_conforming = 0;
+            for (auto& row : *rule_key_rows) {
+                const std::string_view key_view = row.key;
+                const std::string_view rid = key_view.size() > kRulePrefix.size()
+                                                  ? key_view.substr(kRulePrefix.size())
+                                                  : std::string_view{};
+                if (!is_valid_rule_id(rid))
+                    ++non_conforming;
                 rule_keys.push_back(std::move(row.key));
+            }
+            if (non_conforming > 0)
+                spdlog::warn("Guardian: full_sync is disarming {} rule(s) with a rule_id "
+                             "outside the [A-Za-z0-9._-]+/256-byte charset (#4665) -- "
+                             "hard cutover, not preserved; see docs/user-manual/"
+                             "upgrading.md for the pre-upgrade detection query",
+                             non_conforming);
             if (!rule_keys.empty()) {
                 const int cleared = kv_->del_keys(kKvNamespace, rule_keys);
                 if (static_cast<std::size_t>(cleared) == rule_keys.size()) {
@@ -1471,10 +1529,13 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     }
 
     for (const auto& rule : push.rules()) {
-        if (rule.rule_id().empty()) {
-            spdlog::warn("Guardian: skipping rule with empty rule_id (name={})", rule.name());
-            continue;
-        }
+        // #4665: an empty rule_id is one shape of an invalid rule_id, already
+        // rejected for the WHOLE push by the pre-validation scan at the top of
+        // this function (is_valid_rule_id() returns false on empty) - every
+        // rule reaching this loop already has a non-empty, charset-valid id,
+        // so the per-rule skip-and-continue this comment used to sit above is
+        // unreachable and has been removed rather than kept as dead defensive
+        // code.
         if (push.full_sync())
             full_sync_ids.insert(rule.rule_id()); // F7
         if (!put_rule_locked(rule)) {
@@ -1499,7 +1560,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
             try {
                 spdlog::error("Guardian: reconcile threw for rule '{}' - persisted but not armed",
-                              rule.rule_id());
+                              log_id_token(rule.rule_id()));
             } catch (...) {
             }
             continue; // not counted as applied
@@ -2098,7 +2159,7 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                 clamped != fcfg.max_hash_bytes) {
                 spdlog::warn("Guardian: rule '{}' authored max_bytes={} exceeds the {}-byte "
                             "ceiling - clamped (#2233 item 6)",
-                            fcfg.rule_id, fcfg.max_hash_bytes, kMaxFileHashBytes);
+                            log_id_token(fcfg.rule_id), fcfg.max_hash_bytes, kMaxFileHashBytes);
                 fcfg.max_hash_bytes = clamped;
             }
             fcfg.settle_ms = aparam_u64("settle_ms", fcfg.settle_ms);
@@ -2168,12 +2229,12 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
         auto fguard = std::make_unique<FileGuard>(std::move(fcfg), std::move(file_sink));
         if (fguard->start()) {
             guards_.emplace(rule.rule_id(), std::move(fguard));
-            spdlog::info("Guardian: file guard armed for rule '{}' (path={}, {})", rule.rule_id(),
-                         log_path, log_mode);
+            spdlog::info("Guardian: file guard armed for rule '{}' (path={}, {})",
+                         log_id_token(rule.rule_id()), log_key_token(log_path), log_mode);
             return true;
         }
         spdlog::warn("Guardian: file guard for rule '{}' did not start (non-Windows or empty path)",
-                     rule.rule_id());
+                     log_id_token(rule.rule_id()));
         return false;
     }
 
@@ -2225,13 +2286,13 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                 mode = "enforce (observe-only on Linux)";
 #endif
             spdlog::info("Guardian: service guard armed for rule '{}' (service={}, expect={}, mode={})",
-                         rule.rule_id(), log_service,
+                         log_id_token(rule.rule_id()), log_key_token(log_service),
                          desired == ServiceGuard::Desired::Running ? "running" : "stopped", mode);
             return true;
         }
         spdlog::warn("Guardian: service guard for rule '{}' did not start "
                      "(unsupported platform / no service-control backend / invalid service name)",
-                     rule.rule_id());
+                     log_id_token(rule.rule_id()));
         return false;
     }
 
@@ -2279,13 +2340,13 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     auto guard = std::make_unique<RegistryGuard>(std::move(cfg), std::move(guard_sink));
     if (guard->start()) {
         guards_.emplace(rule.rule_id(), std::move(guard));
-        spdlog::info("Guardian: registry guard armed for rule '{}' (mode={})", rule.rule_id(),
-                     enforce ? "enforce" : "audit");
+        spdlog::info("Guardian: registry guard armed for rule '{}' (mode={})",
+                     log_id_token(rule.rule_id()), enforce ? "enforce" : "audit");
         return true;
     }
     spdlog::warn("Guardian: registry guard for rule '{}' did not start "
                  "(non-Windows or invalid hive)",
-                 rule.rule_id());
+                 log_id_token(rule.rule_id()));
     return false;
 }
 
@@ -2317,11 +2378,22 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         // withdrawal here means an operator sees a rule stop being enforced
         // (e.g. on the next restart re-arm pass) with nothing in the log to
         // explain why (sre Gate 6 finding, this PR).
+        // #4665 governance-external-review finding (fjarvis, PR #4979): assertion.error()
+        // and the spec-derivation fallback string below can BOTH embed operator-authored
+        // free text raw (rule.spark().type() here; rule_assertion_from_rule's own
+        // "unrecognized {spark,file,service,registry} {assertion} type: <atype>" error
+        // strings in guardian_spark_bridge.hpp embed rule.spark().type()/the assertion's
+        // own type() the same way) -- all four producer sites feed this ONE consumer, so
+        // wrapping the WHOLE resulting message here, at the sink, covers every current AND
+        // future producer in one place rather than chasing each one individually (exactly
+        // the whack-a-mole this same function's rule_id handling already needed one prior
+        // fix round for).
         spdlog::warn("Guardian: rule '{}' failed spark validation ({}) - withdrawing from "
                      "both detection paths",
-                     rule.rule_id(),
-                     !assertion ? assertion.error() : "spec derivation failed for spark type '" +
-                                                           rule.spark().type() + "'");
+                     log_id_token(rule.rule_id()),
+                     log_key_token(!assertion ? assertion.error()
+                                              : "spec derivation failed for spark type '" +
+                                                    rule.spark().type() + "'"));
         if (spark_runtime_)
             spark_runtime_->detach_rule(rule.rule_id());
         withdraw_legacy_guard_locked(rule.rule_id());
@@ -2388,8 +2460,8 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
                 // decision point). A rule that resolves ASYNCHRONOUSLY to a non-Committed
                 // status is a DIFFERENT outcome (Accepted below); its own failure is logged
                 // by ack_ledger_'s drain, not here.
-                spdlog::warn("Guardian: spark arm failed for rule '{}': {}", rule.rule_id(),
-                             res.error().message);
+                spdlog::warn("Guardian: spark arm failed for rule '{}': {}",
+                             log_id_token(rule.rule_id()), res.error().message);
                 // rung 9c PR-5c round 2 (#4221, UP-1 residual): the old comment here
                 // read "defensive; attach_rule leaves nothing on failure" - true for
                 // every OTHER Failed path, but FALSE for exactly the case UP-1's own
@@ -2466,7 +2538,7 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
                 spdlog::info("Guardian: rule '{}' classified unsupported ({} has no "
                              "mechanism on this host) - enforced by neither backend, "
                              "a routine cross-platform gap, not an error",
-                             rule.rule_id(), rule.spark().type());
+                             log_id_token(rule.rule_id()), rule.spark().type());
         }
         return ReconcileOutcome::Inert; // pinned: "an all-unsupported push still advances
                                         // policy_generation" (test_guardian_engine_spark_reconcile.cpp)

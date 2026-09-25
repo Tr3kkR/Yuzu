@@ -212,6 +212,26 @@ point, and only one of them wants everything. Refusals are counted as
 `yuzu_server_dispatch_target_rejected_total{route="result_set_parent"}` and audited as
 `result_set.create|denied`.
 
+**The generic `POST /api/v1/result-sets` route and MCP `create_result_set` apply the same
+malformed/empty-`parent_id` refusal (#4307) but are NOT dispatch surfaces** — unlike the three
+async producers above, they never call `command_dispatch_fn`, so their `RESULT_SET_BAD_PARENT`
+refusals are audited as `result_set.create|denied` but deliberately do **not** increment
+`yuzu_server_dispatch_target_rejected_total`; that metric family is reserved for the
+dispatch-targeting routes. Do not mistake the absent counter on these two call sites for a
+regression of the alerting coverage the metric otherwise provides.
+
+**`parent_id` is additionally length-capped at 64 bytes (#4734, `kResultSetParentIdMaxLen`)**
+on all five create surfaces (the generic route, all three async producers, and
+`from-inventory-query`) before the value can reach the persisted `scope_input_id` lineage
+marker. Because `parent_id` also accepts a per-operator alias (a result-set `name`, valid up to
+256 bytes) on the three async producers, a real alias longer than 64 bytes that previously
+resolved successfully is now refused before resolution is attempted — reference the set by its
+canonical `rs_...` id instead. A length-cap refusal is audited
+(`result_set.create|denied`, `reason=parent_id_too_long`) but never counted on
+`yuzu_server_dispatch_target_rejected_total`, on any of the five surfaces — see section 9's
+audit-detail catalog. See the `vNEXT` breaking-change note in
+`docs/user-manual/server-admin.md` for the full operator-facing account.
+
 **`{id}/re-eval` is refused, never broadcast, when the original's recorded parent no longer
 exists (#4306).** `re-eval` synthesises the sibling's dispatch scope from the LIVE, nullable
 `parent_id` FK column on the original — `parent_id TEXT REFERENCES result_sets(id) ON DELETE SET
@@ -331,7 +351,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 
 | Action | Result | Notes |
 |---|---|---|
-| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind (plus `execution_id` and the dispatched-agent count on the async producers); parent_id and device_count are not yet recorded (#4088). `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`; also `denied` on `{id}/re-eval` when the original's live parent is gone but its persisted `scope_input_id` shows it was narrowed at creation (#4306), with `detail=reason=parent_gone source_kind=<orig source_kind> scope_input_id=<stale value>`, target_id=`<original id>` (`scope_input_id` added in the #4306 governance follow-up, run through `audit_token()`/`log_token` neutralisation like every other caller-influenced audit-detail token in this file, so the erased target is still forensically identifiable after the originating row TTL-expires when it is a canonical `rs_` id; when it is an ALIAS rather than a canonical id, the recorded string is only the caller's typed reference at creation time -- `resolve_alias`'s newest-wins lookup means the same alias may since be re-bound to a different set, so it must never be re-resolved later to mean "the erased target," only read as "what the caller typed"). `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
+| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind (plus `execution_id` and the dispatched-agent count on the async producers); parent_id and device_count are not yet recorded (#4088). `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`, or when it exceeds 64 bytes (#4734), with `detail=reason=parent_id_too_long[ source_kind=<src_kind>]` -- audited on all five create surfaces but, unlike the shape-check refusal just named, never counted on `yuzu_server_dispatch_target_rejected_total`; also `denied` on `{id}/re-eval` when the original's live parent is gone but its persisted `scope_input_id` shows it was narrowed at creation (#4306), with `detail=reason=parent_gone source_kind=<orig source_kind> scope_input_id=<stale value>`, target_id=`<original id>` (`scope_input_id` added in the #4306 governance follow-up, run through `audit_token()`/`log_token` neutralisation like every other caller-influenced audit-detail token in this file, so the erased target is still forensically identifiable after the originating row TTL-expires when it is a canonical `rs_` id; when it is an ALIAS rather than a canonical id, the recorded string is only the caller's typed reference at creation time -- `resolve_alias`'s newest-wins lookup means the same alias may since be re-bound to a different set, so it must never be re-resolved later to mean "the erased target," only read as "what the caller typed"). `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
 | `result_set.live_reeval` | `success` / `failure` | Includes original_id, new_id, device_count_delta |
 | `result_set.heal` | `success` / `failure` | #4493: written by REST `/re-eval` and MCP `reevaluate_result_set` when the stored `source_payload` is found nested past `kMcpMaxJsonDepth`. `success` = `heal_poisoned_payload` discarded the poisoned payload; `failure` = the caller's own depth check found poison but `heal_poisoned_payload`'s return was `false` - a genuine write failure (row unchanged, still poisoned), a benign race where a concurrent caller already healed the row first (row unchanged, already healthy), or the row was deleted between heal's own SELECT and UPDATE (#4540: a concurrent `delete_set` or the TTL GC sweep, neither holding a shared lock) and no longer exists at all - the three are not currently distinguished (#4524). Not written on a row already healthy at the caller's own check (heal is a no-op there, nothing to audit). |
 | `result_set.pin` / `result_set.unpin` | `success` | |
