@@ -1853,6 +1853,34 @@ tests:
   # (a truly isolated first failure may lag one evaluation cycle) lives in
   # the rule's own `description` in docs/prometheus/yuzu-alerts.yml instead.
 
+  # ── YuzuBreakGlassLogin ─────────────────────────────────────────────────
+
+  # A single break-glass login after the boot seed pages. The flat-0 prefix is
+  # the boot seed in server.cpp; without it the series would be born at 1 and
+  # increase() could not see the first use.
+  - interval: 1m
+    name: break-glass login - one use after the boot seed fires
+    input_series:
+      - series: 'yuzu_auth_break_glass_login_total{job="yuzu",instance="s1"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuBreakGlassLogin", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuBreakGlassLogin", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+
+  # No break-glass use, no page.
+  - interval: 1m
+    name: break-glass login - a flat seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_auth_break_glass_login_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuBreakGlassLogin"}'
+        eval_time: 45m
+        exp_samples: []
+
   # ── YuzuScimDeprovisionRoleRefusedWithActiveLink (D1) ───────────────────
 
   # CASE 41 -- D1 fires: a still-linked out-of-band admin was refused
@@ -2779,6 +2807,39 @@ tests:
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing"}'
         eval_time: 25m
+        exp_samples: []
+
+  # ── YuzuServerPostgresUnreachable (HA WS-8, ADR-2002 §12) ────────────────
+  #
+  # CASE - sustained unreachability fires, per instance. RED if the comparison
+  # is inverted (== 1 would page on every healthy replica) or the gauge name
+  # drifts from what health_routes.cpp exports on /metrics.
+  - interval: 1m
+    name: postgres unreachable - sustained zero fires
+    input_series:
+      - series: 'yuzu_server_pg_reachable{job="yuzu",instance="s1"}'
+        values: "1x5 0x10"
+      - series: 'yuzu_server_pg_reachable{job="yuzu",instance="s2"}'
+        values: "1x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerPostgresUnreachable", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerPostgresUnreachable", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+
+  # CASE - a failover-length red blip stays quiet. Every replica goes red for
+  # an ordinary Patroni switchover (10-30s, one scrape here); paging on that
+  # would page every failover. RED if `for:` is dropped or shortened below a
+  # scrape interval.
+  - interval: 1m
+    name: postgres unreachable - a one-scrape failover blip stays quiet
+    input_series:
+      - series: 'yuzu_server_pg_reachable{job="yuzu",instance="s1"}'
+        values: "1x5 0 1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerPostgresUnreachable"}'
+        eval_time: 7m
         exp_samples: []
 
   # ── YuzuGuardianReadDegraded (#4856) ─────────────────────────────────────

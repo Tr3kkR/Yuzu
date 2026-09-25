@@ -1540,7 +1540,7 @@ curl -s -X POST \
 
 `audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as the session-revoke routes above — `false` means the unlock completed but the audit row was lost, degrading the CC6.3 evidence chain for that request.
 
-**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `403` — caller lacks `UserManagement:Write` or failed MFA step-up; `500` — the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
+**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `401` — MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — caller lacks `UserManagement:Write`, or a SAML session (step-up is not available for SAML sessions); `500` — the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
 
 **Audit:** a successful unlock emits `auth.lockout.cleared` with `result=ok`, `target_type=User`, `target_id=<username>`, `detail=admin_unlock`. A failed write emits the same verb with `result=error`. Note that a lockout cleared automatically (no operator action) emits `auth.lockout.cleared` with `result=ok` and `detail=reset_on_successful_login` when the user next logs in successfully; the threshold crossing itself emits `auth.lockout.applied`. These two verbs are the durable CC6.3 evidence; blocked-while-locked attempts are tracked only via the `yuzu_auth_lockout_blocked_total` metric (no per-attempt audit row **or** analytics event) to avoid amplification under a sustained brute-force.
 
@@ -1576,7 +1576,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 **Response (200):** `{"status":"ok"}`.
 
-**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
+**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated, or MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — not admin, self-grant, or a SAML session (step-up is not available for SAML sessions); `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` on a 403).
 
@@ -1815,10 +1815,11 @@ Quarantine a device.
 > result their shared dispatch closure now carries (a separate, smaller
 > follow-up per route). The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
-> `whitelist`) are exempt so that release stays reachable, and so are three
+> `whitelist`) are exempt so that release stays reachable, and so are four
 > server-internal pushes that are not operator dispatch —
-> `tar.fleet_snapshot`, `__guard__.push_rules` and `asset_tags.sync`, a closed
-> set counted (not per-event audited) by `yuzu_server_system_reserved_push_total`.
+> `tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` and
+> `__sync__.now`, a closed set counted (not per-event audited) by
+> `yuzu_server_system_reserved_push_total`.
 > Nothing else is.
 > If containment
 > state becomes unreadable for longer than a 60-second last-known-good
@@ -8671,7 +8672,7 @@ write a `command.dispatch` audit row with `result=denied` and `detail=reason=<re
 must be a JSON object; anything else is `400`.
 
 **Destructive-class capabilities require explicit, non-empty `agent_ids` — broadcast and `scope`
-fan-out are refused (#3685).** The command catalogue currently classifies 17 `plugin.action` pairs
+fan-out are refused (#3685).** The command catalogue currently classifies 19 `plugin.action` pairs
 `Destructive` (e.g. `tar.purge_source`, `filesystem.delete_lines`, `registry.delete_key`); dispatching
 any of them with `agent_ids` omitted or empty, or with `scope` present at all — including
 `"__all__"` — is refused **before** the command reaches an agent. This is a narrower carve-out
@@ -8757,7 +8758,7 @@ A plain RBAC denial (the caller holds no grant for the pair's classified securab
 {"error": {"code": 403, "message": "permission denied: Execution:Execute"}, "meta": {"api_version": "v1"}}
 ```
 
-A caller who *does* hold the grant but is dispatching one of the ~42 `plugin.action` pairs a
+A caller who *does* hold the grant but is dispatching one of the ~50 `plugin.action` pairs a
 compiled `ExecuteGate` marks `AdminOrApproval`/`AlwaysApproval` (e.g. `script_exec.exec`,
 `filesystem.delete`, `registry.set_value`), with no approval provenance and no admin role:
 
@@ -9337,7 +9338,7 @@ call the same `preview_scope_targets()` builder (`scope_preview.hpp`), so the
 matched-agent set cannot drift between transports. A `tag:<key>` atom in the
 expression resolves from the persistent tag store **only** — unlike a real
 dispatch, which also falls back to a connected agent's own live self-report —
-see [Tag source precedence](asset-tagging-guide.md). **`from_result_set:<id>`
+see [Tag source precedence](../asset-tagging-guide.md). **`from_result_set:<id>`
 and `props.*` atoms are not resolved by this preview** - the resolver only
 populates `os`/`arch`/`hostname`/`agent_version`/`tag:*`, so any other atom
 (including `from_result_set:`, this feature's own headline scope-walking
@@ -10485,10 +10486,12 @@ curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
 
 #### Step-up envelope on high-risk endpoints
 
-The following 19 endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs`:
+The following endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the last two bullets, the JIT-elevation routes, use a 300s window instead when that flag is `0` or less):
 
 - `POST /api/v1/tokens` (mint API token)
 - `DELETE /api/v1/tokens/{id}` (revoke API token)
+- `POST /api/v1/tokens/{id}/rotate` (rotate an API token)
+- `POST /api/v1/tokens/{id}/confirm` (confirm an API-token rotation)
 - `DELETE /api/v1/sessions` (admin force-logout another user)
 - `POST /api/v1/software-packages` (upload software package)
 - `POST /api/v1/software-deployments/{id}/start` (start deployment)
@@ -10506,6 +10509,9 @@ The following 19 endpoints return `401` with an MFA step-up envelope when the ca
 - `POST /api/v1/engine-principals/{id}/credentials/rotate` (rotate a credential)
 - `POST /api/v1/engine-principals/{id}/credentials/confirm` (confirm a rotation cutover)
 - `POST /api/v1/engine-principals/{id}/transfer-owner` (reassign the responsible owner)
+- `POST /api/v1/users/{username}/unlock` (clear an account lockout)
+- `POST /api/v1/users/{username}/elevation-eligibility` and `POST /api/v1/users/elevation-eligibility?username=` (grant or revoke JIT-elevation eligibility)
+- `POST /api/v1/elevate` (activate a JIT admin elevation)
 
 For **OIDC** sessions the envelope's `challenge_url` is `/auth/oidc/start` (and the remediation points at re-SSO) instead of `/login/mfa/stepup` — an external identity has no local TOTP secret to step up against. An OIDC session whose IdP did not attest MFA at all (no `amr`) passes the gate under `--mfa-enforcement=optional`, but is **gated** (re-SSO) under `required` (or `admin-only` for an admin) — symmetric with a local user being forced to enrol.
 
@@ -10865,6 +10871,8 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
     "pending": 3
   },
   "stores": {
+    "pg_pool": "ok",
+    "pg_reachable": "ok",
     "responses": "ok",
     "audit": "ok",
     "instructions": "ok",
@@ -10893,7 +10901,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `uptime_seconds` | integer | Server uptime in seconds |
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
-| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
+| `stores` | object | Health status of each data store (`"ok"` or `"error"`); the example shows a subset. Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. Includes `pg_reachable` (HA WS-8) — the only RUNTIME check here: whether this replica's dedicated probe currently reaches a writable Postgres primary. The other store entries report whether each store opened at startup. `/readyz` carries the same `pg_reachable` row plus a `pg` reason field when it fails; see `docs/user-manual/server-admin.md`, "What `/readyz` checks". |
 | `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
 | `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
 | `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |
