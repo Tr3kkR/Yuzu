@@ -627,46 +627,42 @@ void LogHandoff::teardown(std::chrono::milliseconds grace) noexcept {
         clear_global_drain_handle(this);
         close_drain_admission();
 
-        auto action = [] { hard_exit(kLogTeardownExitCode); };
-        ShutdownDeadlineGuard<decltype(action)> guard{grace, action};
-        // Still INSIDE the watchdog's scope, not after it: if a drain_log_bounded()
-        // lease admitted just before close_drain_admission() above never releases (a
-        // genuinely wedged sink), this wait is what the watchdog is covering -- not an
-        // unwatched drain thread discovered later. This keeps drain_log_bounded()'s OWN
-        // `wait` bound honest (it can no longer become the accidental last owner of the
-        // pool right as its spin loop ends) -- it does NOT by itself guarantee
-        // teardown_body()'s pool_.reset() observes the last reference in general (an
-        // ordinary producer thread can still hold one transiently); wait_for_worker_exit()
-        // inside teardown_body(), right after pool_.reset(), is what closes that wider
-        // case (see the header's WORKER-EXIT SIGNAL paragraph).
-        wait_for_drain_quiescence();
-        teardown_body();
+        {
+            auto action = [] { hard_exit(kLogTeardownExitCode); };
+            ShutdownDeadlineGuard<decltype(action)> guard{grace, action};
+            // Still INSIDE the watchdog's scope, not after it: if a drain_log_bounded()
+            // lease admitted just before close_drain_admission() above never releases (a
+            // genuinely wedged sink), this wait is what the watchdog is covering -- not an
+            // unwatched drain thread discovered later. This keeps drain_log_bounded()'s OWN
+            // `wait` bound honest (it can no longer become the accidental last owner of the
+            // pool right as its spin loop ends) -- it does NOT by itself guarantee
+            // teardown_body()'s pool_.reset() observes the last reference in general (an
+            // ordinary producer thread can still hold one transiently); wait_for_worker_exit()
+            // inside teardown_body(), right after pool_.reset(), is what closes that wider
+            // case (see the header's WORKER-EXIT SIGNAL paragraph).
+            wait_for_drain_quiescence();
+            teardown_body();
+        } // guard destructs (cancels the watchdog) here, strictly before mark_teardown_complete()
+          // below, preserving the file's own ordering contract via SCOPE rather than a separate
+          // try (Gate 8 fifth re-review, cpp-expert finding: a separate try bought no different
+          // exception-handling semantics than nesting the guard here -- mark_teardown_complete()'s
+          // own std::lock_guard construction is the same std::mutex::lock()-can-throw possibility
+          // the catch below already covers).
+        mark_teardown_complete();
     } catch (...) {
-        // teardown_body() (or T0, now that it is inside this try) must not throw in
-        // ordinary operation, but if something deep inside spdlog's own
+        // teardown_body() (or T0, or mark_teardown_complete(), all now inside this one try) must
+        // not throw in ordinary operation, but if something deep inside spdlog's own
         // error-handler rethrow path does, or a mutex lock genuinely fails, fail
         // closed the same way every other primitive in this shutdown-path family
         // does -- never let an exception escape a call the destructor depends on
         // being noexcept (that would reach std::terminate() instead of
         // hard_exit(), which on Windows runs CRT abort handling -- exactly the
         // hazard hard_exit.hpp's own header warns about). hard_exit() never
-        // returns, so mark_teardown_complete() below is unreached on this path --
-        // correct, since the whole process is exiting and no loser thread's wait
-        // needs waking.
-        hard_exit(kLogTeardownExitCode);
-    }
-    // Own try/catch (Gate 8 fourth re-review, cpp-safety finding): kept SEPARATE
-    // from the try above (not folded into it), because that one is scoped to the
-    // ShutdownDeadlineGuard -- which must fully cancel (destruct) before the notify
-    // below fires, per the file's own ordering contract -- not because this call
-    // needs different exception-handling semantics. mark_teardown_complete()'s own
-    // std::lock_guard construction is the same std::mutex::lock()-can-throw
-    // possibility already covered everywhere else in this function (T0, the loser
-    // branch above); this is the one call site that was missed when those two were
-    // fixed.
-    try {
-        mark_teardown_complete();
-    } catch (...) {
+        // returns: a throw from teardown_body()/T0 correctly never reaches
+        // mark_teardown_complete() (the whole process is exiting, no loser thread's
+        // wait needs waking), and a throw from mark_teardown_complete() itself
+        // (notify may or may not have already run) is covered the same way -- the
+        // whole process exiting is what bounds a loser's wait either way.
         hard_exit(kLogTeardownExitCode);
     }
 }

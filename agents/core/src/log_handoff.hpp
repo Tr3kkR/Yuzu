@@ -360,43 +360,66 @@ struct DrainHandle;
 /// stack/member-local owner. See the file banner above for the full contract.
 ///
 /// THREAD-SAFETY CONTRACT (should-fix from the #4666 PR-1 adversarial review, wording
-/// corrected in the second review round -- the first draft overclaimed what
-/// torn_down_ synchronizes): teardown()/teardown_with_action_for_test() are documented
-/// callable "from any thread" and ARE internally synchronized against a CONCURRENT
+/// corrected across five review rounds -- see below): teardown()/teardown_with_action_for_test()
+/// are documented callable "from any thread" and ARE internally synchronized against a CONCURRENT
 /// drain_log_bounded() call (the DRAIN-READER LEASE) and against an ordinary producer
-/// thread's logger()->info()/flush() call (the WORKER-EXIT SIGNAL, both above). They
-/// ARE now synchronized against EACH OTHER (governance hardening round, unhappy-path
-/// UP-2 -- an earlier draft of this paragraph said they were not, and that was a real
-/// gap, not just wording): the `torn_down_` atomic exchange still makes a SECOND
-/// concurrent teardown()/teardown_with_action_for_test()/destructor call the LOSER of
-/// the race, but the loser now WAITS (wait_for_teardown_completion(), a
-/// mutex+condvar+bool distinct from torn_down_) for the WINNER's teardown_body() to
-/// actually finish before returning -- bounded by the winner's own watchdog, since a
-/// wedge there either lets teardown_body() finish normally (which wakes the loser) or
-/// fires the watchdog action (production teardown(): hard_exit()s the whole process,
+/// thread's logger()->info()/flush() call (the WORKER-EXIT SIGNAL, both above).
+///
+/// A SECOND concurrent teardown()/teardown_with_action_for_test()/destructor call on the SAME
+/// object is the LOSER of the `torn_down_` atomic exchange, and the loser WAITS
+/// (wait_for_teardown_completion(), a mutex+condvar+bool distinct from torn_down_) for the
+/// WINNER's teardown_body() to actually finish before returning -- bounded by the winner's own
+/// watchdog, since a wedge there either lets teardown_body() finish normally (which wakes the
+/// loser) or fires the watchdog action (production teardown(): hard_exit()s the whole process,
 /// which ends the loser's wait too, by ending everything; the test-only
-/// teardown_with_action_for_test(): the winner's try/catch calls
-/// mark_teardown_complete() before rethrowing on ANY escaping exception -- including
-/// one from T0 or a genuinely-thrown teardown_body() -- specifically because
-/// ShutdownDeadlineGuard::~ShutdownDeadlineGuard() unconditionally cancels on unwind,
-/// so without that catch a loser blocked on the SAME object would hang with nothing
-/// watching it; Gate 8 re-review finding, governance hardening round). So two threads
-/// calling teardown() (or one calling it while another
-/// drops the last `unique_ptr<LogHandoff>`, triggering the destructor) no longer race
-/// each other for use-after-free purposes: the loser's `teardown()` call does not
-/// return until the object's live state is genuinely quiescent. CONCURRENCY BOUND
-/// (Gate 8 fourth re-review, cpp-safety finding): this is proven for exactly ONE
-/// winner plus ONE loser. With `notify_all()` (not `notify_one()`), if TWO losers
-/// are simultaneously blocked in wait_for_teardown_completion() on the SAME object
-/// (e.g. the destructing owner's thread AND a separate concurrent explicit
-/// teardown() caller), the first one woken could -- if it is the destructing owner
-/// -- free teardown_done_mu_/teardown_done_cv_ while the second loser is still
-/// mid-lock() on that same mutex, the identical use-after-free shape one level up.
-/// Not introduced by any fix here (inherent to a loser-waits pattern once more than
-/// one loser can exist) and not reachable by any call site or test in this PR, but
-/// stated explicitly rather than left implicit: at most ONE explicit teardown() call
-/// may race the destructor at a time; two simultaneous non-destructor callers
-/// racing each other AND the destructor is outside this contract's proof. Separately, they are NOT synchronized against a
+/// teardown_with_action_for_test(): the winner's try/catch calls mark_teardown_complete() before
+/// rethrowing on ANY escaping exception, specifically because
+/// ShutdownDeadlineGuard::~ShutdownDeadlineGuard() unconditionally cancels on unwind, so without
+/// that catch a loser blocked on the SAME object would hang with nothing watching it).
+/// mark_teardown_complete() notifies WHILE STILL HOLDING teardown_done_mu_ (Gate 8 second
+/// re-review, cpp-safety finding), so a loser can never observe `teardown_done_ == true` without
+/// the notify having already run -- that half of the handshake is provably correct.
+///
+/// WHAT THIS DOES **NOT** COVER (Gate 8 fifth re-review, cpp-safety finding, empirically
+/// reproduced): the loser-waits pattern only prevents a use-after-free when the object's memory
+/// keeps existing until the LOSER has fully returned from wait_for_teardown_completion() -- and
+/// nothing makes the WINNER wait for that. mark_teardown_complete()'s notify-under-lock guarantees
+/// the loser will SEE the predicate turn true; it does not guarantee the loser has finished
+/// reacquiring teardown_done_mu_ and returning before the winner's own teardown() call returns.
+/// So:
+///   - SAFE: exactly one thread ever calls teardown() and/or lets the destructor run (the only
+///     case any call site or test in this PR exercises).
+///   - SAFE: the destructor is the LOSER of a race against a separate thread's explicit teardown()
+///     call -- the destructor blocks in wait_for_teardown_completion() and only proceeds to
+///     actually destroy the object's members AFTER that wait returns, so by construction nothing
+///     it owns is freed while the winner is still using it.
+///   - **UNSAFE, live use-after-free:** the destructor (or whichever thread frees the object once
+///     its OWN teardown() call returns) is the WINNER, while a separate thread's teardown() call is
+///     concurrently the LOSER. The winner's teardown() returns immediately after
+///     mark_teardown_complete()'s notify; if that thread then destroys the object (member
+///     destruction tears down teardown_done_mu_/teardown_done_cv_, then the storage itself is
+///     freed), a loser still mid-wakeup -- blocked reacquiring the just-notified mutex, or about
+///     to re-touch teardown_done_ -- touches freed memory. Reproduced: a 5000-iteration ASan stress
+///     test (raw-pointer teardown() call on one thread, owning unique_ptr::reset() on another)
+///     crashed with heap-use-after-free on its FIRST iteration, in two independent runs -- once
+///     inside wait_for_teardown_completion()'s wait predicate, once at torn_down_.exchange() itself.
+/// This supersedes the earlier "two simultaneous losers" framing (previously stated as the only
+/// residual gap): that scenario IS an instance of this same defect (the destructing thread is one
+/// of the two losers, and if it is woken first, it frees the object out from under the other), but
+/// it is not the only instance -- ANY interleaving where the WINNER is the thread that frees the
+/// object shares the same defect, with one loser or two, and is unproven safe regardless of which
+/// notify variant is used (notify_one() would change the failure shape, not close the gap).
+///
+/// Not introduced by any fix in this file's history (inherent to a loser-waits pattern with no
+/// independent lifetime anchor for the object being torn down) and not reachable by any call site
+/// or test in this PR today. Rule for PR-2/PR-3 or any future caller: a concurrent teardown()
+/// caller must either be the sole thread that will ever free the object, or the object's lifetime
+/// must be pinned independently of any single caller's drop -- mirroring how DrainHandle/DrainLease
+/// keep DrainGate alive via a `shared_ptr` refcounted separately from `LogHandoff` itself. Until
+/// such a mechanism exists for LogHandoff, do not let a second thread call teardown() concurrently
+/// with the owning thread dropping its `unique_ptr<LogHandoff>`.
+///
+/// Separately, they are NOT synchronized against a
 /// concurrent call to the plain accessors below (overrun_total()/queue_depth()/
 /// in_write()/stalled_for()/log_errors_total()/last_log_error_for_test()) or against
 /// install()/logger() -- those read pool_/logger_/wrapped_sinks_/error_state_
