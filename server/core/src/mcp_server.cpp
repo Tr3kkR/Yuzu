@@ -792,7 +792,11 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})j"},
 
     {"get_management_group",
-     "Get one management group's metadata plus its current member list. Mirrors GET "
+     "Get one management group's metadata plus its current member list. #1762: "
+     "a DEGRADED read of EITHER the group row itself or its "
+     "member list (store closed / pool-acquire timeout / query error) returns a "
+     "retryable error, never a fabricated healthy result — do not conflate that with "
+     "the not-found case (a genuinely nonexistent group_id, no retry hint). Mirrors GET "
      "/api/v1/management-groups/{id}. Requires ManagementGroup:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"})j"
@@ -1432,12 +1436,15 @@ static const ToolDef kTools[] = {
     // GuaranteedState:Read gate as query_software_licenses/get_dex_device_app_perf
     // below, not the global perm gate.
     {"get_dex_device_score",
-     "Per-device DEX read model: the 0-100 experience score (-1 when unavailable — no "
-     "store, or the score cannot be computed) plus this device's OWN signal summary "
+     "Per-device DEX read model: the 0-100 experience score (-1 when no store is "
+     "configured) plus this device's OWN signal summary "
      "(obs_type -> count/distinct_devices/last_seen). The per-device twin of "
      "list_dex_signals's fleet rollup. Behavioral PII — every call is audit-logged "
      "(dex.device.view), same verb as the REST twin and the dashboard's per-device DEX "
-     "lens. Mirrors GET /api/v1/dex/devices/{id}. Requires GuaranteedState:Read, "
+     "lens. #4855: a DEGRADED signal-summary read (store closed / pool-acquire timeout / "
+     "query error) returns a retryable error instead of a score — never conflate the -1 "
+     "'no store' case above with a degraded read, which is an ERROR response, not a -1 "
+     "score. Mirrors GET /api/v1/dex/devices/{id}. Requires GuaranteedState:Read, "
      "management-group-scoped to this device.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact agent/device id"},)j"
@@ -1561,11 +1568,14 @@ static const ToolDef kTools[] = {
      "Device/App/Network composite, measured crash-free rate, top apps, and the most-affected- "
      "devices list. The devices list names affected agent IDs (behavioral data), confined to "
      "the caller's management-group scope — every call is audit-logged (dex.overview.view). "
-     "Mirrors GET /api/v1/dex/overview. Requires GuaranteedState:Read.",
+     "unscored (#4855) counts connected devices whose per-device score could not be computed "
+     "(no store, or a degraded per-device read) — treat a non-zero unscored as partial "
+     "coverage, not a healthier fleet than reported. Mirrors GET /api/v1/dex/overview. Requires "
+     "GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
      R"j({"type":"object","properties":{)j"
      R"j("window":{"type":"string"},"overall_experience":{"type":"integer"},"device_score":{"type":"integer"},"app_score":{"type":"integer"},"network_score":{"type":"integer"},)j"
-     R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
+     R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"unscored":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
      R"j("crash_free_pct":{"type":["number","null"]},"windows_reporting":{"type":"integer"},"crashes_per_1k_device_days":{"type":["number","null"]},)j"
      R"j("total_crashes":{"type":"integer"},"devices_impacted":{"type":"integer"},"total_online":{"type":"integer"},)j"
      R"j("active_signal_types":{"type":"integer"},"health_score":{"type":["number","null"]},"os_reporting_count":{"type":"integer"},)j"
@@ -9877,10 +9887,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_management_group (B4, #2146 API-parity) ───────────────
-            // Mirrors GET /api/v1/management-groups/{id}. get_group's nullopt
-            // collapses "no such group" with "store degraded" (the store API's
-            // own limitation — REST reports both as a flat 404, mirrored here
-            // exactly rather than inventing a distinction REST does not make).
+            // Mirrors GET /api/v1/management-groups/{id}. get_group_checked
+            // (#1762) distinguishes a genuine not-found (404-equivalent) from
+            // a store degrade (a retryable error) — the two are no longer
+            // collapsed.
             if (tool_name == "get_management_group") {
                 if (!tier_allows(tier, "ManagementGroup", "Read")) {
                     res.set_content(
@@ -9914,18 +9924,43 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto g = mgmt_store->get_group(group_id);
+                // get_group_checked (not the fail-soft get_group()) — a
+                // store-not-open / pool-acquire-timeout / query-error degrade
+                // must not render as a flat "group not found" (#1762 shape);
+                // fail closed with a retryable error instead, matching the
+                // REST twin's 503. A genuine not-found still reports
+                // retry-hint-exempt, mirroring REST's flat 404 with no retry
+                // hint.
+                auto g = mgmt_store->get_group_checked(group_id);
                 if (!g) {
-                    // retry-hint-exempt: ManagementGroupStore::get_group's nullopt is a
-                    // genuine "no such group" (its own store-degrade case is
-                    // distinct and much rarer); REST reports the SAME flat 404 with no
-                    // retry hint, so this mirrors it rather than inventing one REST
-                    // does not have.
+                    mcp_audit("failure", "management group store read degraded; group=" + group_id);
+                    res.set_content(
+                        a4_error(kInternalError, "management group store read degraded",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!*g) {
                     mcp_audit("denied", "group not found");
                     res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
                     return;
                 }
-                auto members = mgmt_store->get_members(group_id);
+                // get_members_checked (not the fail-soft get_members()) — a
+                // store-not-open / pool-acquire-timeout / query-error degrade
+                // must not render as an authoritative empty member list
+                // (#1762 shape); fail closed with a retryable error instead,
+                // matching the REST twin's 503.
+                auto members = mgmt_store->get_members_checked(group_id);
+                if (!members) {
+                    mcp_audit("failure", "management group store read degraded; group=" + group_id);
+                    res.set_content(
+                        a4_error(kInternalError, "management group store read degraded",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
                 mcp_audit("success", group_id);
                 // Shared builder (management_group_model.hpp) - the REST twin
                 // GET /api/v1/management-groups/{id} calls the SAME function,
@@ -9933,7 +9968,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // §1 Rule 1).
                 res.set_content(
                     success_response(
-                        id, tool_result(management_group_detail_json(*g, members), kObjectOutputSchema)),
+                        id, tool_result(management_group_detail_json(**g, *members), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -10046,8 +10081,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto existing = mgmt_store->get_group(group_id);
                 if (!existing) {
-                    // retry-hint-exempt: same collapsed not-found/degrade shape as
-                    // get_management_group above — mirrors REST's flat 404 exactly.
+                    // retry-hint-exempt: this write path stays on the fail-soft
+                    // get_group() (unlike get_management_group above, which
+                    // moved to get_group_checked for #1762) — a collapsed
+                    // not-found/degrade nullopt, mirroring REST's PUT route's
+                    // own flat 404 exactly (also still on get_group()).
                     mcp_audit("denied", "group not found");
                     res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
                     return;
@@ -14521,9 +14559,25 @@ McpServer::HandlerFn McpServer::build_handler(
                 // three. Set-and-proceed: MCP has no Sec-Audit-Failed header, so the
                 // persist bool is captured and surfaced as audit_persisted:false in the
                 // body instead (never a failed call — see docs/api-twin-recipe.md §4).
+                // #4858: the read above may have degraded; this behavioural row
+                // records the access, not the outcome (#4855) — it stays "success"
+                // regardless of a `model.degraded` result below (the device WAS
+                // accessed on the caller's behalf) — the separate `mcp_audit`
+                // tool-invocation record is what flips to "failure" on a degrade.
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.device.view", "success", "Agent", agent_id,
                     "DEX per-device score + signal summary via MCP get_dex_device_score");
+                if (model.degraded) {
+                    // #4855: never serialize a degraded model as a healthy score of
+                    // 100 with no signals -- a retryable error, matching the REST
+                    // twin's 503 and get_dex_device_app_perf's degrade branch below.
+                    mcp_audit("failure", "DEX store read degraded; agent=" + agent_id);
+                    res.set_content(
+                        a4_error(kInternalError, "DEX store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
                 mcp_audit("success", agent_id);
                 res.set_content(
                     success_response(
