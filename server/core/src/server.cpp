@@ -1921,7 +1921,7 @@ public:
                           "Administrator guard (POST/DELETE /api/v1/rbac/roles/{name}/"
                           "assignments and its MCP twins), by transport. A sustained "
                           "non-zero rate is an operator repeatedly trying to remove the "
-                          "fleet's last administrator, not a store fault — compare "
+                          "fleet's last administrator, not a store fault - compare "
                           "against yuzu_server_rbac_read_degrade_total to rule that out.",
                           "counter");
         for (const auto transport : {"rest", "mcp"})
