@@ -1974,8 +1974,52 @@ std::expected<void, std::string> RbacStore::unassign_role(const std::string& pri
     if (!open_)
         return std::unexpected("database not open");
     std::optional<std::uint64_t> new_gen;
+    bool last_admin_reject = false;
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // A2 last-Administrator guard (delivery plan §2 "A2 — Global human
+        // role assignment/unassignment"). Scoped to role_name=="Administrator"
+        // ONLY — every other unassign (including both existing engine-only
+        // callers, rest_api_v1.cpp:3232 and mcp_server.cpp:21727) stays a pure
+        // DELETE with no extra behavior. Unconditional would be WRONG, not
+        // just unnecessary: a fresh install holds ZERO Administrator
+        // `principal_roles` rows until A2's own assign route bootstraps the
+        // first one, so an unconditional post-delete count would spuriously
+        // reject unassigning e.g. a Viewer grant on a store that has never
+        // had an Administrator row at all.
+        //
+        // `principal_type = 'user'` ONLY (adversarial-review PR1/A2 finding
+        // — was `IN ('user', 'group')`): the admin GATE this guard exists to
+        // protect (`rbac_admin_predicate.hpp::is_rbac_administrator`) never
+        // resolves a group-held Administrator row — group membership is a
+        // documented, deliberate exclusion there. Counting a group row as a
+        // "surviving" Administrator here, while the gate can never actually
+        // pass through one, would let the last GATE-PASSING (user) admin be
+        // removed whenever a group row also exists — a false sense of safety
+        // from a row nothing can authenticate as. Match the gate exactly.
+        //
+        // Concurrency: lock the CANDIDATE Administrator rows with `FOR
+        // UPDATE` before the DELETE. Without this, two concurrent unassigns
+        // each removing one of the last two Administrator grants can both
+        // read "1 remaining" under READ COMMITTED (neither sees the other's
+        // still-uncommitted delete) and both commit, landing at zero — the
+        // exact TOCTOU a route-level pre-check would also be vulnerable to.
+        // `FOR UPDATE` blocks the second transaction on the first's row lock
+        // until it commits/rolls back, so the second re-evaluates the count
+        // against the first's now-durable delete.
+        if (role_name == "Administrator") {
+            pg::PgResult lock_rows = pg::exec_params(
+                c,
+                "SELECT principal_id FROM rbac_store.principal_roles "
+                "WHERE role_name = 'Administrator' AND principal_type = 'user' "
+                "FOR UPDATE",
+                std::vector<std::string>{});
+            if (lock_rows.status() != PGRES_TUPLES_OK) {
+                err = PQerrorMessage(c);
+                return false;
+            }
+        }
+
         pg::PgResult r = pg::exec_params(
             c,
             "DELETE FROM rbac_store.principal_roles WHERE principal_type = $1 AND principal_id = $2 "
@@ -1985,9 +2029,33 @@ std::expected<void, std::string> RbacStore::unassign_role(const std::string& pri
             err = PQerrorMessage(c);
             return false;
         }
+
+        // Only fire the count when this DELETE actually removed a row — an
+        // idempotent no-op unassign (the principal never held the role) must
+        // not spuriously reject.
+        if (role_name == "Administrator" && std::string(PQcmdTuples(r.get())) != "0") {
+            pg::PgResult remaining = pg::exec_params(
+                c,
+                "SELECT count(*) FROM rbac_store.principal_roles "
+                "WHERE role_name = 'Administrator' AND principal_type = 'user'",
+                std::vector<std::string>{});
+            if (remaining.status() != PGRES_TUPLES_OK || PQntuples(remaining.get()) != 1) {
+                err = PQerrorMessage(c);
+                return false;
+            }
+            if (std::string(PQgetvalue(remaining.get(), 0, 0)) == "0") {
+                last_admin_reject = true;
+                return false; // aborts the transaction — the DELETE above rolls back
+            }
+        }
+
         new_gen = bump_generation_in_txn(c);
         return new_gen.has_value();
     });
+    if (last_admin_reject)
+        return std::unexpected("cannot remove the last remaining Administrator role grant — "
+                               "the fleet would be left with " +
+                               std::string(kRbacLastAdminRefusalMarker));
     if (!ok)
         return std::unexpected(err.empty() ? "unassign_role failed" : err);
     apply_local_generation(*new_gen);

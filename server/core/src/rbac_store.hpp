@@ -48,6 +48,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -272,6 +273,29 @@ public:
                                                                  const std::string& role_name);
 
     std::expected<void, std::string> assign_role(const PrincipalRole& pr);
+
+    /// A2 last-Administrator guard (`.claude/plans/rbac-industry-leading-
+    /// DELIVERY-PLAN.md` §2): when `role_name == "Administrator"`, refuses
+    /// (and rolls back) a delete that would leave ZERO `principal_roles` rows
+    /// naming `role_name = 'Administrator'` AND `principal_type = 'user'` —
+    /// deliberately NOT `principal_type IN ('user', 'group')`: matches
+    /// `rbac_admin_predicate.hpp::is_rbac_administrator`'s gate exactly,
+    /// which never resolves a group-held Administrator row either (a
+    /// documented A2 scope exclusion) — counting a gate-invisible group row
+    /// as a "surviving" administrator would be a false sense of safety
+    /// (adversarial-review PR1/A2 finding). The count runs INSIDE the same
+    /// transaction as the delete, under a `FOR UPDATE` row lock on the
+    /// candidate rows, so two concurrent unassigns racing to remove the last
+    /// two Administrator grants serialize instead of both observing "1
+    /// remaining" and both committing. Every other role/principal_type
+    /// combination — including
+    /// both existing engine-only callers (`rest_api_v1.cpp:3232`,
+    /// `mcp_server.cpp:21727`) — is unaffected: a pure idempotent DELETE,
+    /// exactly as before. The refusal's error string always contains
+    /// `kRbacLastAdminRefusalMarker` (below) — callers that need to
+    /// distinguish this business-rule refusal from a genuine store/query
+    /// failure match on that constant rather than inventing their own
+    /// substring.
     std::expected<void, std::string> unassign_role(const std::string& principal_type,
                                                    const std::string& principal_id,
                                                    const std::string& role_name);
@@ -530,6 +554,22 @@ private:
 /// extend trust in a cached "disabled" any more than a cached permission
 /// verdict (adversarial-review round, #2703).
 [[nodiscard]] bool rbac_enforcement_in_effect(const RbacStore* store) noexcept;
+
+/// The fixed marker substring `RbacStore::unassign_role`'s error string
+/// always contains when refusing the A2 last-Administrator guard (see that
+/// method's doc comment). The REST route (POST/DELETE
+/// `/api/v1/rbac/roles/{name}/assignments`) and its MCP twin both match
+/// against this ONE constant — via `is_rbac_last_admin_refusal` below — to
+/// distinguish the business-rule refusal (409/Conflict-class) from a genuine
+/// store/query failure (503/Transient-class). EXTEND this, never invent a
+/// second copy of the wording to match against.
+inline constexpr std::string_view kRbacLastAdminRefusalMarker = "zero administrators";
+
+/// True iff `msg` (an `unassign_role` error string) is the last-Administrator
+/// refusal above, rather than a genuine store/query failure.
+[[nodiscard]] inline bool is_rbac_last_admin_refusal(const std::string& msg) noexcept {
+    return msg.find(kRbacLastAdminRefusalMarker) != std::string::npos;
+}
 
 /// Build the `groups.name` used for an IdP-sourced group: `source:external_id`.
 /// `source == "local"` groups are NOT namespaced — returns `external_id`

@@ -345,6 +345,11 @@ TEST_CASE("arming_check (auto path): a schedule whose creator lost the required 
     TWINS_RBAC(rbac);
     TWINS_INSTR(instr_pool);
     Harness h{instr_pool, rbac};
+    // A second Administrator holder so unassigning carol's grant below doesn't
+    // trip the A2 last-Administrator guard (delivery plan §2) — this test is
+    // about arming re-verification, not that guard.
+    REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "twins-other-admin", "Administrator"})
+               .has_value());
     REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "carol", "Administrator"}).has_value());
     auto id = h.make_due("carol", /*requires_approval=*/false);
 
@@ -373,6 +378,10 @@ TEST_CASE("arming_check (approval path): a schedule whose creator lost the requi
     TWINS_RBAC(rbac);
     TWINS_INSTR(instr_pool);
     Harness h{instr_pool, rbac};
+    // A second Administrator holder — see the identical comment in the
+    // auto-path test above (A2 last-Administrator guard).
+    REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "twins-other-admin", "Administrator"})
+               .has_value());
     REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "dave", "Administrator"}).has_value());
     auto id = h.make_due("dave", /*requires_approval=*/true);
 

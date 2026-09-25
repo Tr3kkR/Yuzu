@@ -455,14 +455,45 @@ curl -s -b cookies.txt \
 
 ### Custom Roles (Planned)
 
-Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role creation and role assignment are planned but **not yet implemented**. Currently, custom roles must be managed through the HTMX Settings UI or directly against the shared PostgreSQL `rbac_store` schema (see the "Storage (ADR-0041)" callout above — one `psql` session, not a per-node file).
+Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role **creation** are planned but **not yet implemented** — there is no HTMX Settings UI fragment for this either (`settings_routes.cpp` has no RBAC role-CRUD registration). Currently, a genuinely NEW custom role can only be created directly against the shared PostgreSQL `rbac_store` schema (see the "Storage (ADR-0041)" callout above — one `psql` session, not a per-node file).
+
+**Assigning one of the 6 fleet-wide-assignable built-in roles to a human user is implemented — see "Fleet-Wide Role Assignment" below** (`ITServiceOwner`, the 7th built-in role, is assignable only at management-group scope — see "Scoped Role Assignments"). Only AUTHORING a brand-new custom role (and narrowing/widening a seeded system role's own permission set) remains planned.
 
 **Planned endpoints (not yet available):**
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/v1/rbac/roles` | Create a custom role |
-| `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign a role to a principal |
+| `PUT` | `/api/v1/rbac/roles/{name}` | Update a role |
+| `DELETE` | `/api/v1/rbac/roles/{name}` | Delete a custom role |
+
+### Fleet-Wide Role Assignment (Built-in Roles)
+
+An Administrator can grant or revoke one of the 6 non-`ITServiceOwner` built-in roles (`Administrator`, `PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a human (`principal_type="user"`) user, fleet-wide, through a dedicated pair of routes — **not** the general RBAC-securable `perm_fn`/`require_permission` gate every other route in this document uses. Granting (and especially revoking) standing Administrator authority is a stronger security decision than an ordinary permission check, so the caller must hold a **durable** Administrator role themselves, re-read fresh from the store rather than trusted from a cached session role or a JIT (`POST /api/v1/elevate`) elevation — an elevated session does **not** satisfy this gate.
+
+```bash
+# Grant the Operator role to a user, fleet-wide
+curl -s -b cookies.txt -X POST \
+  http://localhost:8080/api/v1/rbac/roles/Operator/assignments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "principal_type": "user",
+    "principal_id": "jane.doe"
+  }'
+
+# Revoke it again
+curl -s -b cookies.txt -X DELETE \
+  http://localhost:8080/api/v1/rbac/roles/Operator/assignments/jane.doe
+```
+
+Key constraints:
+
+- **`principal_type` must be `"user"`.** Group-scoped fleet-wide assignment is not supported yet — `rbac_store.group_members` is written solely by IdP group-sync, so a group-held grant would make the IdP the admin-authority source, a decision not made by this surface.
+- **`ITServiceOwner` is explicitly rejected**, not silently mis-assigned. Its 92-permission grant is designed around the holder being CONFINED to devices tagged with their IT Service — but that confinement is enforced entirely by `ManagementGroupStore::get_visible_agents`, which reads only the group-scoped `management_group_roles` table, never `principal_roles` (this surface's only write target). A fleet-wide `ITServiceOwner` grant would resolve unconfined/global on every type-level permission check while showing the holder zero visible devices on any per-device list read — wrong both ways. Assign `ITServiceOwner` via the management-group role route instead (see "Scoped Role Assignments" below).
+- **Only the 6 named roles above are accepted** — enforced against a closed allow-list (`rbac_assignable_roles.hpp`), not "any role that happens to exist in the store". A pre-existing custom role (`is_system=false`, creatable only via direct SQL today — `RbacStore::create_role` has no route caller) is rejected exactly like an unknown role name. An unknown/custom role name and `ITServiceOwner` all return the identical client-facing rejection message — the specific reason is recorded in the audit log only, so a caller cannot enumerate the role catalog by diffing error text.
+- **A caller may not revoke their own `Administrator` assignment.** The fleet's **last** remaining `Administrator` grant held by a human user cannot be revoked by anyone, even another admin — the store-level guard runs inside the same transaction as the delete, so two concurrent revokes cannot both succeed and leave zero administrators. The guard counts `principal_type='user'` rows only, matching the admin gate itself exactly — a group-held `Administrator` row (not creatable via this surface today) is never treated as a survivor.
+- **Assigning a role to a username with no existing account is allowed** (pre-provisioning) — RBAC's `principal_roles` and `AuthDB`'s `users` table are independent, unrelated by foreign key.
+- MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see `docs/user-manual/mcp.md`.
 
 ### Scoped Role Assignments
 
@@ -484,7 +515,7 @@ curl -s -b cookies.txt -X POST \
 
 ### Deny a Specific Operation
 
-Prevent a role from deleting infrastructure resources, even if other roles would allow it. This requires creating a custom role with a Deny permission (via the Settings UI or direct database access, since the role creation API is not yet available):
+Prevent a role from deleting infrastructure resources, even if other roles would allow it. This requires creating a custom role with a Deny permission (via direct database access, since the role creation API is not yet available — no HTMX Settings UI fragment exists for this either):
 
 ```sql
 -- Example: create a deny role directly against the shared rbac_store schema
@@ -508,13 +539,15 @@ Assign this role alongside any other roles. Because deny overrides allow, the us
 | `POST` | `/api/v1/rbac/roles` | Create a custom role | Planned |
 | `PUT` | `/api/v1/rbac/roles/{name}` | Update a role | Planned |
 | `DELETE` | `/api/v1/rbac/roles/{name}` | Delete a custom role | Planned |
-| `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign a role to a principal | Planned |
-| `DELETE` | `/api/v1/rbac/roles/{name}/assignments` | Unassign a role | Planned |
+| `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign one of the 6 non-`ITServiceOwner` built-in roles to a human user, fleet-wide (A2) | Implemented |
+| `DELETE` | `/api/v1/rbac/roles/{name}/assignments/{principal_id}` | Unassign a fleet-wide role from a human user (A2) | Implemented |
 
 ## Planned Features
 
 | Feature | Phase | Status |
 |---|---|---|
-| REST API for role creation and assignment | 3 | Planned |
+| REST API for fleet-wide built-in role assignment | A2 | Implemented |
+| REST API for custom role creation | 3 (Priority B) | Planned |
+| Group-scoped fleet-wide role assignment (`principal_type=group`) | 3 | Planned |
 | OIDC group-to-role auto-mapping refinements | 3 | Stub |
 | Role management via Settings UI matrix | 3 | Planned |

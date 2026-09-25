@@ -740,6 +740,218 @@ TEST_CASE("RbacStore: unassign role", "[rbac_store][pg]") {
     CHECK(roles.empty());
 }
 
+// ── A2 last-Administrator guard (delivery plan §2) ──────────────────────────
+
+TEST_CASE("RbacStore: unassign_role refuses to remove the fleet's last remaining "
+          "Administrator grant",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.assign_role({"user", "onlyadmin", "Administrator"}).has_value());
+
+    auto result = store.unassign_role("user", "onlyadmin", "Administrator");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(is_rbac_last_admin_refusal(result.error()));
+
+    // The DELETE rolled back — the grant is still there.
+    auto roles = store.get_principal_roles("user", "onlyadmin");
+    REQUIRE(roles.size() == 1);
+    CHECK(roles[0].role_name == "Administrator");
+}
+
+TEST_CASE("RbacStore: unassign_role removes an Administrator grant when another "
+          "Administrator remains",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.assign_role({"user", "admin1", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "admin2", "Administrator"}).has_value());
+
+    auto result = store.unassign_role("user", "admin1", "Administrator");
+    REQUIRE(result.has_value());
+    CHECK(store.get_principal_roles("user", "admin1").empty());
+    CHECK(store.get_principal_roles("user", "admin2").size() == 1);
+}
+
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard is scoped to the "
+          "Administrator role only — a Viewer/Operator unassign on a ZERO-admin "
+          "store still succeeds (fresh-install bootstrap shape, A2)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // Fresh RBAC_STORE holds ZERO Administrator principal_roles rows — this is
+    // the real fresh-install shape (A2 is the bootstrap step). Assigning and
+    // then removing a non-Administrator role must be a pure, unconditional
+    // DELETE, exactly as it was before this guard existed — matching every
+    // existing production caller (both engine-only) of unassign_role.
+    REQUIRE(store.get_role_members("Administrator").empty());
+    REQUIRE(store.assign_role({"user", "vera", "Viewer"}).has_value());
+
+    auto result = store.unassign_role("user", "vera", "Viewer");
+    REQUIRE(result.has_value());
+    CHECK(store.get_principal_roles("user", "vera").empty());
+}
+
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard IGNORES a group-held "
+          "Administrator grant — it never counts as a surviving administrator "
+          "(adversarial-review PR1/A2 finding: the guard must match "
+          "is_rbac_administrator's gate, which never resolves group membership)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // A group-held Administrator row (however it got there today — no
+    // production caller writes one — the guard is a property of
+    // unassign_role, shared by any future caller) must NOT be treated as a
+    // surviving administrator: rbac_admin_predicate.hpp's
+    // is_rbac_administrator gate can never authenticate as one (principal_
+    // type="user" only), so a group row "surviving" would be a false sense
+    // of safety — the fleet would have zero GATE-PASSING administrators.
+    REQUIRE(store.assign_role({"group", "admins-group", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "soleadmin", "Administrator"}).has_value());
+
+    // Removing the ONLY user Administrator must be refused even though a
+    // group row is still present — the guard counts principal_type='user'
+    // ONLY now, ignoring the group row entirely.
+    auto result = store.unassign_role("user", "soleadmin", "Administrator");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(is_rbac_last_admin_refusal(result.error()));
+    CHECK(store.get_principal_roles("user", "soleadmin").size() == 1);
+
+    // The group row is untouched by this refusal (unassign_role never
+    // touched it — different principal_type).
+    CHECK(store.get_principal_roles("group", "admins-group").size() == 1);
+}
+
+// Adversarial-review PR1/A2 finding #2's own regression test: seed a group
+// Administrator row PLUS two real user Administrators, then drive two
+// CONCURRENT REAL RbacStore::unassign_role calls (std::thread, not
+// hand-copied SQL on a puppeteered connection — unlike the deterministic
+// race test below, this one only needs to prove the invariant holds under
+// genuine concurrency, not exercise one specific interleaving) each
+// removing one of the two user rows. Exactly one must succeed and one must
+// be refused — the group row must never be counted as a reason both can
+// succeed.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard under real "
+          "concurrency still refuses to remove the last USER administrator "
+          "even with a group-held Administrator row present",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.assign_role({"group", "admins-group", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "concadmin1", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "concadmin2", "Administrator"}).has_value());
+
+    std::atomic<bool> ok1{false}, ok2{false};
+    std::atomic<bool> done1{false}, done2{false};
+    std::thread t1([&] {
+        ok1 = store.unassign_role("user", "concadmin1", "Administrator").has_value();
+        done1 = true;
+    });
+    std::thread t2([&] {
+        ok2 = store.unassign_role("user", "concadmin2", "Administrator").has_value();
+        done2 = true;
+    });
+    // Same join-on-unwind hazard as the deterministic race test below — see
+    // its comment for why a bare REQUIRE between spawn and join is unsafe.
+    struct ThreadJoiner2 {
+        std::thread &a, &b;
+        ~ThreadJoiner2() {
+            if (a.joinable())
+                a.join();
+            if (b.joinable())
+                b.join();
+        }
+    } joiner2{t1, t2};
+    t1.join();
+    t2.join();
+    CHECK(done1.load());
+    CHECK(done2.load());
+
+    // Exactly one succeeded, one was refused — never both (which would mean
+    // the group row was silently counted as a survivor) and never neither.
+    CHECK(ok1.load() != ok2.load());
+
+    // Exactly one real user Administrator remains — never zero.
+    const std::size_t user_admins_left = store.get_principal_roles("user", "concadmin1").size() +
+                                         store.get_principal_roles("user", "concadmin2").size();
+    CHECK(user_admins_left == 1);
+    // The group row is unaffected either way.
+    CHECK(store.get_principal_roles("group", "admins-group").size() == 1);
+}
+
+// chaos-injector-style: two concurrent unassigns racing to remove the last two
+// Administrator grants must NOT both succeed (which would leave zero admins).
+// Deterministic interleaving via a manually-held FOR UPDATE lock on connection
+// A (mirrors the CHAOS-1 test above) rather than a hope-for-the-best race:
+// connection A holds the SAME row lock unassign_role's own transaction takes,
+// blocking a background thread's REAL store.unassign_role call; A then
+// performs the exact DELETE unassign_role would (removing admin1, leaving
+// admin2) and commits, unblocking the background thread's transaction, which
+// must then observe exactly ONE remaining Administrator row (admin2's) before
+// ITS OWN delete and refuse to remove it.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
+          "concurrent unassigns of the last two Administrator grants — exactly "
+          "one succeeds, never zero remain",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.assign_role({"user", "raceadmin1", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "raceadmin2", "Administrator"}).has_value());
+
+    auto lease_a = rbac_pool_fx_.acquire();
+    REQUIRE(lease_a);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "SELECT principal_id FROM rbac_store.principal_roles WHERE "
+                            "role_name = 'Administrator' AND principal_type = 'user' "
+                            "FOR UPDATE",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> b_started{false};
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_ok{false};
+    std::string b_error;
+    std::thread unassign_thread([&] {
+        b_started = true;
+        auto res = store.unassign_role("user", "raceadmin2", "Administrator");
+        b_ok = res.has_value();
+        if (!res)
+            b_error = res.error();
+        b_done = true;
+    });
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() {
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{unassign_thread};
+
+    // Prove a real blocked-then-unblocked interleaving, not a lucky race.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(b_started.load());
+    CHECK_FALSE(b_done.load());
+
+    // Connection A now performs the delete + count check unassign_role's own
+    // transaction would for raceadmin1, and commits — mirroring the real
+    // production statements exactly.
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "DELETE FROM rbac_store.principal_roles WHERE principal_type = "
+                            "'user' AND principal_id = 'raceadmin1' AND role_name = "
+                            "'Administrator'",
+                            std::vector<std::string>{})
+                .ok());
+    REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+    lease_a.reset();
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    // The background thread's own FOR UPDATE only sees raceadmin2's row by the
+    // time it unblocks (raceadmin1's is already gone) — removing it would
+    // leave zero, so it must be refused.
+    CHECK_FALSE(b_ok.load());
+    CHECK(is_rbac_last_admin_refusal(b_error));
+
+    // Exactly one Administrator remains — never zero.
+    CHECK(store.get_principal_roles("user", "raceadmin1").empty());
+    CHECK(store.get_principal_roles("user", "raceadmin2").size() == 1);
+}
+
 TEST_CASE("RbacStore: get role members", "[rbac_store][pg]") {
     RBAC_STORE(store);
     store.assign_role({"user", "alice", "Operator"});
@@ -1680,6 +1892,10 @@ TEST_CASE("RbacStore: every authz read fails closed (DENY) on a broken store",
 TEST_CASE("RbacStore: a revoke invalidates a cached allow (generation token)",
           "[rbac_store][pg]") {
     RBAC_STORE(store);
+    // A second Administrator holder so the revoke below doesn't trip the A2
+    // last-Administrator guard (delivery plan §2) — this test is about cache
+    // invalidation, not that guard, which has its own dedicated test cases.
+    store.assign_role({"user", "otheradmin", "Administrator"});
     store.assign_role({"user", "cacheuser", "Administrator"}); // Administrator = allow-all
     // Warm perm_cache_ with an ALLOW verdict.
     CHECK(store.check_permission("cacheuser", "Execution", "Execute"));
