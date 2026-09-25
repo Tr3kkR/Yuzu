@@ -1815,10 +1815,11 @@ Quarantine a device.
 > result their shared dispatch closure now carries (a separate, smaller
 > follow-up per route). The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
-> `whitelist`) are exempt so that release stays reachable, and so are three
+> `whitelist`) are exempt so that release stays reachable, and so are four
 > server-internal pushes that are not operator dispatch —
-> `tar.fleet_snapshot`, `__guard__.push_rules` and `asset_tags.sync`, a closed
-> set counted (not per-event audited) by `yuzu_server_system_reserved_push_total`.
+> `tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` and
+> `__sync__.now`, a closed set counted (not per-event audited) by
+> `yuzu_server_system_reserved_push_total`.
 > Nothing else is.
 > If containment
 > state becomes unreadable for longer than a 60-second last-known-good
@@ -10870,6 +10871,8 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
     "pending": 3
   },
   "stores": {
+    "pg_pool": "ok",
+    "pg_reachable": "ok",
     "responses": "ok",
     "audit": "ok",
     "instructions": "ok",
@@ -10898,7 +10901,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `uptime_seconds` | integer | Server uptime in seconds |
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
-| `stores` | object | Health status of each data store (`"ok"` or `"error"`). Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. |
+| `stores` | object | Health status of each data store (`"ok"` or `"error"`); the example shows a subset. Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. Includes `pg_reachable` (HA WS-8) — the only RUNTIME check here: whether this replica's dedicated probe currently reaches a writable Postgres primary. The other store entries report whether each store opened at startup. `/readyz` carries the same `pg_reachable` row plus a `pg` reason field when it fails; see `docs/user-manual/server-admin.md`, "What `/readyz` checks". |
 | `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
 | `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
 | `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |

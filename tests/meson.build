@@ -290,6 +290,7 @@ agent_test_exe = executable(
     'unit/test_shutdown_pipe.cpp',
     'unit/test_hard_exit.cpp',
     'unit/test_shutdown_deadline_guard.cpp',
+    'unit/test_log_handoff.cpp', # #4666 PR-1: bounded async log hand-off primitive
     'unit/test_spark_detached_call.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
@@ -1125,6 +1126,8 @@ if build_server
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
       'unit/server/test_coord_dsn.cpp',
+      'unit/server/test_pg_reachability_probe.cpp', # HA WS-8: /readyz pg_reachable rule + probe
+      'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
       'unit/server/test_command_outbox_store.cpp', # WS-3 3.3: transactional command outbox
       'unit/server/test_command_outbox_delivery.cpp', # WS-3 3.3: leader-gated delivery loop
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
