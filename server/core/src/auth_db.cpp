@@ -236,10 +236,14 @@ const std::vector<pg::PgMigration>& migrations() {
     // `RbacStore::unassign_role`'s last-Administrator guard (rbac_store.cpp)
     // runs `rbac_store.principal_roles JOIN auth.users ... WHERE
     // u.is_active` in its OWN transaction, on the assumption this column
-    // keeps its name and its "can this username currently authenticate"
-    // meaning — a rename or a semantic change here needs that guard
-    // reviewed in the same change, or it silently stops meaning what its
-    // own doc comment says it means.
+    // keeps its name and its "not soft-deleted / deactivated" meaning — the
+    // precondition every login path filters on, but NOT sufficient on its
+    // own for "can currently authenticate": lockout (locked_until /
+    // failed_login_count), an MFA-enrolled-but-pending account,
+    // --auth-mode=sso-only, and identity_source all gate authentication
+    // separately and must not be folded into this column's meaning. A
+    // rename fails the guard closed (SQL error); a change to what
+    // `is_active` *means* silently changes what the guard counts.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          "CREATE TABLE users ("

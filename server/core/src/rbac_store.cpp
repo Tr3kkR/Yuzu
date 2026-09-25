@@ -1999,22 +1999,23 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // removed whenever a group row also exists — a false sense of safety
         // from a row nothing can authenticate as. Match the gate exactly.
         //
-        // JOIN auth.users u ON u.username = pr.principal_id, WHERE u.is_active
-        // (governance BLOCKING #1, full-pipeline review on 765bc7ec1): a bare
-        // `principal_roles` row count is a count of GRANTS, not of
-        // AUTHENTICATABLE administrators. A2 explicitly permits pre-
-        // provisioning (assigning Administrator to a username with no
-        // `auth.users` row yet — see `target_provisioned` at the assign
-        // route), and `AuthDB::remove_user` is a SOFT delete
-        // (`UPDATE auth.users SET is_active = FALSE ...`, auth_db.cpp — there
-        // is no hard-delete/cascade path anywhere in this codebase), so
-        // BOTH a ghost (never-logged-in) row AND a deactivated/removed
-        // account would previously count as a "surviving" administrator
-        // while nobody can actually authenticate as either. The JOIN
-        // excludes a nonexistent username (no matching row) and `u.is_active`
-        // excludes both deactivated and (soft-)deleted accounts — the same
-        // filter covers all three sub-cases named in the finding. This is
-        // safe ONLY because `RbacStore` and `AuthDB` are ALWAYS constructed
+        // JOIN auth.users u ON u.username = pr.principal_id, WHERE u.is_active (governance
+        // BLOCKING #1, full-pipeline review on 765bc7ec1): a bare `principal_roles` row count
+        // is a count of GRANTS, not of administrators who are even potentially authenticatable
+        // — `is_active` is a NECESSARY precondition every login path filters on, not a
+        // sufficient one (see auth_db.cpp's `migrations()` comment on `users.is_active` for
+        // what else gates authentication). A2 explicitly permits pre-provisioning (assigning
+        // Administrator to a username with no `auth.users` row yet — see `target_provisioned`
+        // at the assign route), and `AuthDB::remove_user` is a SOFT delete (`UPDATE auth.users
+        // SET is_active = FALSE ...`, auth_db.cpp — there is no hard-delete/cascade path
+        // anywhere in this codebase), so BOTH a ghost (never-logged-in) row AND a
+        // deactivated/removed account would previously count as a "surviving" administrator
+        // when neither is even a candidate to authenticate as one (a ghost row has no
+        // credentials to authenticate with at all; a deactivated account fails the `is_active`
+        // precondition every login path enforces). The JOIN excludes a nonexistent username (no
+        // matching row) and `u.is_active` excludes both deactivated and (soft-)deleted accounts
+        // — the same filter covers all three sub-cases named in the finding. This is safe ONLY
+        // because `RbacStore` and `AuthDB` are ALWAYS constructed
         // on the SAME PgPool/database in production — ONE `--postgres-dsn`,
         // ONE `pg_pool_` member, both stores built from it
         // (server.cpp:4532,6047; ADR-0006) — so `auth.users` is guaranteed

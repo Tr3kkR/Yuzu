@@ -10580,7 +10580,7 @@ curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
 
 #### Step-up envelope on high-risk endpoints
 
-The following 19 endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs`:
+The following 21 endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs`:
 
 - `POST /api/v1/tokens` (mint API token)
 - `DELETE /api/v1/tokens/{id}` (revoke API token)
@@ -10601,6 +10601,8 @@ The following 19 endpoints return `401` with an MFA step-up envelope when the ca
 - `POST /api/v1/engine-principals/{id}/credentials/rotate` (rotate a credential)
 - `POST /api/v1/engine-principals/{id}/credentials/confirm` (confirm a rotation cutover)
 - `POST /api/v1/engine-principals/{id}/transfer-owner` (reassign the responsible owner)
+- `POST /api/v1/rbac/roles/{name}/assignments` (assign a fleet-wide RBAC role to a human user)
+- `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` (unassign a fleet-wide RBAC role from a human user)
 
 For **OIDC** sessions the envelope's `challenge_url` is `/auth/oidc/start` (and the remediation points at re-SSO) instead of `/login/mfa/stepup` — an external identity has no local TOTP secret to step up against. An OIDC session whose IdP did not attest MFA at all (no `amr`) passes the gate under `--mfa-enforcement=optional`, but is **gated** (re-SSO) under `required` (or `admin-only` for an admin) — symmetric with a local user being forced to enrol.
 

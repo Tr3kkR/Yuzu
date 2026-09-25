@@ -5633,7 +5633,7 @@ void RestApiV1::register_routes(
                     role_name == "ITServiceOwner"
                         ? "ITServiceOwner: requires group-scoped confinement, not supported "
                           "fleet-wide"
-                        : role_name + ": not one of the 6 fleet-wide-assignable roles";
+                        : audit_token(role_name) + ": not one of the 6 fleet-wide-assignable roles";
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
                                                     "denied", "User", audit_target_id, reason);
                 res.status = 400;
