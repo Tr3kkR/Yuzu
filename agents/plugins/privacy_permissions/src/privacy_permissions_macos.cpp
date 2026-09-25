@@ -9,19 +9,20 @@
  *   - one PER-USER db per real home, /Users/<name>/Library/Application Support/com.apple.TCC/
  *     TCC.db -- camera and microphone grants normally live HERE, not in the system db (measured
  *     on this Mac, 2026-09-23: the per-user db held kTCCServiceMicrophone rows the system db
- *     never has; an MDM PPPC payload can add rows to the system db). Rows are qualified `<name>\<client>` (qualify_app_id, the same
- *     shape the Windows leg uses per profile). Homes are enumerated the autoruns_macos.cpp
- *     collect_user_launchagents way: directories directly under /Users, not followed through a
- *     symlink, owned by uid >= 500, the directory name as the user name (no Open Directory call).
+ *     never has; an MDM PPPC payload can add rows to the system db). Rows are qualified
+ *     `<name>\<client>` (qualify_app_id, the same shape the Windows leg uses per profile).
+ *     Homes are enumerated the autoruns_macos.cpp collect_user_launchagents way: directories
+ *     directly under /Users, not followed through a symlink, owned by uid >= 500, the directory
+ *     name as the user name (no Open Directory call).
  * A per-user db that does not exist is `absent` for that user; a refusal (EPERM/EACCES on the
  * lstat or the open, SQLITE_AUTH/PERM, or SQLITE_CANTOPEN whose underlying syscall failed
- * EPERM/EACCES on a file that IS there) is `denied`; anything else -- including a failed `PRAGMA query_only` or
- * query bind -- is `unreadable` with a `<source>:<cause>` token (macos_parsers.hpp decides; this
- * file only reads).
+ * EPERM/EACCES on a file that IS there) is `denied`; anything else -- including a failed
+ * `PRAGMA query_only` or query bind -- is `unreadable` with a `<source>:<cause>` token
+ * (macos_parsers.hpp decides; this file only reads).
  *
  * RESIDUALS, stated rather than assumed away:
  *   - Every TCC.db (system AND per-user) is TCC-protected. An agent identity without Full Disk
- *     Access reads `denied` for every source -- the charter's expected outcome, recorded
+ *     Access reads `denied` for every source -- the expected outcome, recorded
  *     honestly; the production LaunchDaemon (root) is not known to hold FDA today.
  *   - A home outside /Users (a relocated or network home) is not read, and a user whose home
  *     directory is directly under /Users but owned by a uid < 500 is skipped as a system entry.
@@ -29,12 +30,13 @@
  *     not a regular file of plausible size, not SQLite, WAL-mode, has a -journal/-wal/-shm beside
  *     it, or changes while read (an immutable read ignores exactly that state): so a concurrent
  *     tccd commit reads `unreadable`. O_NOFOLLOW_ANY refuses a symlink anywhere in the path.
- *     Rows per service, value size and time (per source and per run) are bounded.
+ *     Schema text, rows per service, value and retained-text size, and time (per source and per
+ *     run) are bounded.
  *   - The `access` schema and `auth_value` mapping (0=denied/2=allowed/3=limited) are the
  *     commonly-documented shape, proven on macOS 26.6.2 only; any other value is
  *     prompt_undetermined, never guessed.
  *
- * `location` is NOT queried here at all (CDX-R2-005) -- ADR-3003's platform investigation
+ * `location` is NOT queried here at all -- ADR-3003's platform investigation
  * established macOS Location Services is administered by `locationd`, OUTSIDE TCC; it ships as
  * one explicit `unsupported` row on every collection, whatever else failed.
  *
@@ -77,7 +79,6 @@ namespace {
 static_assert(macos::kSqlitePerm == SQLITE_PERM);
 static_assert(macos::kSqliteCantOpen == SQLITE_CANTOPEN);
 static_assert(macos::kSqliteAuth == SQLITE_AUTH);
-static_assert(macos::kSqliteCantOpenSymlink == SQLITE_CANTOPEN_SYMLINK);
 
 constexpr std::string_view kTccDbPath = "/Library/Application Support/com.apple.TCC/TCC.db";
 constexpr std::string_view kUsersDir = "/Users";
@@ -102,14 +103,18 @@ struct Deadline {
     bool expired() noexcept { return fired = fired || std::chrono::steady_clock::now() >= end; }
 };
 
-/// sqlite3_errmsg, or a fixed literal when sqlite3 could not even allocate a handle.
+/// sqlite3_errmsg, or a fixed literal when sqlite3 could not even allocate a handle. The text can
+/// echo hostile schema identifiers, so it is cut, scrubbed and escaped before it reaches a token.
 std::string sqlite_errmsg(sqlite3* db) {
-    return db ? std::string{sqlite3_errmsg(db)} : std::string{"no_handle"};
+    if (!db) return "no_handle";
+    return yuzu::util::safe_output_field(
+        sanitize_utf8(std::string_view{sqlite3_errmsg(db)}.substr(0, 200)));
 }
 
 /// Opens `db_path` (default: the system TCC.db) read-only through an immutable URI (no lock, so no
-/// busy timeout either) and makes the connection query-only. `deadline`, when given, is installed
-/// before the first prepare. On failure returns an empty handle and sets `failure` -- classified by
+/// busy timeout either), bounds the schema parse, applies sqlite's untrusted-database posture and
+/// makes the connection query-only. `deadline`, when given, is installed before the first prepare.
+/// On failure returns an empty handle and sets `failure` -- classified by
 /// macos::classify_tcc_sqlite_failure from the real result code, the VFS's own failed-syscall
 /// errno (sqlite3_system_errno) and sqlite3_errmsg, never a guessed diagnostic. A failed
 /// `PRAGMA query_only=1` is a failure too: the source is never read without it. `db_path` is a
@@ -130,13 +135,22 @@ DbPtr open_readonly(std::optional<macos::SourceFailure>& failure,
             db ? sqlite3_system_errno(db.get()) : 0, sqlite_errmsg(db.get()));
         return {};
     }
+    // The schema is parsed at the first prepare, before any per-value limit could apply.
+    sqlite3_limit(db.get(), SQLITE_LIMIT_LENGTH, macos::kMaxSchemaBytes);
+    sqlite3_limit(db.get(), SQLITE_LIMIT_SQL_LENGTH, macos::kMaxSchemaBytes);
+    if (sqlite3_db_config(db.get(), SQLITE_DBCONFIG_DEFENSIVE, 1, nullptr) != SQLITE_OK ||
+        sqlite3_db_config(db.get(), SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, nullptr) != SQLITE_OK) {
+        failure = macos::SourceFailure{macos::SourceOutcome::unreadable, "hardening_failed"};
+        return {};
+    }
     if (deadline) {
         const auto check = +[](void* d) noexcept -> int {
             return static_cast<Deadline*>(d)->expired();
         };
         sqlite3_progress_handler(db.get(), 1000, check, deadline);
     }
-    const int pragma_rc = sqlite3_exec(db.get(), "PRAGMA query_only=1", nullptr, nullptr, nullptr);
+    const int pragma_rc = sqlite3_exec(db.get(), "PRAGMA query_only=1; PRAGMA cell_size_check=ON",
+                                       nullptr, nullptr, nullptr);
     if (pragma_rc != SQLITE_OK) {
         failure = macos::classify_tcc_sqlite_failure(macos::SqliteStage::query_only, pragma_rc,
                                                      sqlite3_system_errno(db.get()),
@@ -199,10 +213,11 @@ bool sidecar_present(const std::string& path) {
 }
 
 /// The per-service query over one prepared statement. A read that hits a bound stops there with
-/// `cut` set and keeps what it had.
+/// `cut` set and keeps what it had; `retained` counts the scrubbed client text kept by the source.
 std::vector<macos::TccServiceRead> read_services(sqlite3_stmt* stmt, Deadline& deadline,
                                                  std::size_t row_cap) {
     std::vector<macos::TccServiceRead> reads;
+    std::size_t retained = 0;
     for (const auto& svc : macos::kTccServices) {
         macos::TccServiceRead read{svc.category, {}, false, false, {}};
         if (deadline.expired()) {
@@ -222,7 +237,7 @@ std::vector<macos::TccServiceRead> read_services(sqlite3_stmt* stmt, Deadline& d
             if (step_rc == SQLITE_DONE) break;
             if (step_rc != SQLITE_ROW) {
                 if (deadline.fired) read.cut = macos::kCutTimeout;
-                else if (step_rc == SQLITE_TOOBIG) read.cut = macos::kCutValueTooLong;
+                else if (step_rc == SQLITE_TOOBIG) read.cut = macos::kCutValueOversized;
                 else read.step_failed = true;
                 break;
             }
@@ -234,8 +249,14 @@ std::vector<macos::TccServiceRead> read_services(sqlite3_stmt* stmt, Deadline& d
             std::optional<std::int64_t> auth_value;
             if (sqlite3_column_type(stmt, 2) == SQLITE_INTEGER)
                 auth_value = sqlite3_column_int64(stmt, 2);
-            // Scrubbed here so the run-wide output budget counts the bytes that reach the wire.
-            read.grants.push_back({sanitize_utf8(client ? client : "-"), auth_value});
+            // Scrubbed here so both output budgets count the bytes that reach the wire.
+            auto text = sanitize_utf8(client ? client : "-");
+            if (retained + text.size() > macos::kMaxSourceBytes) {
+                read.cut = macos::kCutByteCap;
+                break;
+            }
+            retained += text.size();
+            read.grants.push_back({std::move(text), auth_value});
         }
         macos::sort_grants(read.grants);
         reads.push_back(std::move(read));
@@ -285,14 +306,14 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
     const int prep_rc = sqlite3_prepare_v2(db.get(), kQuery, -1, &raw_stmt, nullptr);
     const StmtPtr stmt{raw_stmt}; // owns it from here -- finalized on every path
     if (prep_rc != SQLITE_OK) {
-        // 7.6: a TCC refusal can surface lazily, at the first page read, as CANTOPEN/AUTH --
+        // A TCC refusal can surface lazily, at the first page read, as CANTOPEN/AUTH --
         // classified the same as an open failure, never a flat `unreadable`.
         if (deadline.fired) return fail({unreadable, std::string{macos::kCutTimeout}});
         return fail(macos::classify_tcc_sqlite_failure(
             macos::SqliteStage::prepare, sqlite3_extended_errcode(db.get()),
             sqlite3_system_errno(db.get()), sqlite_errmsg(db.get())));
     }
-    // Only now: the real schema text is one value too, and must still load.
+    // Only now that the schema has loaded: tighten to the per-value bound.
     sqlite3_limit(db.get(), SQLITE_LIMIT_LENGTH, macos::kMaxValueBytes);
 
     const auto reads = read_services(stmt.get(), deadline, bounds.row_cap);
@@ -381,13 +402,13 @@ void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::Constraint
 // YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY is defined -- the seam
 // test_privacy_permissions_macos_internals.cpp uses to #include this TU directly and reach the
 // internal-linkage `open_readonly`/`read_tcc_source` for deterministic open-failure unit tests
-// (denied-path composition, K2/COD-FV-5), without pulling collect_macos_permissions's own
+// (denied-path composition), without pulling collect_macos_permissions's own
 // symbol into a second definition. This TU never statically links the real plugin either way
 // (test_privacy_permissions_local_dispatcher.cpp loads it via PluginHandle::load/dlopen at
 // runtime), so a second compilation of the same free functions here creates no ODR/duplicate-
 // symbol conflict. Never defined by this TU's own (real) build -- meson.build does not set it.
 // Mirrors autoruns_macos.cpp's identical seam for YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY
-// and execution_artifacts_win.cpp's #4392 TU-inclusion precedent.
+// and execution_artifacts_win.cpp's TU-inclusion precedent.
 #ifndef YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY
 
 int collect_macos_permissions(yuzu::CommandContext& ctx) {
@@ -397,7 +418,7 @@ int collect_macos_permissions(yuzu::CommandContext& ctx) {
     macos::OutputBudget output;
     read_all_sources(rows, acc, std::string{kTccDbPath}, std::string{kUsersDir}, bounds, output);
 
-    // Fixed four-category vocabulary (CDX-R2-005): location has no TCC service at all, so it
+    // Fixed four-category vocabulary: location has no TCC service at all, so it
     // ships its own explicit `unsupported` row on EVERY collection -- including when every
     // TCC.db read above failed -- never silently omitted.
     rows.push_back({"macos", "-", "location", PermissionState::unsupported, "-", "-", "-", false});

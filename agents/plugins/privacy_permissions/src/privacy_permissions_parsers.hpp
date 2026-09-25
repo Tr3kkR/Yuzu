@@ -12,8 +12,9 @@
  * (epoch-ms, "-" elsewhere) -- always present so every row has the same field count.
  *
  * FAILURE ROWS: a row whose state is `unreadable` or `denied` because a READ failed carries its
- * own `<subject>:<cause>` failure token in `raw` (the same token lands in the result
- * provenance), so a failure row is never mistaken for a decoded grant. `category` is "-" only
+ * own `<subject>:<cause>` failure token in `raw` (macOS and Linux add the same token to the
+ * result provenance; Windows adds the app-less form, win::coarse_failure_token), so a failure
+ * row is never mistaken for a decoded grant. `category` is "-" only
  * on a whole-SOURCE row (a whole TCC.db, profile hive, HKLM root, the portal/session bus) --
  * that one row stands for every category of that source, so no category is ever silently
  * omitted: each category either gets its own row or is covered by a whole-source row.
@@ -21,19 +22,20 @@
  * <category> is a FIXED, cross-OS vocabulary: camera | microphone | location |
  * full_disk_access. Each leg owns its own native-identifier -> category table and silently
  * SKIPS any native capability outside it (Windows' `contacts`/`phoneCall`/etc, a macOS TCC
- * service this plugin doesn't model) -- that is a deliberate charter-scoped filter, not a
+ * service this plugin doesn't model) -- that is a deliberate scope filter, not a
  * decode failure, and must never consume a `constrained` token or emit a row.
  *
  * <state> = allowed | denied | prompt_undetermined | absent | unreadable | unsupported.
- * BINDING CONTRACT (same discipline as every sibling Wave 8 plugin): absent (the mechanism
- * definitively says there is no record for this app+category -- the app never asked) adds no
+ * BINDING CONTRACT (same discipline as the sibling posture plugins): absent (the mechanism
+ * definitively says there is no record for this app+category; a Windows NonPackaged app row can
+ * also read `absent` beside its last-used timestamps, having no per-app decision) adds no
  * failure token and never downgrades the status; unreadable (the read itself failed for a
  * reason OTHER than "not there") always carries a `<key>:<cause>` token; denied (a
  * PERMISSION_DENIED-class refusal -- EACCES/EPERM opening TCC.db, ERROR_ACCESS_DENIED on the
  * registry, an AccessDenied-shaped D-Bus error) is a THIRD, separate bucket from both -- a
  * refused read must NEVER collapse into absent. This is the single most important
- * correctness property here: the macOS acceptance criterion is explicitly about recording a
- * real SIP/TCC denial honestly, not silently reporting "no camera access requested".
+ * correctness property here: on macOS a real SIP/TCC denial must be recorded as such, never
+ * reported as "no camera access requested".
  */
 #pragma once
 

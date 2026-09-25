@@ -100,7 +100,7 @@ bool do_lookup(sd_bus* bus, const portal::PortalTable& t, std::vector<Permission
             t, portal::classify_lookup_error(err.err.name ? err.err.name : "", -rc), rows, acc);
 
     portal::PortalReply walked;
-    // CDX-R2-004: sd_bus_message_enter_container returns >0 entered, 0 a genuine type MISMATCH
+    // sd_bus_message_enter_container returns >0 entered, 0 a genuine type MISMATCH
     // at the current position (NOT entered), <0 an error -- only >0 is success.
     walked.array_entered = sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_ARRAY, "{sas}") > 0;
     if (walked.array_entered) {

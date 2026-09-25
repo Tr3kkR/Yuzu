@@ -1,9 +1,9 @@
 /**
  * test_privacy_permissions_macos_internals.cpp -- TU-inclusion seam over
- * privacy_permissions_macos.cpp's internal-linkage `open_readonly` and `read_tcc_source`
- * (K2/COD-FV-5, both external code-review reviewers independently: the binding contract's single
- * most important property -- a refused TCC.db open must never collapse into `absent` -- was
- * proven only at the pure layer, never against the real open this leg actually makes).
+ * privacy_permissions_macos.cpp's internal-linkage `open_readonly`, `read_tcc_source` and
+ * `read_all_sources`. The binding contract's single most important property -- a refused TCC.db
+ * open must never collapse into `absent` -- is proven here against the real open this leg
+ * makes, not only at the pure layer.
  *
  * Both take the db path as a parameter (default: the real TCC.db) specifically so this test can
  * force each outcome branch deterministically, without a non-FDA identity and without touching
@@ -14,7 +14,7 @@
  * never a sleep.
  *
  * #if defined(__APPLE__) guards the WHOLE body -- empty TU elsewhere, mirroring every other
- * Apple-only internals-seam test in this tree (test_autoruns_macos_local.cpp's #4241 seam is the
+ * Apple-only internals-seam test in this tree (test_autoruns_macos_local.cpp's seam is the
  * direct precedent this file copies).
  */
 #if !defined(__APPLE__)
@@ -40,7 +40,7 @@
 // Direct source inclusion, macOS-only, mirroring autoruns_macos.cpp's
 // YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY seam (see that file's own banner, and
 // YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY's definition comment in
-// privacy_permissions_macos.cpp): `open_readonly`, `read_tcc_source` and `snapshot_fd` have
+// privacy_permissions_macos.cpp): `open_readonly`, `read_tcc_source` and `read_all_sources` have
 // internal (anonymous-namespace) linkage, so there is no header seam to reach them through
 // otherwise. This TU never statically links the real plugin either way
 // (test_privacy_permissions_local_dispatcher.cpp loads it via PluginHandle::load/dlopen at
@@ -272,7 +272,10 @@ TEST_CASE("privacy_permissions macOS: anything that is not one quiescent rollbac
     REQUIRE(::mkfifo((dir / "fifo.db").c_str(), 0600) == 0);
     CHECK(read_source(dir / "empty.db").rows.at(0).raw == "evil:tcc_db:size_out_of_range");
     CHECK(read_source(dir / "junk.db").rows.at(0).raw == "evil:tcc_db:not_sqlite");
-    CHECK(read_source(dir / "fifo.db").rows.at(0).raw == "evil:tcc_db:not_regular_file");
+    CHECK(read_source(dir / "fifo.db").rows.at(0).raw == "evil:tcc_db:not_regular");
+    { std::ofstream{dir / "huge.db"}; }
+    REQUIRE(::truncate((dir / "huge.db").c_str(), macos::kMaxDbBytes + 1) == 0); // sparse
+    CHECK(read_source(dir / "huge.db").rows.at(0).raw == "evil:tcc_db:size_out_of_range");
 }
 
 TEST_CASE("privacy_permissions macOS: the value limit lands after the schema loads, and an "
@@ -294,7 +297,7 @@ TEST_CASE("privacy_permissions macOS: the value limit lands after the schema loa
                 std::string(2 * macos::kMaxValueBytes, 'c') +
                 "',0,2);INSERT INTO access VALUES('kTCCServiceMicrophone','m.app',0,2);");
     const auto cell = read_source(dir / "cell.db");
-    CHECK(cell.has_raw("evil:tcc_db:camera:value_too_long"));
+    CHECK(cell.has_raw("evil:tcc_db:camera:value_oversized"));
     CHECK(cell.count("camera", PermissionState::absent) == 0);
     CHECK(cell.count("microphone", PermissionState::allowed) == 1);
 }
@@ -329,25 +332,140 @@ TEST_CASE("privacy_permissions macOS: a spent run or source budget is a named ti
     const StmtPtr stmt{raw};
     CHECK(sqlite3_step(stmt.get()) == SQLITE_INTERRUPT);
     CHECK(deadline.fired);
+
+    // A query that never yields a row is cut by the handler mid-step, not reported as a failure.
+    make_db(db.parent_path() / "spin.db",
+            "CREATE VIEW access AS WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n) "
+            "SELECT 'kTCCServiceCamera' AS service, 'x' AS client, 0 AS client_type, 2 AS "
+            "auth_value FROM n WHERE i < 0;");
+    macos::ReadBounds brief;
+    brief.source_budget = std::chrono::milliseconds{20};
+    const auto spin = read_source(db.parent_path() / "spin.db", brief);
+    CHECK(spin.has_raw("evil:tcc_db:camera:timeout"));
+    CHECK_FALSE(spin.has_raw("evil:tcc_db:camera:query_step_failed"));
 }
 
-TEST_CASE("privacy_permissions macOS: snapshot_fd sees a change made to the file through the "
-          "held descriptor",
+TEST_CASE("privacy_permissions macOS: the bounded schema and untrusted-database posture still "
+          "read a real-shape 17-column db, and refuse a hostile schema before it is parsed",
           "[privacy_permissions][macos][internals]") {
-    yuzu::test::TempDir tmp{"yuzu_test_pp_snap_"};
-    const auto db = scratch_dir(tmp) / "TCC.db";
-    make_db(db, std::string{kAccessSchema});
-    yuzu::agent::ScopedFd fd{::open(db.c_str(), O_RDONLY | O_CLOEXEC)};
-    yuzu::agent::ScopedFd writer{::open(db.c_str(), O_WRONLY | O_CLOEXEC)};
-    REQUIRE((fd && writer));
+    yuzu::test::TempDir tmp{"yuzu_test_pp_schema_"};
+    const auto dir = scratch_dir(tmp);
+    make_db(dir / "real.db",
+            "CREATE TABLE access (service TEXT NOT NULL, client TEXT NOT NULL, client_type INTEGER "
+            "NOT NULL, auth_value INTEGER NOT NULL, auth_reason INTEGER NOT NULL, auth_version "
+            "INTEGER NOT NULL, csreq BLOB, policy_id INTEGER, indirect_object_identifier_type "
+            "INTEGER, indirect_object_identifier TEXT NOT NULL DEFAULT 'UNUSED', "
+            "indirect_object_code_identity BLOB, flags INTEGER, last_modified INTEGER NOT NULL "
+            "DEFAULT (CAST(strftime('%s','now') AS INTEGER)), pid INTEGER, pid_version INTEGER, "
+            "boot_uuid TEXT NOT NULL DEFAULT 'UNUSED', last_reminded INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (service, client, client_type, indirect_object_identifier));"
+            "INSERT INTO access(service,client,client_type,auth_value,auth_reason,auth_version,"
+            "csreq) VALUES('kTCCServiceCamera','com.apple.Terminal',0,2,4,1,zeroblob(5000));"
+            "INSERT INTO access(service,client,client_type,auth_value,auth_reason,auth_version,"
+            "csreq) VALUES('kTCCServiceMicrophone','com.zoom.us',0,0,4,1,zeroblob(300));");
+    const auto real = read_source(dir / "real.db");
+    CHECK(real.count("camera", PermissionState::allowed) == 1);
+    CHECK(real.count("microphone", PermissionState::denied) == 1);
+    CHECK_FALSE(real.acc.any_failure());
 
-    const auto first = snapshot_fd(fd.get());
-    REQUIRE(first);
-    CHECK(macos::read_unchanged(first->stamp, snapshot_fd(fd.get())->stamp));
-    const unsigned char bump[4] = {0, 0, 0, 9};
-    REQUIRE(::pwrite(writer.get(), bump, sizeof bump, 24) == 4); // the change counter alone
-    CHECK(snapshot_fd(fd.get())->stamp.change_counter == 9);
-    CHECK_FALSE(macos::read_unchanged(first->stamp, snapshot_fd(fd.get())->stamp));
+    std::string list = "0";
+    for (int i = 0; i < 40000; ++i) list += ",0";
+    make_db(dir / "check.db",
+            "CREATE TABLE access(service TEXT, client TEXT, client_type INTEGER, auth_value "
+            "INTEGER CHECK (auth_value IN (" + list + ")));");
+    make_db(dir / "name.db",
+            "CREATE VIEW access AS SELECT 'kTCCServiceCamera' AS service, 'c' AS client, 0 AS "
+            "client_type, 2 AS auth_value FROM \"" + std::string(100000, 'n') + "\";");
+    for (const char* hostile : {"check.db", "name.db"})
+        CHECK(read_source(dir / hostile).rows.at(0).raw ==
+              "evil:tcc_db:prepare_failed:string or blob too big");
+
+    make_db(dir / "msg.db",
+            "CREATE VIEW access AS SELECT 'kTCCServiceCamera' AS service, 'c' AS client, 0 AS "
+            "client_type, 2 AS auth_value FROM \"a\nINFO forged log line" +
+                std::string(50000, 'm') + "\";");
+    const auto msg = read_source(dir / "msg.db").rows.at(0).raw;
+    CHECK(msg.rfind("evil:tcc_db:prepare_failed:no such table: main.a INFO forged log", 0) == 0);
+    CHECK(msg.size() <= std::string_view{"evil:tcc_db:prepare_failed:"}.size() + 200);
+    CHECK(msg.find('\n') == std::string::npos);
+}
+
+TEST_CASE("privacy_permissions macOS: one source keeps at most kMaxSourceBytes of client text; "
+          "the other categories are still read",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_bytes_"};
+    const auto db = scratch_dir(tmp) / "TCC.db";
+    make_db(db, // 450 x 0xFF scrubs to 1350 bytes, so the byte cap binds before the row cap
+            "CREATE VIEW access AS WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n "
+            "LIMIT 5000) SELECT 'kTCCServiceCamera' AS service, CAST(unhex(replace(hex("
+            "zeroblob(450)),'00','FF')) AS TEXT)||i AS client, 0 AS client_type, 2 AS auth_value "
+            "FROM n UNION ALL SELECT 'kTCCServiceMicrophone', 'm.app', 0, 2;");
+
+    const auto r = read_source(db);
+    CHECK(r.has_raw("evil:tcc_db:camera:byte_cap"));
+    CHECK_FALSE(r.has_raw("evil:tcc_db:camera:row_cap"));
+    CHECK(r.count("camera", PermissionState::allowed) < macos::kMaxRowsPerService);
+    CHECK(r.count("microphone", PermissionState::allowed) == 1);
+    std::size_t kept = 0;
+    for (const auto& row : r.rows)
+        if (row.category == "camera" && row.state == PermissionState::allowed)
+            kept += row.app_id.size() - std::string_view{"evil\\"}.size();
+    CHECK(kept <= macos::kMaxSourceBytes);
+}
+
+// The `poke()` scalar lets a view change the file while the statement is stepping.
+struct Poke {
+    std::string path;
+    bool bump_counter = false;
+    bool create_journal = false;
+} g_poke;
+
+void poke_fn(sqlite3_context* ctx, int, sqlite3_value**) {
+    if (g_poke.bump_counter) {
+        yuzu::agent::ScopedFd fd{::open(g_poke.path.c_str(), O_WRONLY | O_CLOEXEC)};
+        const unsigned char counter[4] = {0, 0, 0, 9};
+        static_cast<void>(::pwrite(fd.get(), counter, sizeof counter, 24));
+    }
+    if (g_poke.create_journal) { std::ofstream{g_poke.path + "-journal"} << "x"; }
+    sqlite3_result_int(ctx, 0);
+}
+
+int poke_entry(sqlite3* db, char**, const sqlite3_api_routines*) {
+    const int rc = sqlite3_create_function(db, "poke", 0, SQLITE_UTF8 | SQLITE_INNOCUOUS, nullptr,
+                                           poke_fn, nullptr, nullptr);
+    return rc != SQLITE_OK ? rc
+                           : sqlite3_create_function(db, "poke_unsafe", 0, SQLITE_UTF8, nullptr,
+                                                     poke_fn, nullptr, nullptr);
+}
+
+struct PokeRegistered {
+    PokeRegistered() { sqlite3_auto_extension(reinterpret_cast<void (*)()>(poke_entry)); }
+    ~PokeRegistered() { sqlite3_cancel_auto_extension(reinterpret_cast<void (*)()>(poke_entry)); }
+};
+
+TEST_CASE("privacy_permissions macOS: a change made to the file while it is being read discards "
+          "the read; a function the schema may not trust is refused",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_race_"};
+    const auto dir = scratch_dir(tmp);
+    const auto view = [](const char* call) {
+        return std::string{"CREATE VIEW access AS SELECT 'kTCCServiceCamera' AS service, 'a.app' "
+                           "AS client, 0 AS client_type, 2 + "} + call + " AS auth_value;";
+    };
+    make_db(dir / "TCC.db", view("poke()"));
+    make_db(dir / "unsafe.db", view("poke_unsafe()"));
+    const PokeRegistered registered;
+    g_poke = {(dir / "TCC.db").string(), false, false};
+
+    CHECK(read_source(dir / "TCC.db").count("camera", PermissionState::allowed) == 1);
+    g_poke.bump_counter = true;
+    CHECK(read_source(dir / "TCC.db").rows.at(0).raw == "evil:tcc_db:changed_during_read");
+    g_poke.bump_counter = false;
+    g_poke.create_journal = true;
+    CHECK(read_source(dir / "TCC.db").rows.at(0).raw == "evil:tcc_db:sidecar_present");
+    g_poke.create_journal = false;
+    CHECK(read_source(dir / "unsafe.db").rows.at(0).raw.rfind(
+              "evil:tcc_db:prepare_failed:unsafe use of poke_unsafe()", 0) == 0);
 }
 
 TEST_CASE("privacy_permissions macOS: one run deadline covers every source, and homes stop being "
@@ -364,9 +482,16 @@ TEST_CASE("privacy_permissions macOS: one run deadline covers every source, and 
         std::filesystem::create_directories(dir);
         make_db(dir / "TCC.db", honest);
     }
+    std::filesystem::create_directory_symlink(users / "a", users / "link");
+    { std::ofstream{users / "file"}; }
     make_db(base / "system.db", honest);
     const std::string system_db = (base / "system.db").string();
     SourceRead r;
+    const auto from = [&](const std::string& home) {
+        return std::any_of(r.rows.begin(), r.rows.end(), [&](const auto& row) {
+            return row.app_id.rfind(home + "\\", 0) == 0;
+        });
+    };
 
     SECTION("a spent run deadline is seen by the system db and every home") {
         macos::ReadBounds bounds;
@@ -381,15 +506,27 @@ TEST_CASE("privacy_permissions macOS: one run deadline covers every source, and 
         macos::OutputBudget output;
         output.max_bytes = 20; // the system db alone stays under it; one home's rows do not
         read_all_sources(r.rows, r.acc, system_db, users.string(), {}, output);
-        const auto from = [&](const std::string& home) {
-            return std::any_of(r.rows.begin(), r.rows.end(), [&](const auto& row) {
-                return row.app_id.rfind(home + "\\", 0) == 0;
-            });
-        };
         CHECK(from("a"));
         CHECK_FALSE(from("b"));
         CHECK_FALSE(from("c"));
         CHECK(r.has_raw("collection:budget_exceeded"));
+    }
+    SECTION("a missing system db is never absent; a symlink and a plain file are not homes") {
+        macos::OutputBudget output;
+        read_all_sources(r.rows, r.acc, (base / "missing.db").string(), users.string(), {}, output);
+        const auto missing = std::find_if(r.rows.begin(), r.rows.end(), [](const auto& row) {
+            return row.raw == "tcc_db:missing";
+        });
+        REQUIRE(missing != r.rows.end());
+        CHECK(missing->state == PermissionState::unreadable);
+        CHECK(from("a"));
+        CHECK_FALSE(from("link"));
+        CHECK_FALSE(from("file"));
+    }
+    SECTION("an absent users dir is a named row") {
+        macos::OutputBudget output;
+        read_all_sources(r.rows, r.acc, system_db, (base / "nope").string(), {}, output);
+        CHECK(r.has_raw("users:open_errno_2"));
     }
 }
 

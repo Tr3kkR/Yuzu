@@ -36,7 +36,7 @@
 namespace yuzu::privacy_permissions::win {
 
 // <profile hive>/HKLM ...\CapabilityAccessManager\ConsentStore\<CapabilityName>. Only the
-// capabilities this plugin's charter names are opened; every other CapabilityName Windows
+// capabilities this plugin models are opened; every other CapabilityName Windows
 // exposes (contacts, phoneCall, userAccountInformation, ...) is never opened at all -- a scope
 // filter, not a decode failure.
 struct CapabilityEntry {
@@ -302,11 +302,16 @@ struct LastUsedField {
 
 /// The token a failed grant adds to the run's constraint set: `<source>:<category>:<cause>`, no
 /// app. One token per kind of failure however many apps share it, so an owner-stuffed ConsentStore
-/// cannot grow the set; the row's own `raw` still names the app.
+/// cannot grow the set; the row's own `raw` still names the app. A cause embedding an
+/// owner-chosen number (`..._type_<n>`, `..._size_<n>`) is cut before it for the same reason.
 [[nodiscard]] inline std::string coarse_failure_token(std::string_view source,
                                                       std::string_view category,
                                                       std::string_view cause) {
-    return std::string{source} + ":" + std::string{category} + ":" + std::string{cause};
+    std::string c{cause};
+    for (const std::string_view marker : {"_type_", "_size_"})
+        if (const auto at = c.find(marker); at != std::string::npos)
+            c.resize(at + marker.size() - 1);
+    return std::string{source} + ":" + std::string{category} + ":" + c;
 }
 
 /// One (app_id, category) grant as read from ONE ConsentStore root (a profile hive or HKLM).
@@ -323,7 +328,7 @@ struct RawGrant {
     std::string cause{};
     // The READ of this grant's `Value` was refused (ERROR_ACCESS_DENIED) -- NOT the same thing
     // as `state == PermissionState::denied` alone, which also (correctly) means "the read
-    // succeeded and decoded to a stored `Deny` grant" (CDX-P1-002).
+    // succeeded and decoded to a stored `Deny` grant".
     bool read_denied = false;
 };
 

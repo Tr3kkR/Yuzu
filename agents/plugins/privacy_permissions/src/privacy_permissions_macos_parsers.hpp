@@ -35,10 +35,10 @@ struct TccService {
     std::string_view category;
 };
 
-// Only three of the four charter categories are TCC services; every other TCC service
+// Only three of the four categories this plugin models are TCC services; every other TCC service
 // (kTCCServiceContacts, kTCCServiceAppleEvents, kTCCServiceScreenCapture, ...) is out of scope
 // by deliberate filter, not a decode failure -- the query never asks for them. `location` is
-// NOT here (CDX-R2-005): ADR-3003's platform investigation established macOS Location Services
+// NOT here: ADR-3003's platform investigation established macOS Location Services
 // is administered by `locationd`, OUTSIDE TCC entirely -- there is no kTCCServiceLocation row
 // to query. It ships as its own explicit `unsupported` row instead.
 inline constexpr std::array<TccService, 3> kTccServices{{
@@ -66,7 +66,6 @@ inline constexpr std::array<TccService, 3> kTccServices{{
 inline constexpr int kSqlitePerm = 3;
 inline constexpr int kSqliteCantOpen = 14;
 inline constexpr int kSqliteAuth = 23;
-inline constexpr int kSqliteCantOpenSymlink = kSqliteCantOpen | (6 << 8); // extended code
 
 enum class SourceOutcome { absent, denied, unreadable };
 
@@ -86,7 +85,7 @@ struct SourceFailure {
 classify_tcc_presence(int lstat_errno, bool is_regular_file, bool missing_is_absent) {
     if (lstat_errno == 0) {
         if (is_regular_file) return std::nullopt;
-        return SourceFailure{SourceOutcome::unreadable, "not_regular_file"};
+        return SourceFailure{SourceOutcome::unreadable, "not_regular"};
     }
     if (lstat_errno == ENOENT || lstat_errno == ENOTDIR) {
         if (missing_is_absent) return SourceFailure{SourceOutcome::absent, {}};
@@ -100,15 +99,12 @@ classify_tcc_presence(int lstat_errno, bool is_regular_file, bool missing_is_abs
 /// A sqlite3_open_v2 / sqlite3_prepare_v2 failure on a file the lstat pre-check already saw
 /// as present. SQLITE_AUTH/SQLITE_PERM are refusals -> denied. SQLITE_CANTOPEN is a refusal ONLY
 /// when the VFS's own failed syscall (`sys_errno`, from sqlite3_system_errno) was EPERM/EACCES --
-/// the SIP/TCC refusal shape, the charter's expected outcome without Full Disk Access; a
+/// the SIP/TCC refusal shape, the expected outcome without Full Disk Access; a
 /// CANTOPEN for any other reason (ENOENT after a race, EMFILE, ...) is unreadable. Any other code
 /// (SQLITE_NOMEM, SQLITE_IOERR, SQLITE_NOTADB, a schema error) is a real fault that gaining FDA
-/// would not fix -> unreadable (C4-CODEX-004). Pass the EXTENDED code (sqlite3_extended_errcode):
-/// SQLITE_CANTOPEN_SYMLINK is SQLITE_OPEN_NOFOLLOW refusing a symbolic link somewhere in the path
-/// -- never a permission refusal, and sqlite3_system_errno is stale for it (no syscall failed),
-/// so it is unreadable whatever errno says. Otherwise only the primary byte is compared.
+/// would not fix -> unreadable. Pass the EXTENDED code (sqlite3_extended_errcode): only its
+/// primary byte is compared.
 [[nodiscard]] constexpr SourceOutcome classify_tcc_sqlite_rc(int rc, int sys_errno) noexcept {
-    if (rc == kSqliteCantOpenSymlink) return SourceOutcome::unreadable;
     const int primary = rc & 0xff;
     if (primary == kSqliteAuth || primary == kSqlitePerm) return SourceOutcome::denied;
     if (primary == kSqliteCantOpen && (sys_errno == EPERM || sys_errno == EACCES))
@@ -141,10 +137,12 @@ enum class SqliteStage { open, query_only, prepare };
 // through an immutable URI (no lock, no -journal/-wal/-shm opened or created), refused unless it
 // is one quiescent rollback-mode SQLite file, and bounded on every axis.
 inline constexpr std::size_t kMaxRowsPerService = 1024; // real max: 6
-inline constexpr int kMaxValueBytes = 4096;             // real max record: a few hundred bytes
-inline constexpr std::int64_t kMaxDbBytes = 256LL << 20;
+inline constexpr int kMaxSchemaBytes = 64 * 1024; // schema text and any SQL, until the schema loads
+inline constexpr int kMaxValueBytes = 1024;       // after it: real max client 112 B
+inline constexpr std::size_t kMaxSourceBytes = 1024 * 1024; // retained client text per source
+inline constexpr std::int64_t kMaxDbBytes = 16LL << 20;
 inline constexpr std::chrono::milliseconds kRunBudget{10'000};
-inline constexpr std::chrono::milliseconds kSourceBudget{2'000};
+inline constexpr std::chrono::milliseconds kSourceBudget{500};
 
 struct ReadBounds {
     std::chrono::steady_clock::time_point run_end = std::chrono::steady_clock::now() + kRunBudget;
@@ -155,7 +153,8 @@ struct ReadBounds {
 // Why a category's read stopped short: the token suffix after `<source>:<category>:`.
 inline constexpr std::string_view kCutRowCap = "row_cap";
 inline constexpr std::string_view kCutTimeout = "timeout";
-inline constexpr std::string_view kCutValueTooLong = "value_too_long";
+inline constexpr std::string_view kCutValueOversized = "value_oversized";
+inline constexpr std::string_view kCutByteCap = "byte_cap";
 
 inline constexpr std::array<std::string_view, 3> kSidecarSuffixes{"-journal", "-wal", "-shm"};
 
@@ -194,7 +193,7 @@ struct OutputBudget {
 /// The opened descriptor's own fstat: a regular file of plausible size.
 [[nodiscard]] inline std::optional<SourceFailure> classify_tcc_file(bool is_regular,
                                                                     std::int64_t size) {
-    if (!is_regular) return SourceFailure{SourceOutcome::unreadable, "not_regular_file"};
+    if (!is_regular) return SourceFailure{SourceOutcome::unreadable, "not_regular"};
     if (size <= 0 || size > kMaxDbBytes)
         return SourceFailure{SourceOutcome::unreadable, "size_out_of_range"};
     return std::nullopt;

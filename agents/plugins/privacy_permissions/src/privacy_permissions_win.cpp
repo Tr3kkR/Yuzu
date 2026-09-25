@@ -4,8 +4,8 @@
  * HKEY_CURRENT_USER) plus the machine-wide HKLM mirror, walking
  * ...\CapabilityAccessManager\ConsentStore (rung 1, registry only, no spawn).
  *
- * CDX-R2-001: the Windows agent service registers and runs as LocalSystem, not a per-user
- * identity (docs/agent-privilege-model.md TL;DR, #1442) -- HKEY_CURRENT_USER therefore
+ * The Windows agent service registers and runs as LocalSystem, not a per-user
+ * identity (docs/agent-privilege-model.md TL;DR) -- HKEY_CURRENT_USER therefore
  * resolves to LocalSystem's own (irrelevant, near-always-empty) profile, never an interactive
  * user's real ConsentStore. Like license_scan's run_per_user_surfaces and registry's
  * do_get_user_value, this leg enumerates real profiles from HKLM ...\ProfileList
@@ -84,7 +84,7 @@ static_assert(win::kRegQword == REG_QWORD);
 constexpr wchar_t kConsentStorePath[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore";
 
-// COD-P1-03: a ConsentStore subtree is under the OWNING USER's write access (packaged/
+// A ConsentStore subtree is under the OWNING USER's write access (packaged/
 // NonPackaged app keys), so an unbounded enumeration lets that same user pin the instruction
 // worker -- and, on the offline-hive arm, hold the process-wide offline_hive_mutex() -- for as
 // long as they can keep stuffing subkeys. Same shape and same order-of-magnitude as
@@ -97,9 +97,9 @@ struct SubkeyEnum {
 };
 
 /// Every child key name of `parent`, capped at kMaxEnumeratedSubkeys, plus how the walk ended
-/// (win::classify_subkey_enum decides). CDX-R2-002: the code that ended the walk is never
+/// (win::classify_subkey_enum decides). The code that ended the walk is never
 /// discarded -- a mid-enumeration ERROR_ACCESS_DENIED is not "every child enumerated".
-/// C4-CODEX-005/K2: when the loop stops at the cap, one extra, uncounted RegEnumKeyExW probe at
+/// When the loop stops at the cap, one extra, uncounted RegEnumKeyExW probe at
 /// the next index tells "exactly cap children" (complete) from "more exist" (truncated) --
 /// win_profiles.hpp's enumerate_profile_records/profile_list_actually_truncated precedent.
 SubkeyEnum enumerate_subkey_names(HKEY parent) {
@@ -131,7 +131,7 @@ RawGrant read_one_grant(HKEY app_key, std::string app_id, std::string_view categ
     DWORD type = 0, size = 0;
     const LONG probe_rc = RegQueryValueExW(app_key, L"Value", nullptr, &type, nullptr, &size);
     if (probe_rc == ERROR_SUCCESS && size > win::kMaxConsentValueBytes) {
-        // C4-CODEX-002: this subtree is under the OWNING USER's write access, so an unbounded
+        // This subtree is under the OWNING USER's write access, so an unbounded
         // allocation sized from a provider-reported DWORD would let that user make the
         // privileged agent retain an arbitrarily large buffer per value -- capped at the small
         // ConsentStore-literal bound (win::kMaxConsentValueBytes), reported, never truncated.
@@ -149,7 +149,7 @@ RawGrant read_one_grant(HKEY app_key, std::string app_id, std::string_view categ
             if (g.state == PermissionState::unreadable)
                 g.cause = (type != REG_SZ) ? "value_type_" + std::to_string(type) : "value_empty";
         } else if (real_rc == ERROR_ACCESS_DENIED) {
-            // CDX-R2-002: the second read can itself be refused even though the size probe
+            // The second read can itself be refused even though the size probe
             // succeeded (an ACL change between the two calls).
             g.state = PermissionState::denied;
             g.read_denied = true;
@@ -286,8 +286,9 @@ ConsentWalk walk_consent_store(HKEY hive, win::RetentionBudget& budget) {
 }
 
 /// Emits one grant as a row. `source` is the profile name (or "hklm"); `qualify` = prefix the
-/// row's app_id with it (false only for HKLM's own, machine-wide rows). Every failure token is
-/// `<source>\<app_id>:<category>:<cause>` and is also the row's `raw`.
+/// row's app_id with it (false only for HKLM's own, machine-wide rows). A failed grant's row `raw`
+/// is `<source>\<app_id>:<category>:<cause>`; the run's constraint set (the agent-log provenance)
+/// gets only the app-less win::coarse_failure_token.
 void emit_grant(std::string_view source, bool qualify, const RawGrant& g,
                 std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc) {
     const std::string subject = qualify_app_id(source, g.app_id) + ":" + std::string{g.category};
@@ -345,7 +346,7 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         if (win::hklm_overrides_profile(g)) hklm_overriding.push_back(g);
 
     // Real interactive users, not the agent process's own (LocalSystem) HKEY_CURRENT_USER --
-    // see the file banner (CDX-R2-001).
+    // see the file banner.
     // Discovery keeps every code it saw -- a refused or failed root, a walk that
     // ended on an error rather than ERROR_NO_MORE_ITEMS, the cap, a refused SID key or
     // ProfileImagePath -- and each is a row (win::profile_discovery_failure /
@@ -362,7 +363,7 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
     const auto profiles = yuzu::profiles::build_profile_list(discovery.records, hku_subkeys);
 
-    // Profiles whose hive was ACTUALLY reached (COD-P1-02/K1): when none was, HKLM's
+    // Profiles whose hive was ACTUALLY reached: when none was, HKLM's
     // overriding grants are emitted directly (unqualified) rather than silently dropped.
     std::size_t reachable_profiles = 0;
     for (const auto& profile : profiles) {
@@ -382,7 +383,7 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
             continue;
         }
 
-        // C4-CODEX-001: with_user_hive's live-hive check tests only `== ERROR_SUCCESS`, so a
+        // with_user_hive's live-hive check tests only `== ERROR_SUCCESS`, so a
         // refused LIVE HKU\<SID> root is indistinguishable from "not loaded" to its caller, and
         // if the offline fallback then also fails the denial would be lost. A cheap peek at the
         // live root (never gating or replacing the real call; benign TOCTOU) recovers it.
@@ -402,12 +403,13 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         // behind), reported as a token, not a data gap.
         if (report.unload_failed) {
             acc.add_failure(pname + ":hive_unload_failed");
-            spdlog::warn("privacy_permissions: hive unload failed for HKU\\{} -- the profile's "
-                         "NTUSER.DAT stays locked until it is released; retry `reg unload HKU\\{}`",
-                         report.mount_name, report.mount_name);
+            spdlog::error("privacy_permissions: hive unload failed for profile {} (HKU\\{}): its "
+                          "NTUSER.DAT stays locked, and the user's next sign-in may not load the "
+                          "profile, until `reg unload HKU\\{}` succeeds",
+                          pname, report.mount_name, report.mount_name);
         }
 
-        // Exhaustive over the FOUR HiveAccessStatus outcomes (COD-P1-02/K1): a profile whose hive
+        // Exhaustive over the FOUR HiveAccessStatus outcomes: a profile whose hive
         // was never opened must never read as "this profile has no grants" -- each failure is
         // its own row.
         // `refused`: the cause is itself a refusal (a missing privilege): denied, token unchanged.

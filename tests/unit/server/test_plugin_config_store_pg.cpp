@@ -541,6 +541,9 @@ TEST_CASE("Wave 8: ServerImpl's boot sequence actually calls "
                                           marker);
     REQUIRE(guard_start != std::string::npos);
     CHECK(guard_start < marker);
+    // The guard must be this call's own, not an earlier seed's.
+    CHECK(source.substr(guard_start, marker - guard_start).find("seed_kill_switch_default_off") ==
+          std::string::npos);
 
     CHECK(block.find("startup_failed_ = true;") != std::string::npos);
     CHECK(block.find("Refusing to start") != std::string::npos);

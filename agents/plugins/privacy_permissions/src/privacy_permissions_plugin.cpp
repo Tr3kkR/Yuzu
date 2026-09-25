@@ -15,18 +15,13 @@
  * kill-switch seed (server.cpp) gates whether this plugin's dispatch is even reachable; this
  * plugin performs no authz itself.
  *
- * WHY (state plainly, do not inflate): the roadmap's own research found zero documented
- * business/compliance driver anywhere in the four planning docs for this row -- the weakest
- * justification in the whole wave. Built anyway as fleet-visibility completeness: every
- * competitor EDR/MDM already reports this. See README "Caveats and known gaps" for the full
- * disclosure.
+ * WHY (stated plainly): no business or compliance driver is documented for this plugin. See
+ * README "Caveats and known gaps".
  *
- * All three legs are genuinely first-of-kind in this codebase (confirmed by repo-wide grep:
- * zero TCC.db, zero ConsentStore/CapabilityAccessManager, zero sd_bus_open_user anywhere
- * before this plugin) -- lower confidence than a typical Wave 8 row, several real unknowns
- * are named in each leg's own file banner and resolved only by a real-host probe, not by
- * assumption. Portable except the dispatch #if; all three descriptor legs are declared
- * unconditionally so the capability-matrix generator sees one shape everywhere.
+ * All three legs are first of their kind here (no earlier TCC.db, ConsentStore or
+ * sd_bus_open_user code); each leg banner names what is measured and what is not. Portable
+ * except the dispatch #if; all three descriptor legs are declared unconditionally so the
+ * capability-matrix generator sees one shape everywhere.
  */
 
 #include <string>
@@ -124,11 +119,13 @@ public:
             return 1;
         } catch (...) {
             // Same 8-field shape as a data row (row_kind `constrained`), so the YAML columns
-            // still line up on the one row a consumer is most likely to be puzzled by. A literal:
-            // nothing here may allocate.
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "internal_error");
-            ctx.write_output(kInternalErrorRow);
+            // still line up. No formatting here; the SDK wrapper copies, so the writes are guarded.
+            try {
+                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL, "internal_error");
+                ctx.write_output(kInternalErrorRow);
+            } catch (...) {
+            }
             return 1;
         }
     }

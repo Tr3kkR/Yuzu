@@ -647,12 +647,39 @@ TEST_CASE("win::RetentionBudget: the run deadline is injectable, inclusive and s
     CHECK(b.walk_stopped());
 }
 
+TEST_CASE("macos: the documented bounds and the tokens a bound produces",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::kMaxSchemaBytes == 64 * 1024);
+    CHECK(macos::kMaxValueBytes == 1024);
+    CHECK(macos::kMaxRowsPerService == 1024);
+    CHECK(macos::kMaxSourceBytes == 1024u * 1024u);
+    CHECK(macos::kMaxDbBytes == 16LL * 1024 * 1024);
+    CHECK(macos::kSourceBudget == std::chrono::milliseconds{500});
+    CHECK(macos::kRunBudget == std::chrono::seconds{10});
+    CHECK(macos::kCutRowCap == "row_cap");
+    CHECK(macos::kCutByteCap == "byte_cap");
+    CHECK(macos::kCutValueOversized == "value_oversized");
+    CHECK(macos::kCutTimeout == "timeout");
+}
+
 TEST_CASE("win::coarse_failure_token: one token per kind of failure, however many apps share it",
           "[privacy_permissions][win_parsers]") {
     yuzu::shared::ConstraintAccumulator acc;
     for (int i = 0; i < 1000; ++i)
         acc.add_failure(win::coarse_failure_token("alice", "camera", "value_oversized"));
     CHECK(acc.reason() == "alice:camera:value_oversized");
+
+    // A number the ConsentStore owner chooses (a value's type, a LastUsedTime size) is not kept.
+    yuzu::shared::ConstraintAccumulator typed;
+    for (int i = 0; i < 1000; ++i) {
+        typed.add_failure(
+            win::coarse_failure_token("alice", "camera", "value_type_" + std::to_string(i)));
+        typed.add_failure(win::coarse_failure_token("alice", "camera",
+                                                    "last_used_start_size_" + std::to_string(i)));
+    }
+    CHECK(typed.reason() == "alice:camera:value_type,alice:camera:last_used_start_size");
+    CHECK(win::coarse_failure_token("alice", "camera", "value_win32_1450") ==
+          "alice:camera:value_win32_1450");
 }
 
 TEST_CASE("win::nonpackaged_open_failure: a missing NonPackaged key is the toggle row reading "
@@ -780,7 +807,7 @@ TEST_CASE("macos::classify_tcc_presence: a missing per-user db is absent, a miss
     const auto link = macos::classify_tcc_presence(0, false, true);
     REQUIRE(link);
     CHECK(link->outcome == macos::SourceOutcome::unreadable);
-    CHECK(link->cause == "not_regular_file");
+    CHECK(link->cause == "not_regular");
     const auto io = macos::classify_tcc_presence(EIO, false, true);
     REQUIRE(io);
     CHECK(io->cause == "lstat_errno_" + std::to_string(EIO));
@@ -797,9 +824,6 @@ TEST_CASE("macos::classify_tcc_sqlite_rc: AUTH/PERM denied; CANTOPEN denied only
     CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, 0) == SourceOutcome::unreadable);
     CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, ENOENT) == SourceOutcome::unreadable);
     CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, EMFILE) == SourceOutcome::unreadable);
-    // NOFOLLOW's symlink refusal: no syscall failed, errno is stale -- never a false denied.
-    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpenSymlink, EPERM) ==
-          SourceOutcome::unreadable);
     CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteAuth, 0) == SourceOutcome::denied);
     CHECK(macos::classify_tcc_sqlite_rc(macos::kSqlitePerm, 0) == SourceOutcome::denied);
     CHECK(macos::classify_tcc_sqlite_rc(1 /* SQLITE_ERROR */, EPERM) == SourceOutcome::unreadable);
@@ -857,14 +881,19 @@ TEST_CASE("macos::classify_tcc_header: WAL is either version byte; the change co
     CHECK_FALSE(macos::classify_tcc_header(h));
     h[24] = 1, h[27] = 4;
     CHECK(macos::header_change_counter(h) == 0x01000004u);
+    const auto refusal = [](std::span<const unsigned char> bytes) {
+        const auto f = macos::classify_tcc_header(bytes);
+        REQUIRE(f);
+        return f->cause;
+    };
     for (const std::size_t i : {18, 19}) {
         auto wal = h;
         wal[i] = 2;
-        CHECK(macos::classify_tcc_header(wal)->cause == "wal_mode");
+        CHECK(refusal(wal) == "wal_mode");
     }
-    CHECK(macos::classify_tcc_header(std::span{h}.first(99))->cause == "not_sqlite");
+    CHECK(refusal(std::span{h}.first(99)) == "not_sqlite");
     h[0] = 'X';
-    CHECK(macos::classify_tcc_header(h)->cause == "not_sqlite");
+    CHECK(refusal(h) == "not_sqlite");
 }
 
 TEST_CASE("macos::read_unchanged: every field of the file stamp matters",

@@ -9,7 +9,7 @@
 /// @file plugin_action_catalogue_privacy_permissions.hpp
 /// One fragment of the command capability catalogue: `privacy_permissions`'s single action
 /// (`agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp`). Classified by
-/// READING the implementation, per this package's spec.
+/// reading the implementation.
 ///
 /// `permissions` is ReadOnly/None -- the plugin never requests, revokes or modifies a permission
 /// grant on any platform. It reads TCC.db (opened immutable: no lock taken, no sidecar file
@@ -47,7 +47,7 @@ inline constexpr std::array<CommandCapability, 1> kPluginActionCataloguePrivacyP
     },
 }};
 
-// #1398: every row must author .execute_gate -- an omission would value-initialize to
+// Every row must author .execute_gate -- an omission would value-initialize to
 // ExecuteGate::Unspecified (the zero enumerator), a compile failure here rather than a
 // silent runtime gap. See ExecuteGate's doc comment in command_capability.hpp.
 static_assert(

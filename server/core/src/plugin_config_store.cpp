@@ -484,8 +484,8 @@ bool PluginConfigStore::seed_kill_switch_default_off(std::string_view plugin,
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease) {
-        spdlog::error("PluginConfigStore: kill-switch seed for {} failed: no connection lease",
-                      plugin);
+        spdlog::error("PluginConfigStore: kill-switch seed for {} failed: no connection lease ({})",
+                      plugin, pool_.last_error());
         return false;
     }
     pg::PgResult res = pg::exec_params(
