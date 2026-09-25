@@ -2772,6 +2772,27 @@ TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on a
             a.detail.find("from-inventory-query") != std::string::npos)
             saw_from_inventory_query_denied = true;
     CHECK(saw_from_inventory_query_denied);
+
+    // Clause (5), routed-concerns-access-control.md "Service-scoped API token
+    // confinement": the A4 body must NOT name a `.permission` that would not,
+    // by itself, admit the caller — a service-scoped token holding
+    // Inventory:Read is STILL denied here, so naming it would be a false
+    // self-remediation claim. Pin this on the response body itself (matching
+    // test_inventory_routes.cpp's identical idiom for the same clause) rather
+    // than relying only on the status-code check above, which would stay
+    // green even if a future edit dropped the explicit "" and fell back to
+    // the helper's GuaranteedState:Read default.
+    auto raw = h.sink.Post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":"linux"}]})");
+    REQUIRE(raw);
+    REQUIRE(raw->status == 403);
+    auto body = nlohmann::json::parse(raw->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(raw->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
 }
 
 TEST_CASE("owner-scoped result-set routes: an ordinary session is unaffected "
