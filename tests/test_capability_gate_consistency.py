@@ -96,6 +96,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_browser_policy.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
@@ -126,19 +127,23 @@ FRAGMENT_FILES = [
 # Wave 8 PR8.6: +2 app_control (wdac_policy/applocker_policy) — read-only
 # posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
 # Wave 8 PR8.1-a1: +2 platform_security (secure_boot/code_integrity).
+# Wave 10 PR10.1-b: +2 runtimes (dotnet/jvm).
+# Wave 10 PR10.2-b: +1 browser_policy (policies).
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
 # 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
-# 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) = 219.
+# 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) +
+# 1 (browser_policy) = 220.
 # This constant has been bumped independently on both sides of a merge several times
 # (PR #4719 CI is the trail; #4721 tracks deriving it per fragment). The rule is
 # always the same: find the shared baseline both sides agree on and add EVERY side's new
-# plugin on top of it, never pick one side's total. Dev is at 216 here (209 baseline +
-# printing.clear_queue 1 + app_control 2 + platform_security 2 + browser_inventory 2);
-# firmware_posture's 1 row and runtimes' 2 rows (dotnet, jvm) landed independently on the
-# two sides of the merge: 216 + 1 + 2 = 219.
-EXPECTED_TOTAL_ROWS = 219
+# plugin on top of it, never pick one side's total. Dev is at 219 here (216 baseline +
+# firmware_posture 1 + runtimes 2, per that merge's own resolution); this branch's own
+# browser_policy (+1) lands on top of dev's 219: 219 + 1 = 220. Verified directly against
+# the merged fragment files (not by combining these two stale totals) before landing —
+# see the merge commit for the confirming test run.
+EXPECTED_TOTAL_ROWS = 220
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
