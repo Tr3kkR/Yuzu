@@ -25,6 +25,7 @@
 #include "agent_registry.hpp"
 #include "default_certs.hpp"
 #include "event_bus.hpp"
+#include "nvd_db.hpp"
 #include "process_health.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -69,6 +70,7 @@ struct Harness {
     DefaultCertSet default_cert_set{};
     std::atomic<bool> draining{false};
     PgReachabilityProbe* pg_probe{nullptr}; // HA WS-8: null = fail-closed
+    NvdDatabase* nvd_db{nullptr}; // null unless a case wires one
 
     bool session_present{true};
     std::string session_username{"alice"};
@@ -133,7 +135,8 @@ struct Harness {
         deps.draining = &draining;
         deps.pg_reachability_probe = pg_probe;
         deps.server_start_time = std::chrono::steady_clock::now();
-        // Every store pointer stays null — see file header comment.
+        deps.nvd_db = nvd_db;
+        // Every other store pointer stays null — see file header comment.
         health::register_health_routes(sink, deps);
     }
 
@@ -317,6 +320,42 @@ TEST_CASE("health_routes: GET /readyz with every store pointer null reports "
     // scim_store above.
     CHECK(std::find(failed.begin(), failed.end(), "ca_store") == failed.end());
     CHECK(std::find(failed.begin(), failed.end(), "ca_root") == failed.end());
+}
+
+TEST_CASE("health_routes: GET /readyz reports a dead nvd_db as degraded, never "
+          "as a failed store",
+          "[server][routes][health_routes]") {
+    // nvd_db is fail-open by design: a broken CVE cache must be visible to
+    // on-call without pulling the node out of rotation.
+    Harness h;
+    h.wire(); // nvd_db left null == not open
+    auto r = h.sink.Get("/readyz");
+    REQUIRE(r);
+    auto body = json::parse(r->body);
+    REQUIRE(body.contains("degraded"));
+    auto degraded = body["degraded"].get<std::vector<std::string>>();
+    CHECK(std::find(degraded.begin(), degraded.end(), "nvd_db") != degraded.end());
+    REQUIRE(body.contains("failed_stores"));
+    auto failed = body["failed_stores"].get<std::vector<std::string>>();
+    CHECK(std::find(failed.begin(), failed.end(), "nvd_db") == failed.end());
+}
+
+TEST_CASE("health_routes: GET /readyz does not report an open nvd_db as degraded",
+          "[server][routes][health_routes]") {
+    // The other arm of the nvd_db notice: pins the predicate to is_open(), so a
+    // regression to a constant false (always degraded) fails here.
+    NvdDatabase db(":memory:");
+    REQUIRE(db.is_open());
+    Harness h;
+    h.nvd_db = &db;
+    h.wire();
+    auto r = h.sink.Get("/readyz");
+    REQUIRE(r);
+    auto body = json::parse(r->body);
+    if (body.contains("degraded")) {
+        auto degraded = body["degraded"].get<std::vector<std::string>>();
+        CHECK(std::find(degraded.begin(), degraded.end(), "nvd_db") == degraded.end());
+    }
 }
 
 TEST_CASE("health_routes: GET /readyz reports draining when deps.draining is "

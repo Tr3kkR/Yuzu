@@ -809,10 +809,16 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // that posture and the comment that used to sit on this row. Reported
         // separately so on-call can still tell feature-off from feature-on-but-
         // dead without pulling a healthy node out of LB/orchestrator rotation.
+        // nvd_db is the same shape: construction is fail-OPEN by design (a CVE
+        // cache that fails to open leaves matching empty, never a 503), and it
+        // is always constructed, so a null pointer or a not-open handle is
+        // genuinely "broken", not "feature off". Without this row a dead CVE
+        // cache showed only as the yuzu_nvd_* gauges going absent.
         std::vector<StoreCheck> notices = {
             {"analytics_event_store",
              !deps.cfg->analytics_enabled ||
                  (deps.analytics_store && deps.analytics_store->is_open())},
+            {"nvd_db", deps.nvd_db && deps.nvd_db->is_open()},
         };
 
         std::string failed_list;
