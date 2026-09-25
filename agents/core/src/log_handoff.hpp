@@ -53,8 +53,12 @@
 /// scheme (that was a specification bug in an earlier draft, caught by the final
 /// review -- verify against ErrorState below, not against a stale comment elsewhere).
 ///
-/// TEARDOWN CONTRACT (plan 1.4, PR-1-scoped): teardown() is idempotent (a second call,
-/// or the destructor firing after an explicit call, is a no-op) and is a STANDALONE,
+/// TEARDOWN CONTRACT (plan 1.4, PR-1-scoped): teardown() is idempotent -- a second SEQUENTIAL
+/// call (or the destructor firing after an explicit call already returned) is a no-op. A second
+/// CONCURRENT call (from a different thread, still in flight) instead WAITS for the winner and is
+/// safe only if the concurrent caller is not the thread that frees the object -- see the class's
+/// own THREAD-SAFETY CONTRACT below for the full SAFE/UNSAFE breakdown; do not read "idempotent" as
+/// "always safe from a second thread." teardown() is a STANDALONE,
 /// SELF-CONTAINED call -- it constructs its own ShutdownDeadlineGuard
 /// (shutdown_deadline_guard.hpp) around the (possibly blocking) drain-and-destroy work,
 /// so a caller (PR-2's main.cpp/service_win.cpp) does not need to build a SEPARATE
@@ -380,7 +384,7 @@ struct DrainHandle;
 /// re-review, cpp-safety finding), so a loser can never observe `teardown_done_ == true` without
 /// the notify having already run -- that half of the handshake is provably correct.
 ///
-/// WHAT THIS DOES **NOT** COVER (Gate 8 fifth re-review, cpp-safety finding, empirically
+/// WHAT THIS DOES NOT COVER (scoped governance run, cpp-safety finding, empirically
 /// reproduced): the loser-waits pattern only prevents a use-after-free when the object's memory
 /// keeps existing until the LOSER has fully returned from wait_for_teardown_completion() -- and
 /// nothing makes the WINNER wait for that. mark_teardown_complete()'s notify-under-lock guarantees
@@ -393,7 +397,7 @@ struct DrainHandle;
 ///     call -- the destructor blocks in wait_for_teardown_completion() and only proceeds to
 ///     actually destroy the object's members AFTER that wait returns, so by construction nothing
 ///     it owns is freed while the winner is still using it.
-///   - **UNSAFE, live use-after-free:** the destructor (or whichever thread frees the object once
+///   - UNSAFE, LIVE USE-AFTER-FREE: the destructor (or whichever thread frees the object once
 ///     its OWN teardown() call returns) is the WINNER, while a separate thread's teardown() call is
 ///     concurrently the LOSER. The winner's teardown() returns immediately after
 ///     mark_teardown_complete()'s notify; if that thread then destroys the object (member
@@ -538,8 +542,10 @@ public:
     /// Test/diagnostic accessor -- not surfaced on the heartbeat (PR-3's job, if ever).
     [[nodiscard]] std::string last_log_error_for_test() const;
 
-    /// T0-T3 (see the file banner's TEARDOWN CONTRACT). Exactly once -- a second call,
-    /// from any thread, is a no-op. NOEXCEPT and fail-closed: if anything inside throws
+    /// T0-T3 (see the file banner's TEARDOWN CONTRACT). Idempotent: a second SEQUENTIAL call is a
+    /// no-op; a second CONCURRENT call from another thread waits and is safe only if that thread
+    /// does not free the object -- see the class's THREAD-SAFETY CONTRACT above. NOEXCEPT and
+    /// fail-closed: if anything inside throws
     /// unexpectedly, this calls hard_exit(kLogTeardownExitCode) itself rather than let
     /// an exception escape a call the destructor depends on being noexcept.
     void teardown(std::chrono::milliseconds grace = kLogTeardownGrace) noexcept;

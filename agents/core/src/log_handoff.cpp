@@ -644,7 +644,7 @@ void LogHandoff::teardown(std::chrono::milliseconds grace) noexcept {
             teardown_body();
         } // guard destructs (cancels the watchdog) here, strictly before mark_teardown_complete()
           // below, preserving the file's own ordering contract via SCOPE rather than a separate
-          // try (Gate 8 fifth re-review, cpp-expert finding: a separate try bought no different
+          // try (scoped governance run, cpp-expert finding: a separate try bought no different
           // exception-handling semantics than nesting the guard here -- mark_teardown_complete()'s
           // own std::lock_guard construction is the same std::mutex::lock()-can-throw possibility
           // the catch below already covers).
