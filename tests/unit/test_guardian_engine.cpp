@@ -26,12 +26,14 @@
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
 #include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
+#include "guardian_legacy_sink_executor.hpp" // LegacySendOutcome (EventSink's return type, #4783)
 
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -886,10 +888,17 @@ TEST_CASE("GuardianEngine: drift event_id embeds agent_id (#1307)",
           "[guardian][engine][event][event_id]") {
     GuardianFixture f;  // agent_id == "agent-test"
 
-    std::string captured_id;
-    f.engine->set_event_sink([&captured_id](const gpb::GuaranteedStateEvent& ev) {
-        captured_id = ev.event_id();
+    // #4783: EventSink delivery is now asynchronous (a detached executor worker,
+    // not the calling thread) — own the captured data via shared_ptr rather than
+    // reference-capturing a local declared after the fixture, so destruction
+    // order can never race the worker's own access to it.
+    auto captured_id = std::make_shared<std::string>();
+    f.engine->set_event_sink([captured_id](const gpb::GuaranteedStateEvent& ev) {
+        *captured_id = ev.event_id();
+        return yuzu::agent::LegacySendOutcome::Sent;
     });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
 
     yuzu::agent::GuardDrift d;
     d.guard_type = "registry";
@@ -897,11 +906,12 @@ TEST_CASE("GuardianEngine: drift event_id embeds agent_id (#1307)",
     d.rule_name = "rule-A";
     yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
 
-    REQUIRE_FALSE(captured_id.empty());
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE_FALSE(captured_id->empty());
     // Layout is "<rule_id>-<agent_id>-<ms>-<seq>"; assert agent_id is present and
     // sits immediately after the rule_id prefix (the slot the crash path uses).
-    CHECK(captured_id.find("agent-test") != std::string::npos);
-    CHECK(captured_id.rfind("rule-A-agent-test-", 0) == 0);
+    CHECK(captured_id->find("agent-test") != std::string::npos);
+    CHECK(captured_id->rfind("rule-A-agent-test-", 0) == 0);
 }
 
 TEST_CASE("GuardianEngine: same rule + same seq on two agents → distinct event_ids (#1307)",
@@ -928,9 +938,23 @@ TEST_CASE("GuardianEngine: same rule + same seq on two agents → distinct event
     REQUIRE(eng_a.start_local().has_value());
     REQUIRE(eng_b.start_local().has_value());
 
-    std::string id_a, id_b;
-    eng_a.set_event_sink([&id_a](const gpb::GuaranteedStateEvent& ev) { id_a = ev.event_id(); });
-    eng_b.set_event_sink([&id_b](const gpb::GuaranteedStateEvent& ev) { id_b = ev.event_id(); });
+    // #4783: own the captures via shared_ptr — see the sibling event_id test's
+    // comment above for why a reference capture of a local declared after the
+    // engines is no longer safe now that delivery is asynchronous.
+    auto id_a = std::make_shared<std::string>();
+    auto id_b = std::make_shared<std::string>();
+    eng_a.set_event_sink([id_a](const gpb::GuaranteedStateEvent& ev) {
+        *id_a = ev.event_id();
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    eng_b.set_event_sink([id_b](const gpb::GuaranteedStateEvent& ev) {
+        *id_b = ev.event_id();
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    yuzu::test::ScopeExit retire_a(
+        [&] { CHECK(eng_a.retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
+    yuzu::test::ScopeExit retire_b(
+        [&] { CHECK(eng_b.retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
 
     yuzu::agent::GuardDrift d;
     d.guard_type = "registry";
@@ -940,15 +964,17 @@ TEST_CASE("GuardianEngine: same rule + same seq on two agents → distinct event
     yuzu::agent::guardian_emit_drift_for_test(eng_a, d);
     yuzu::agent::guardian_emit_drift_for_test(eng_b, d);
 
-    REQUIRE_FALSE(id_a.empty());
-    REQUIRE_FALSE(id_b.empty());
-    CHECK(id_a != id_b);  // no PK collision
+    REQUIRE(eng_a.flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE(eng_b.flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE_FALSE(id_a->empty());
+    REQUIRE_FALSE(id_b->empty());
+    CHECK(*id_a != *id_b);  // no PK collision
     // Prefix-anchor each id independently (not just containment): this pins the
     // "{rule_id}-{agent_id}-..." layout so the test fails against the pre-fix
     // "{rule_id}-{ms}-{seq}" shape on its own, without depending on a timing
     // difference between the two emits or on the sibling test having run.
-    CHECK(id_a.rfind("shared-rule-agent-alpha-", 0) == 0);
-    CHECK(id_b.rfind("shared-rule-agent-bravo-", 0) == 0);
+    CHECK(id_a->rfind("shared-rule-agent-alpha-", 0) == 0);
+    CHECK(id_b->rfind("shared-rule-agent-bravo-", 0) == 0);
 }
 
 TEST_CASE("GuardianEngine: empty agent_id still yields a well-formed (if ambiguous) event_id",
@@ -966,10 +992,13 @@ TEST_CASE("GuardianEngine: empty agent_id still yields a well-formed (if ambiguo
     GuardianEngine eng{&kv, ""};
     REQUIRE(eng.start_local().has_value());
 
-    std::string captured_id;
-    eng.set_event_sink([&captured_id](const gpb::GuaranteedStateEvent& ev) {
-        captured_id = ev.event_id();
+    auto captured_id = std::make_shared<std::string>();
+    eng.set_event_sink([captured_id](const gpb::GuaranteedStateEvent& ev) {
+        *captured_id = ev.event_id();
+        return yuzu::agent::LegacySendOutcome::Sent;
     });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(eng.retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
 
     yuzu::agent::GuardDrift d;
     d.guard_type = "registry";
@@ -977,8 +1006,9 @@ TEST_CASE("GuardianEngine: empty agent_id still yields a well-formed (if ambiguo
     d.rule_name = "rule-Z";
     yuzu::agent::guardian_emit_drift_for_test(eng, d);
 
-    REQUIRE_FALSE(captured_id.empty());
-    CHECK(captured_id.rfind("rule-Z--", 0) == 0);  // empty agent_id segment, not a crash
+    REQUIRE(eng.flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE_FALSE(captured_id->empty());
+    CHECK(captured_id->rfind("rule-Z--", 0) == 0);  // empty agent_id segment, not a crash
 }
 
 TEST_CASE("GuardianEngine: stop() makes subsequent apply_rules fail",
@@ -1061,8 +1091,16 @@ TEST_CASE("GuardianEngine: a health report emits guard.unhealthy with its detail
           "[guardian][engine][event][health]") {
     GuardianFixture f;
 
-    gpb::GuaranteedStateEvent captured;
-    f.engine->set_event_sink([&captured](const gpb::GuaranteedStateEvent& ev) { captured = ev; });
+    // #4783: shared_ptr-owned capture — see the event_id test's comment near the
+    // top of this file for why a reference to a local declared after the fixture
+    // is no longer safe now that delivery is asynchronous.
+    auto captured = std::make_shared<gpb::GuaranteedStateEvent>();
+    f.engine->set_event_sink([captured](const gpb::GuaranteedStateEvent& ev) {
+        *captured = ev;
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
 
     yuzu::agent::GuardDrift d;
     d.guard_type = "file";
@@ -1072,23 +1110,29 @@ TEST_CASE("GuardianEngine: a health report emits guard.unhealthy with its detail
     d.health_detail = "parent-directory watch permanently disabled";
     yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
 
-    CHECK(captured.event_type() == "guard.unhealthy");
-    CHECK(captured.guard_type() == "file");
-    CHECK(captured.rule_name() == "rule-health-name");
-    CHECK(captured.detail_json() == R"({"detail":"parent-directory watch permanently disabled"})");
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    CHECK(captured->event_type() == "guard.unhealthy");
+    CHECK(captured->guard_type() == "file");
+    CHECK(captured->rule_name() == "rule-health-name");
+    CHECK(captured->detail_json() == R"({"detail":"parent-directory watch permanently disabled"})");
     // event_id/rule_id/guard_category/timestamp/platform are stamped outside the
     // health/drift branch — unaffected by which arm ran.
-    CHECK(captured.rule_id() == "rule-health");
-    CHECK(captured.guard_category() == "event");
-    CHECK_FALSE(captured.event_id().empty());
+    CHECK(captured->rule_id() == "rule-health");
+    CHECK(captured->guard_category() == "event");
+    CHECK_FALSE(captured->event_id().empty());
 }
 
 TEST_CASE("GuardianEngine: a health report with an empty detail omits detail_json",
           "[guardian][engine][event][health]") {
     GuardianFixture f;
 
-    gpb::GuaranteedStateEvent captured;
-    f.engine->set_event_sink([&captured](const gpb::GuaranteedStateEvent& ev) { captured = ev; });
+    auto captured = std::make_shared<gpb::GuaranteedStateEvent>();
+    f.engine->set_event_sink([captured](const gpb::GuaranteedStateEvent& ev) {
+        *captured = ev;
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
 
     yuzu::agent::GuardDrift d;
     d.guard_type = "file";
@@ -1098,8 +1142,9 @@ TEST_CASE("GuardianEngine: a health report with an empty detail omits detail_jso
     // health_detail left empty.
     yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
 
-    CHECK(captured.event_type() == "guard.unhealthy");
-    CHECK(captured.detail_json().empty());
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    CHECK(captured->event_type() == "guard.unhealthy");
+    CHECK(captured->detail_json().empty());
 }
 
 TEST_CASE("GuardianEngine: a health report with non-UTF-8 detail bytes still serializes "
@@ -1107,8 +1152,13 @@ TEST_CASE("GuardianEngine: a health report with non-UTF-8 detail bytes still ser
           "[guardian][engine][event][health]") {
     GuardianFixture f;
 
-    gpb::GuaranteedStateEvent captured;
-    f.engine->set_event_sink([&captured](const gpb::GuaranteedStateEvent& ev) { captured = ev; });
+    auto captured = std::make_shared<gpb::GuaranteedStateEvent>();
+    f.engine->set_event_sink([captured](const gpb::GuaranteedStateEvent& ev) {
+        *captured = ev;
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
 
     yuzu::agent::GuardDrift d;
     d.guard_type = "file";
@@ -1118,9 +1168,10 @@ TEST_CASE("GuardianEngine: a health report with non-UTF-8 detail bytes still ser
     d.health_detail = "bad-byte-\xFF-here";
     yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
 
-    CHECK(captured.event_type() == "guard.unhealthy");
-    CHECK_FALSE(captured.detail_json().empty()); // must serialize, never throw/drop the event
-    CHECK(captured.detail_json().find("bad-byte-") != std::string::npos);
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    CHECK(captured->event_type() == "guard.unhealthy");
+    CHECK_FALSE(captured->detail_json().empty()); // must serialize, never throw/drop the event
+    CHECK(captured->detail_json().find("bad-byte-") != std::string::npos);
 }
 
 TEST_CASE("GuardianEngine: a health report with contradictory compliance fields set still "
@@ -1128,8 +1179,13 @@ TEST_CASE("GuardianEngine: a health report with contradictory compliance fields 
           "[guardian][engine][event][health]") {
     GuardianFixture f;
 
-    gpb::GuaranteedStateEvent captured;
-    f.engine->set_event_sink([&captured](const gpb::GuaranteedStateEvent& ev) { captured = ev; });
+    auto captured = std::make_shared<gpb::GuaranteedStateEvent>();
+    f.engine->set_event_sink([captured](const gpb::GuaranteedStateEvent& ev) {
+        *captured = ev;
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
 
     yuzu::agent::GuardDrift d;
     d.guard_type = "file";
@@ -1148,10 +1204,11 @@ TEST_CASE("GuardianEngine: a health report with contradictory compliance fields 
     d.collapsed_count = 3;
     yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
 
-    CHECK(captured.event_type() == "guard.unhealthy");
-    CHECK(captured.remediation_action().empty());
-    CHECK_FALSE(captured.remediation_success());
-    CHECK(captured.detected_value().empty());
-    CHECK(captured.expected_value().empty());
-    CHECK(captured.drift_rate() == 0);
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    CHECK(captured->event_type() == "guard.unhealthy");
+    CHECK(captured->remediation_action().empty());
+    CHECK_FALSE(captured->remediation_success());
+    CHECK(captured->detected_value().empty());
+    CHECK(captured->expected_value().empty());
+    CHECK(captured->drift_rate() == 0);
 }
