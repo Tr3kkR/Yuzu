@@ -655,7 +655,20 @@ void LogHandoff::teardown(std::chrono::milliseconds grace) noexcept {
         // needs waking.
         hard_exit(kLogTeardownExitCode);
     }
-    mark_teardown_complete();
+    // Own try/catch (Gate 8 fourth re-review, cpp-safety finding): kept SEPARATE
+    // from the try above (not folded into it), because that one is scoped to the
+    // ShutdownDeadlineGuard -- which must fully cancel (destruct) before the notify
+    // below fires, per the file's own ordering contract -- not because this call
+    // needs different exception-handling semantics. mark_teardown_complete()'s own
+    // std::lock_guard construction is the same std::mutex::lock()-can-throw
+    // possibility already covered everywhere else in this function (T0, the loser
+    // branch above); this is the one call site that was missed when those two were
+    // fixed.
+    try {
+        mark_teardown_complete();
+    } catch (...) {
+        hard_exit(kLogTeardownExitCode);
+    }
 }
 
 void LogHandoff::teardown_with_action_for_test(std::chrono::milliseconds grace,

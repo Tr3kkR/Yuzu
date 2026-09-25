@@ -384,7 +384,19 @@ struct DrainHandle;
 /// calling teardown() (or one calling it while another
 /// drops the last `unique_ptr<LogHandoff>`, triggering the destructor) no longer race
 /// each other for use-after-free purposes: the loser's `teardown()` call does not
-/// return until the object's live state is genuinely quiescent. Separately, they are NOT synchronized against a
+/// return until the object's live state is genuinely quiescent. CONCURRENCY BOUND
+/// (Gate 8 fourth re-review, cpp-safety finding): this is proven for exactly ONE
+/// winner plus ONE loser. With `notify_all()` (not `notify_one()`), if TWO losers
+/// are simultaneously blocked in wait_for_teardown_completion() on the SAME object
+/// (e.g. the destructing owner's thread AND a separate concurrent explicit
+/// teardown() caller), the first one woken could -- if it is the destructing owner
+/// -- free teardown_done_mu_/teardown_done_cv_ while the second loser is still
+/// mid-lock() on that same mutex, the identical use-after-free shape one level up.
+/// Not introduced by any fix here (inherent to a loser-waits pattern once more than
+/// one loser can exist) and not reachable by any call site or test in this PR, but
+/// stated explicitly rather than left implicit: at most ONE explicit teardown() call
+/// may race the destructor at a time; two simultaneous non-destructor callers
+/// racing each other AND the destructor is outside this contract's proof. Separately, they are NOT synchronized against a
 /// concurrent call to the plain accessors below (overrun_total()/queue_depth()/
 /// in_write()/stalled_for()/log_errors_total()/last_log_error_for_test()) or against
 /// install()/logger() -- those read pool_/logger_/wrapped_sinks_/error_state_
