@@ -237,12 +237,14 @@ const std::vector<pg::PgMigration>& migrations() {
     // runs `rbac_store.principal_roles JOIN auth.users ... WHERE
     // u.is_active` in its OWN transaction, on the assumption this column
     // keeps its name and its "not soft-deleted / deactivated" meaning — the
-    // precondition every login path filters on, but NOT sufficient on its
-    // own for "can currently authenticate": lockout (locked_until /
-    // failed_login_count), an MFA-enrolled-but-pending account,
-    // --auth-mode=sso-only, and identity_source all gate authentication
-    // separately and must not be folded into this column's meaning. A
-    // rename fails the guard closed (SQL error); a change to what
+    // precondition every LOCAL PASSWORD login path filters on (lockout via
+    // locked_until/failed_login_count, an MFA-enrolled-but-pending account,
+    // and --auth-mode=sso-only all additionally gate the local path). An
+    // OIDC/SAML session is minted directly from IdP group membership
+    // (AuthManager::create_oidc_session/create_saml_session, auth.cpp) and
+    // never reads this column at all — see docs/user-manual/rbac.md's
+    // local-account-only-check note (#4966) for the resulting guard-coverage
+    // gap. A rename fails the guard closed (SQL error); a change to what
     // `is_active` *means* silently changes what the guard counts.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,

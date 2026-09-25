@@ -2591,9 +2591,9 @@ static const ToolDef kTools[] = {
      "Administrator role. A caller may NOT remove their own Administrator assignment through "
      "this tool (self-lockout guard); removing the fleet's LAST remaining authenticatable "
      "Administrator grant is refused even by another admin — the fleet must always keep at "
-     "least one. A grant held by a deactivated account, or by a principal with no matching "
-     "active auth.users row, does not count as a surviving Administrator, so a refusal can "
-     "happen even when other Administrator grants nominally exist. "
+     "least one. A grant naming a nonexistent, deactivated, soft-deleted, or group-held "
+     "principal is never counted as a surviving Administrator, so a refusal can happen even "
+     "when other Administrator grants nominally exist. "
      "Idempotent: unassigning a role the principal did not hold still returns success. "
      "Destructive — verify the target doesn't need this role before calling. Requires "
      "Security:Write (supervised MCP tier; approval-gated).",
