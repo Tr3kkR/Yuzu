@@ -5967,10 +5967,12 @@ with zero scoping. Unlike the async producers below, it is a synchronous
 read, not a dispatch, so it gates on the same securable as `GET
 /api/v1/inventory/software` rather than `Execution:Execute`. **A
 service-scoped token is denied outright here too (#4980)**, same as its
-result-set siblings — before #4980 this route admitted-and-confined a
-service-scoped token via `fleet_read_fn` instead of denying it, a tracked
-cross-service-reach gap (`#4307`); see the "Result Sets" section below for
-the full history). The owner-scoped result-set row it creates is only
+result-set siblings — before #4980, under RBAC-on, this route
+admitted-and-confined a service-scoped token via `fleet_read_fn` instead of
+denying it, a tracked cross-service-reach gap (`#4307`); `fleet_read_fn`
+still hard-denied a service-scoped token under RBAC-off (the default), same
+as the `require_permission` gate it briefly replaced (see the "Result Sets"
+section below for the full history). The owner-scoped result-set row it creates is only
 readable/mutable by its own creator through the routes below, which — like
 their HTMX dashboard twins — also deny a service-scoped token outright:
 `session->username` is the *minting* principal's identity, not the token's

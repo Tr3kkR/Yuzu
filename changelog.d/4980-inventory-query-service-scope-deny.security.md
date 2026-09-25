@@ -2,8 +2,10 @@
   service-scoped API token outright, matching its 8 non-dispatch sibling
   result-set routes (#4980).** Previously this route gated purely through the
   admit-then-filter `fleet_read_fn` chokepoint (ADR-0017), whose service-scope
-  branch admits-and-confines a service-scoped caller rather than denying it —
-  but the result set this call materializes is owner-scoped to
+  branch admits-and-confines a service-scoped caller under RBAC-on rather than
+  denying it (RBAC-off, the default, was unaffected — `fleet_read_fn` still
+  hard-denied a service-scoped caller there) — but the result set this call
+  materializes is owner-scoped to
   `session->username` (the token-minting **principal's** identity, not the
   token's own service tag), so a service-scoped token holding `Inventory:Read`
   could mint a result set the minting principal's other tokens/session could
