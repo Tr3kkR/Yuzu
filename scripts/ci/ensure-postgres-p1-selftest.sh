@@ -1007,6 +1007,33 @@ expect "pgoptions-lowercase-nonempty-fatal" "rc" "1" "$RC"
 expect_contains "pgoptions-lowercase-nonempty-fatal" "stderr" "PGOPTIONS must not be set" "$err"
 expect_not_contains "pgoptions-lowercase-nonempty-fatal" "stdout" "YUZU_TEST_POSTGRES_DSN=" "$OUT"
 
+# ── the pre-set DSN's own options= is refused in every spelling libpq
+#          honours (keyword with no space after `=`, URI query) before any
+#          psql call, and a look-alike keyword (myoptions=) is not. The gate
+#          only works while its regex stays unquoted on the right of =~. ────
+N=$((N + 1))
+state="$(new_state 0 "$CAP_OFF" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "host=127.0.0.1 port=5433 user=yuzu dbname=yuzu_test options='-c statement_timeout=0'" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "options-dsn-keyword-fatal" "rc" "1" "$RC"
+expect_contains "options-dsn-keyword-fatal" "stderr" "must not set options=" "$err"
+expect_not_contains "options-dsn-keyword-fatal" "stdout" "YUZU_TEST_POSTGRES_DSN=" "$OUT"
+
+N=$((N + 1))
+state="$(new_state 0 "$CAP_OFF" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test?options=-c%20statement_timeout%3D0" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "options-dsn-uri-fatal" "rc" "1" "$RC"
+expect_contains "options-dsn-uri-fatal" "stderr" "must not set options=" "$err"
+expect_not_contains "options-dsn-uri-fatal" "stdout" "YUZU_TEST_POSTGRES_DSN=" "$OUT"
+
+N=$((N + 1))
+state="$(new_state 0 "$CAP_OFF" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "host=127.0.0.1 port=5433 user=yuzu dbname=yuzu_test myoptions=1" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "options-dsn-lookalike-not-fatal" "rc" "0" "$RC"
+expect_not_contains "options-dsn-lookalike-not-fatal" "stderr" "must not set options=" "$err"
+
 # ── 26. a lower-case pghostaddr=::1 still refuses the heal (set-or-empty,
 #          case-insensitive) — unaffected by the PGOPTIONS non-empty fix
 #          above, since the two gates use p1_env_is_set differently. ──────

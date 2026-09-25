@@ -29,11 +29,12 @@
 #      PGHOST/PGHOSTADDR/PGSERVICE/PGPORT override in the job/
 #      runner environment, and with a toolchain-manifest-vouched psql
 #      (YUZU_CI_PSQL, exported by deploy/windows/Assert-Toolchain.ps1
-#      -ExportCiEnv), attempts a heal. The heal session's own first two
-#      statements are in-session identity/config-parse DO-block guards that
-#      RAISE before any ALTER SYSTEM if the server it is actually talking
-#      to isn't loopback:port, or if pg_file_settings already has a parse
-#      error — only past both does it run ALTER SYSTEM + pg_reload_conf(),
+#      -ExportCiEnv), attempts a heal. The heal session first pins
+#      search_path; its next two statements are in-session identity/config-
+#      parse DO-block guards that RAISE before any ALTER SYSTEM if the
+#      server it is actually talking to isn't loopback:port, or if
+#      pg_file_settings has a reload-aborting error — only past both does
+#      it run ALTER SYSTEM + pg_reload_conf(),
 #      then re-read with a bounded retry. Elsewhere, drift is reported,
 #      never healed. A manifest-vouched SELECT 1 probe failure (agent 0/
 #      base cluster or any further agent) is retried then fails the job —
@@ -477,9 +478,10 @@ p1_conform() {
     heal*)
       echo "::warning::ensure-postgres: ${hp_disp} had ${decision#heal } not off ($(p1_flatten "$rows")) — healing with ALTER SYSTEM SET ... = off + pg_reload_conf(). This persists in postgresql.auto.conf; if it recurs, the printed pg_settings.source will name the cause." >&2
       rc=0
-      # The heal session's first two statements are in-session DO-block
-      # guards, run BEFORE any ALTER SYSTEM under ON_ERROR_STOP=1 (either
-      # RAISEing aborts the whole call with no ALTER issued): (1) an
+      # The heal session runs, in order: a search_path pin (below), then
+      # two in-session DO-block guards, all BEFORE any ALTER SYSTEM under
+      # ON_ERROR_STOP=1 (either guard RAISEing aborts the whole call with
+      # no ALTER issued): (1) an
       # identity guard binding what the heal actually MUTATES to loopback
       # on this DSN's exact port ${hp} — explicit IS NULL disjuncts so a
       # Unix-socket session's NULL inet_server_addr()/port() RAISEs
@@ -610,6 +612,10 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   # per libpq's conninfo_parse), so the `=` is matched with `[[:space:]]*`
   # in front, not a bare `=` - adversarial review v2 F1', reproduced
   # empirically against `options = '-c statement_timeout=0'`.
+  # Keep the pattern UNQUOTED and inline on the right of =~: the space
+  # before `]]` is bash's separator, and moving the regex into a quoted
+  # variable would carry a trailing space into the pattern (the options=
+  # cases in the harness pin this).
   if [[ "${YUZU_TEST_POSTGRES_DSN}" =~ (^|[?&[:space:]])options[[:space:]]*= ]]; then
     echo "::error::ensure-postgres: pre-set YUZU_TEST_POSTGRES_DSN must not set options= (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead. See docs/ci-architecture.md 'Postgres for server tests'." >&2
     exit "$SOFT_EXIT"
