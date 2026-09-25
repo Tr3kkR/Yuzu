@@ -94,7 +94,7 @@ If a user loses both their authenticator and all 10 recovery codes (or is locked
 | Flag | Default | Description |
 |---|---|---|
 | `--mfa-enforcement` | `optional` | `optional`: users enroll voluntarily; login never requires it. `admin-only`: an admin without MFA must enroll before login completes. `required`: every role must enroll. Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrollment (`POST /login/mfa/enroll`) before a session is minted; the startup log emits an `INFO` line naming the active mode. **Breaking:** in releases before this one these values were accepted but a no-op — see `docs/user-manual/upgrading.md` before enabling. For SSO users see "MFA on SSO sessions" below — your IdP must assert an `amr` MFA method. |
-| `--mfa-step-up-window-secs` | `300` | Seconds after a TOTP proof during which high-risk endpoints accept the session as "stepped up" without re-prompting. Set to `0` to disable the step-up gate entirely (escape hatch — emits a startup `WARN`). |
+| `--mfa-step-up-window-secs` | `300` | Seconds after a TOTP proof during which high-risk endpoints accept the session as "stepped up" without re-prompting. Set to `0` to disable the step-up gate on every endpoint except JIT elevation (`POST /api/v1/elevate` and the elevation-eligibility routes), which keeps a 300s window (escape hatch — emits a startup `WARN`). |
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state lives in process memory and is lost on server restart. |
 
 Each flag also accepts the matching `YUZU_MFA_*` environment variable.

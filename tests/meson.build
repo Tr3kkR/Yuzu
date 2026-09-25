@@ -262,6 +262,7 @@ agent_test_exe = executable(
     'unit/test_command_dedup_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
+    'unit/test_guardian_engine_legacy_sink.cpp', # #4783 commit 1: [!mayfail] red evidence only
     'unit/test_guardian_journal_format.cpp',
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
@@ -308,6 +309,7 @@ agent_test_exe = executable(
     'unit/test_guardian_convergence_scheduler.cpp',
     'unit/test_guardian_io_executor.cpp',
     'unit/test_guardian_outbox_send_executor.cpp',
+    'unit/test_guardian_legacy_sink_executor.cpp',
     'unit/test_guardian_outbox_drain_worker.cpp',
     'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_guardian_arm_ack.cpp',
@@ -1273,6 +1275,7 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
       'unit/server/test_agent_properties_scope_authz.cpp', # #3700: require_scoped_permission on /api/agents/:id/properties
@@ -2276,6 +2279,20 @@ test('proto gen_proto version check',
   args: [files('test_gen_proto_version.py')],
   suite: 'proto',
   timeout: 30,
+)
+
+# ── Gateway build wrapper ──────────────────────────────────────────────────
+# scripts/build_gateway.py (+ the shared erlang_toolchain.py) driven with a
+# fake Python child — no Erlang needed, so it runs on every leg, including the
+# Windows one whose stdio/timeout/Ctrl-C behaviour it mostly pins. ~51s
+# measured (Windows and Linux); several cases deliberately wait out a
+# grandchild to prove the whole tree was killed, so the timeout leaves room
+# for a loaded shared runner box.
+test('gateway build wrapper',
+  _python3_test,
+  args: [files('test_build_gateway.py')],
+  suite: 'docs',
+  timeout: 180,
 )
 
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
