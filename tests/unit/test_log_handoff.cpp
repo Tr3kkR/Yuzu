@@ -837,3 +837,87 @@ TEST_CASE("U-json: set_formatter() reaches the inner sink through the wrapper, s
     // Not the default text pattern's shape.
     CHECK(rec.formatted.find('[') == std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// U10: two genuinely concurrent teardown() calls -- the loser-waits handshake
+// under real thread contention, kept deterministically inside the SAFE half
+// of the THREAD-SAFETY CONTRACT (log_handoff.hpp)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("U10: two concurrent teardown() calls on a stably-owned object never race "
+          "for use-after-free; the loser genuinely waits for the winner",
+          "[log_handoff]") {
+    // Governance scoped-review rounds 5/6 (#4666) found and then documented that the
+    // loser-waits handshake (torn_down_ exchange, notify-under-lock,
+    // wait_for_teardown_completion()) is safe ONLY when the object's memory outlives
+    // the loser's own return from that wait -- true when the destructor is the
+    // LOSER, false when the destructor (or whichever thread frees the object right
+    // after its own call returns) is the WINNER. No test exercises the UNSAFE half
+    // by design (see the header's "WHAT THIS DOES NOT COVER" paragraph): the only
+    // way to observe it is to trigger a genuine heap-use-after-free, which is not
+    // something to leave running in the ordinary (non-sanitized) shared test binary
+    // -- a mis-timed race there would risk corrupting state for unrelated tests
+    // sharing this process, not just failing cleanly.
+    //
+    // This test instead exercises the SAFE half's underlying mechanism directly:
+    // two threads race to call teardown() on the SAME live object, but NEITHER of
+    // them is the thread that frees it -- `h` (and its owning
+    // unique_ptr<LogHandoff>) stays alive for the entire test and is only destroyed
+    // after BOTH racing threads have already returned. That makes this
+    // deterministically safe regardless of which thread wins the torn_down_
+    // exchange, while still proving the loser genuinely BLOCKS until the winner's
+    // teardown_body() has actually finished (observed via the paused sink below),
+    // rather than racing ahead or returning early.
+    Harness h; // initially paused
+    yuzu::test::ScopeExit release_on_exit{[&] { h.sink->release(); }};
+
+    auto logger = h.handoff->logger();
+    logger->info("park");
+    REQUIRE(yuzu::test::spin_until([&] { return h.handoff->in_write(); }));
+
+    LogHandoff* raw = h.handoff.get(); // NOT the owner -- h.handoff owns it throughout
+
+    std::atomic<bool> t1_done{false};
+    std::atomic<bool> t2_done{false};
+    std::thread t1([&] {
+        raw->teardown();
+        t1_done.store(true, std::memory_order_release);
+    });
+    std::thread t2([&] {
+        raw->teardown();
+        t2_done.store(true, std::memory_order_release);
+    });
+
+    // The sink is still paused, so whichever thread wins the exchange is now
+    // genuinely blocked inside teardown_body()'s pool join (the worker can't finish
+    // draining), and the loser is genuinely blocked inside
+    // wait_for_teardown_completion() -- neither call has anything to return early
+    // on. Give both threads a moment to reach that state (matches "BLOCKER round-2
+    // regression"'s own sleep_for idiom above for the identical purpose), well
+    // inside kLogTeardownGrace's 2s default so the watchdog cannot fire here.
+    std::this_thread::sleep_for(100ms * yuzu::test::kSpinScale);
+    CHECK_FALSE(t1_done.load(std::memory_order_acquire));
+    CHECK_FALSE(t2_done.load(std::memory_order_acquire));
+
+    // Release the gate: the parked worker finishes draining, the winner's pool join
+    // completes, mark_teardown_complete() wakes the loser under the lock, and both
+    // calls return.
+    h.sink->release();
+
+    const bool t1_ok =
+        yuzu::test::spin_until([&] { return t1_done.load(std::memory_order_acquire); });
+    const bool t2_ok =
+        yuzu::test::spin_until([&] { return t2_done.load(std::memory_order_acquire); });
+
+    // Cleanup runs unconditionally before any assertion (this file's GATE
+    // DISCIPLINE convention): both threads must be joined before Harness's own
+    // destructor -- a third, now purely sequential teardown() call, since both
+    // racing calls have already returned -- runs.
+    t1.join();
+    t2.join();
+
+    REQUIRE(t1_ok);
+    REQUIRE(t2_ok);
+    SUCCEED("two concurrent explicit teardown() calls on a live object both "
+            "completed cleanly; the loser genuinely waited for the winner");
+}

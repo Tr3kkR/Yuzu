@@ -100,6 +100,16 @@ Requested to check whether round 5's fix (a documentation-only correction, no ne
 
 Verified: full `[log_handoff]` suite green (12094 assertions/14 cases) across 3 standalone runs on `build-linux`, the full `--suite agent` pass, and fresh `build-linux-tsan`/`build-linux-asan` (ASan+UBSan) runs, all clean.
 
+### Standing regression test for the SAFE half of the contract (U10), added on operator request after round 6
+
+The two-losers-and-then-one-loser UAF found in rounds 5/6 had no standing regression coverage — round 5's own repro and round 6's own validation harness were both temporary, reverted before commit. Asked whether a standing test could be added: yes for the SAFE half (destructor-as-loser and the loser-waits handshake it relies on), not for the UNSAFE half — see the new `U10` test's own header comment in `tests/unit/test_log_handoff.cpp` for the full reasoning, summarized here:
+
+- A test that deliberately triggers the UNSAFE interleaving (destructor-as-winner) would need to trigger a genuine heap-use-after-free to prove anything. In the ordinary (non-sanitized) shared test binary that's a hazard, not a test — undefined behavior without sanitizer instrumentation may not crash at all, or may silently corrupt state for unrelated tests sharing the same process. Making it safe to run by default would need its own ASan-only, subprocess-isolated harness, which this codebase has no existing pattern for — deferred, not built here.
+- `U10` instead exercises the loser-waits handshake (the same `torn_down_` exchange, notify-under-lock, `wait_for_teardown_completion()` mechanism) under genuine two-thread contention, while remaining **deterministically** safe: two threads race to call `teardown()` on the same live object, but *neither* of them frees it — the owning `unique_ptr<LogHandoff>` stays alive for the whole test and is only dropped after both racing threads have already returned. This can never reach the destructor-as-winner interleaving by construction (there is no unique_ptr drop during the race at all), so it carries none of the risk above, while still proving the loser genuinely blocks (observed via a paused sink) rather than racing ahead or returning early.
+- This does not regression-test the specific round-5/6 defect (which needed a real free mid-race) — it regression-tests the foundational mechanism that defect was found IN, under real concurrent contention, for the first time in this test file (no existing case had two threads both calling `teardown()` concurrently on one object before this).
+
+Verified: `[log_handoff]` green (12101 assertions/15 cases, the new U10 case included) across 10 standalone runs on `build-linux`, the full `--suite agent` pass, and fresh `build-linux-tsan`/`build-linux-asan` runs, all clean.
+
 ## Trigger rows and invariants this change was checked against
 
 - **Spark detection layer row, clause (4) — APPLICABLE, not "not triggered".** An earlier draft of
