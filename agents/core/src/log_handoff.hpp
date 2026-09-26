@@ -8,12 +8,17 @@
 /// .claude/plans/spark-4666-retire-synchronous-log-writes-DELIVERY-PLAN.md for the full
 /// design record (adjudication table, decisions taken, risk register).
 ///
-/// PR-1 SCOPE ONLY: this file builds the primitive -- StallObservableSink, LogHandoff,
-/// drain_log_bounded() -- as a correct, fully unit-tested, standalone unit. Nothing here
-/// is called from the shipped binary yet: PR-2 wires main.cpp's/service_win.cpp's real
-/// install()/teardown() call sites and the guardian_engine.cpp/guardian_spark_runtime.hpp
-/// drain_log_bounded() call sites. Do not infer that any of this is live in production
-/// from this file's existence alone.
+/// PR-1 built the primitive -- StallObservableSink, LogHandoff, drain_log_bounded() --
+/// as a correct, fully unit-tested, standalone unit. PR-2 (LANDED) wires it into
+/// production: main.cpp's/service_win.cpp's real install()/teardown() call sites
+/// (agent_log_wiring.hpp) and the F3 orphan-exit drain_log_bounded() calls in both
+/// files. The guardian_engine.cpp/guardian_spark_runtime.hpp drain_log_bounded() call
+/// sites PR-1's own plan once expected here were evaluated and deliberately NOT added
+/// by PR-2 -- neither file has a hard_exit() call site that would need one (grep-
+/// confirmed; see docs/spark-flip-gate.md's own status update and this file's PR-2
+/// resource-ledger section for the full record). Corrected here after an
+/// adversarial-review finding that this banner, as the primary anchor for both PRs,
+/// had drifted into contradicting the shipped code twice over.
 ///
 /// THE GUARANTEE (plan 1.1), stated exactly: a producer's spdlog:: call formats on the
 /// calling thread, constructs the log_msg (stamping `time` and `thread_id` there), and

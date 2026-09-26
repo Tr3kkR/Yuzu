@@ -703,10 +703,21 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE; // log_epilogue's destructor still tears down cleanly here
     }
     if (log_handoff->used_log_file_fallback()) {
-        std::cerr << "Failed to open log file '" << log_file << "': "
+        // Format the RESOLVED path (log_opts.log_file), not the raw CLI log_file string:
+        // for a Windows service using its implicit default (no --log-file given), the
+        // default is resolved only into log_opts by make_log_handoff_options() above —
+        // the CLI-local log_file stays empty, and formatting it here printed a
+        // diagnostic naming no path at all, on exactly the configuration where an
+        // operator has no other way to learn which path to fix (adversarial-review
+        // finding, governance-hardening round). used_log_file_fallback() is true only
+        // when create() actually attempted a file open, so log_opts.log_file is
+        // guaranteed set here.
+        const std::string attempted_path =
+            log_opts.log_file ? log_opts.log_file->string() : log_file;
+        std::cerr << "Failed to open log file '" << attempted_path << "': "
                   << log_handoff->log_file_fallback_reason()
                   << " — logging to console only\n";
-        spdlog::warn("Failed to open log file '{}': {} — logging to console only", log_file,
+        spdlog::warn("Failed to open log file '{}': {} — logging to console only", attempted_path,
                      log_handoff->log_file_fallback_reason());
     }
 

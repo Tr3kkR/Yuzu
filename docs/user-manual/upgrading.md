@@ -3002,7 +3002,11 @@ Before upgrading any component:
   sustained overload the queue drops the oldest still-queued lines
   (`overrun_oldest`) rather than blocking or growing; there is no
   `--log-sync` opt-out. Not a breaking change: same log format, same
-  `--log-file`/rotation behaviour, no new flags. The only new
+  `--log-file`/rotation behaviour, no new flags, with one exception: the
+  "Received signal, shutting down..." line on `SIGINT`/`SIGTERM`/Ctrl-C used
+  to be a raw stderr-only write and now goes through the same configured
+  logger as everything else, so it also lands in `--log-file` and picks up
+  JSON formatting under `--log-format json`. The other new
   operator-visible surface is a fifth self-exit code: tearing down the async
   logger during shutdown is itself bounded by a 2-second internal watchdog,
   and a wedge there self-terminates with **exit code 5**, distinct from the

@@ -29,6 +29,7 @@
 /// see log_handoff.hpp's THREAD-SAFETY CONTRACT / TEARDOWN CONTRACT) run AFTER every
 /// later-declared object has already been destroyed and can no longer log.
 
+#include "hard_exit.hpp"
 #include "log_handoff.hpp"
 
 #include <yuzu/json_log_formatter.hpp>
@@ -84,20 +85,45 @@ inline constexpr std::string_view kDefaultLogPattern = "[%Y-%m-%d %H:%M:%S.%e] [
 
 /// The exe-image half of teardown: swaps THIS image's spdlog default logger to a null
 /// sink (so nothing in this image can log through the about-to-be-destroyed logger
-/// while teardown() runs), then calls h.teardown(). The swap is firewalled in
-/// try/catch -- if it fails, teardown() still runs regardless (LogHandoff::teardown()
-/// is documented to run unconditionally even if install() was never called on this
-/// instance).
+/// while teardown() runs), then calls h.teardown() regardless of whether the swap
+/// succeeded (LogHandoff::teardown() is documented to run unconditionally even if
+/// install() was never called on this instance).
+///
+/// CATASTROPHIC ON MACOS IF THE SWAP THROW IS SWALLOWED WITHOUT FAILING CLOSED
+/// (adversarial-review finding, governance-hardening round): on a platform with two
+/// separate spdlog registries (macOS -- see log_handoff.hpp's MULTI-IMAGE note and this
+/// file's own banner), THIS swap is the ONLY thing that ever drops THIS image's
+/// registry reference to the real logger -- h.teardown() below only ever reaches the
+/// registry of the image IT is compiled into (the core library), never this one. If the
+/// swap throws (spdlog::set_default_logger()'s registry-mutex lock/map write is not
+/// noexcept; the two make_shared calls above it can throw bad_alloc) and that exception
+/// is merely swallowed, this image's registry keeps a live, real reference to the
+/// logger and its sinks -- surviving teardown()'s bounded watchdog entirely and only
+/// getting destroyed at UNWATCHED process static teardown, which is the exact
+/// unbounded-shutdown-wedge hazard this whole primitive exists to close. So: track
+/// whether the swap actually succeeded, and hard_exit() if it did not, rather than
+/// silently continuing into a teardown() that cannot see or fix the retained reference.
 inline void release_log_handoff_from_this_image(LogHandoff& h) noexcept {
+    bool swap_ok = false;
     try {
         spdlog::set_default_logger(
             std::make_shared<spdlog::logger>("", std::make_shared<spdlog::sinks::null_sink_mt>()));
+        swap_ok = true;
     } catch (...) {
-        // Deliberately swallowed -- h.teardown() below is unconditional and itself
-        // noexcept (log_handoff.hpp), so a failure to pre-emptively null this image's
-        // default logger must not skip or block the real teardown.
+        // Deliberately swallowed here, not re-thrown -- this function is noexcept and
+        // h.teardown() below is unconditional regardless of swap_ok, exactly as before.
+        // What changed: swap_ok now records the failure so it can be acted on AFTER
+        // teardown() runs, instead of being silently treated as harmless.
     }
     h.teardown(); // already noexcept -- not double-wrapped in try/catch.
+    if (!swap_ok) {
+        // Fail closed, matching log_handoff.cpp's own teardown-exception precedent
+        // (hard_exit(kLogTeardownExitCode) there too). On Linux/Windows (single
+        // registry) this is unreachable in practice: teardown()'s own T2 step already
+        // dropped the one registry's reference before this check runs. On macOS this is
+        // the ONLY backstop for the retained-reference hazard above.
+        hard_exit(kLogTeardownExitCode);
+    }
 }
 
 /// RAII wrapper: calls release_log_handoff_from_this_image(h) in its destructor. See

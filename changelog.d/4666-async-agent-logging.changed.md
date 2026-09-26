@@ -5,6 +5,9 @@
   queue drops the oldest still-queued lines rather than blocking or growing. Agent shutdown gains
   one more possible self-exit code, `5`, distinct from the existing `1`/`3`/`4`, if tearing down
   the logger does not complete within its own short internal deadline. Not a breaking change: same
-  log format, same `--log-file`/rotation behaviour, no new flags. Operators with a supervisor
-  script or alert keyed to a fixed agent exit-code set should widen it to include `5`. See
-  "Stopping a wedged agent" in `docs/user-manual/server-admin.md`.
+  log format, same `--log-file`/rotation behaviour, no new flags — with one exception: the
+  "Received signal, shutting down..." line printed on `SIGINT`/`SIGTERM`/Ctrl-C used to be a raw
+  write straight to stderr and is now routed through the configured logger like everything else,
+  so it now also lands in `--log-file` and picks up JSON formatting under `--log-format json`.
+  Operators with a supervisor script or alert keyed to a fixed agent exit-code set should widen it
+  to include `5`. See "Stopping a wedged agent" in `docs/user-manual/server-admin.md`.
