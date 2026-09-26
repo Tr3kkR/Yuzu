@@ -1085,6 +1085,103 @@ TEST_CASE("RbacStore: unassign_role SUCCEEDS removing a DEACTIVATED "
     CHECK(store.get_principal_roles("user", "deactivatedonly").empty());
 }
 
+// Doomgoose external review, PR #4985 (IMPORTANT finding #1, TOCTOU): the
+// `locked_admin_principal_ids` snapshot above is taken BEFORE the DELETE, and
+// `auth.users` is deliberately left unlocked by this guard (see the "never
+// lock auth.users rows here" note on `unassign_role` in rbac_store.cpp) — so a
+// principal that is a ghost/deactivated Administrator grant at lock time (and
+// therefore excluded from the locked/counted set) can be reactivated by a
+// FULLY INDEPENDENT, concurrent transaction (`AuthDB::reactivate_user`) in the
+// gap between the lock query and the DELETE. If that reactivated principal is
+// the fleet's ONLY real Administrator, the guard must still refuse — this
+// reproduces exactly that interleaving and confirms the fix (the fresh
+// post-DELETE `auth.users.is_active` re-check) catches it.
+//
+// Deterministic interleaving: production's own `FOR UPDATE OF pr` lock query
+// does NOT lock ghostadmin's row (it's inactive at lock time, so it fails the
+// JOIN's `is_active` filter and is never in that query's result set) — so,
+// unlike the CHAOS-1/race tests above, there is no natural production lock to
+// hang the background thread on here. This test manufactures its own
+// synchronization point instead: connection A takes a direct `FOR UPDATE` on
+// ghostadmin's own `principal_roles` row (not a production statement, purely
+// a test-only control point) BEFORE the background thread starts, which
+// blocks that thread's own `DELETE` (targeting the identical row) until
+// connection A releases it — giving a guaranteed window in which to commit
+// the reactivation from a third, fully independent connection before letting
+// the background thread's DELETE (and this fix's fresh re-check) proceed.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard REFUSES when "
+          "the ONLY Administrator grant is reactivated by an independent "
+          "transaction between the lock query and the DELETE (TOCTOU close, "
+          "PR #4985 finding #1)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "ghostadmin");
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+    // Deactivate — ghostadmin is now the fleet's ONLY Administrator grant, and
+    // it is NOT counted (mirrors the "ghost/deactivated" scenario the earlier
+    // succeeds-test above covers), so `unassign_role`'s lock query will find
+    // zero locked/counted rows.
+    REQUIRE(auth_db->remove_user("ghostadmin").has_value());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    // Test-only lock (NOT a production statement — see the header comment
+    // above): locks the exact row the background thread's DELETE will target,
+    // so that DELETE blocks here regardless of the production lock query's
+    // own (empty, since ghostadmin is inactive) result set.
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "SELECT principal_id FROM rbac_store.principal_roles WHERE "
+                            "principal_type = 'user' AND principal_id = 'ghostadmin' AND "
+                            "role_name = 'Administrator' FOR UPDATE",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> b_started{false};
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_ok{false};
+    std::string b_error;
+    std::jthread unassign_thread([&] {
+        b_started = true;
+        auto res = store.unassign_role("user", "ghostadmin", "Administrator");
+        b_ok = res.has_value();
+        if (!res)
+            b_error = res.error();
+        b_done = true;
+    });
+
+    // Prove a real blocked-then-unblocked interleaving (Doomgoose external
+    // review, PR #4985 IMPORTANT #6) — separate probe connection, never
+    // lease_a itself. See poll_for_blocked_backend_pid's own doc comment.
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
+    CHECK(b_started.load());
+    CHECK_FALSE(b_done.load());
+
+    // Reactivate ghostadmin from a FULLY INDEPENDENT connection/transaction
+    // (AuthDB::reactivate_user acquires its own pool lease and commits
+    // immediately) WHILE the background thread's unassign is still blocked
+    // between its lock query and its DELETE — the exact race window finding
+    // #1 identified.
+    REQUIRE(auth_db->reactivate_user("ghostadmin").has_value());
+
+    // Release connection A's hold so the background DELETE can proceed.
+    REQUIRE(pg::exec_params(lease_a.get(), "ROLLBACK", std::vector<std::string>{}).ok());
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    // Must now be refused: ghostadmin is (as of the reactivation, already
+    // committed) the fleet's ONLY real Administrator, and this delete would
+    // leave zero.
+    CHECK_FALSE(b_ok.load());
+    CHECK(is_rbac_last_admin_refusal(b_error));
+
+    // Refused ⇒ rolled back ⇒ the grant survives, and the account is (per the
+    // reactivation) active — the fleet still has exactly one real admin.
+    CHECK(store.get_principal_roles("user", "ghostadmin").size() == 1);
+}
+
 // MINOR (Doomgoose external review, PR #4985): the idempotent no-op shape a
 // regression here would actually spuriously refuse — unassigning
 // "Administrator" from a principal who never held it at all, on a store with

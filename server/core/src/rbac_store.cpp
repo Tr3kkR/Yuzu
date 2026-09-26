@@ -2127,8 +2127,47 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // in `locked_admin_principal_ids`, so this also naturally excludes a
         // group-held "Administrator" row per the "match the gate exactly"
         // rule above.
+        //
+        // TOCTOU close (Doomgoose external review, PR #4985, finding #1):
+        // `locked_admin_principal_ids` is a snapshot taken BEFORE the DELETE, and
+        // `auth.users` is deliberately left unlocked (see the "never lock auth.users
+        // rows here" note above) — so a row that was ghost/deactivated at lock time
+        // (and therefore excluded from the locked set) can be reactivated by a fully
+        // independent, concurrent transaction (e.g. `AuthDB::reactivate_user`) in the
+        // gap between the lock query and this DELETE. If that reactivated principal
+        // is the fleet's ONLY real Administrator, trusting the stale snapshot alone
+        // would evaluate `removed_a_counted_admin` false and skip the recount below
+        // entirely — silently removing the last real admin's grant with no refusal.
+        // Close this with a FRESH, targeted re-check of `auth.users.is_active` for
+        // the SPECIFIC principal_id just deleted, run here (after the DELETE, same
+        // transaction) rather than relying on the earlier snapshot for this decision:
+        // under READ COMMITTED this fresh statement sees any reactivation that has
+        // ALREADY COMMITTED by this point. Only needed when the principal wasn't
+        // already in the locked set — if it was, the recount below already fires
+        // regardless.
+        bool reactivated_since_lock = false;
+        if (role_name == "Administrator" && removed && principal_type == "user" &&
+            locked_admin_principal_ids.count(principal_id) == 0) {
+            pg::PgResult fresh_active = pg::exec_params(
+                c, "SELECT is_active FROM auth.users WHERE username = $1",
+                std::vector<std::string>{principal_id});
+            if (fresh_active.status() != PGRES_TUPLES_OK) {
+                err = PQerrorMessage(c);
+                return false;
+            }
+            reactivated_since_lock = PQntuples(fresh_active.get()) == 1 &&
+                                     to_bool(PQgetvalue(fresh_active.get(), 0, 0));
+        }
+        // Residual window, documented honestly rather than claimed fully closed
+        // (matching this codebase's own accepted-staleness convention elsewhere,
+        // e.g. #2703's bounded stale-serve): a reactivation that commits strictly
+        // AFTER this fresh check but BEFORE this transaction's own commit is still
+        // unseen by this guard. Deliberately NOT closed by locking `auth.users`
+        // here — that remains the explicitly out-of-scope alternative per the
+        // "never lock auth.users rows here" design note above.
         const bool removed_a_counted_admin =
-            removed && principal_type == "user" && locked_admin_principal_ids.count(principal_id) > 0;
+            removed && principal_type == "user" &&
+            (locked_admin_principal_ids.count(principal_id) > 0 || reactivated_since_lock);
         if (role_name == "Administrator" && removed_a_counted_admin) {
             pg::PgResult remaining = pg::exec_params(
                 c,
