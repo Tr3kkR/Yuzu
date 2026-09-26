@@ -1875,11 +1875,15 @@ private:
         bool recovered{false};
     };
 
-    /// Off-lock, static (touches no member), noexcept: sweeper_main() has no
-    /// catch around this call, so a throw from a log call here (fmt allocation)
-    /// would be thread death on the sole producer of health edges. Content,
-    /// level and the 1/2/4/8 gate are exactly what sweeper_main() wrote under
-    /// mu_ before #4704; a default-constructed outcome (a clean pass) logs nothing.
+    /// Off-lock, static (touches no member), noexcept with an internal catch:
+    /// spdlog already catches a single formatting/allocation failure
+    /// internally (its own SPDLOG_TRY/CATCH) and routes it to a rate-limited
+    /// error handler without rethrowing, so only a second, double allocation
+    /// failure inside that handler's own formatting can reach the catch(...)
+    /// below - which would otherwise terminate the sole producer of health
+    /// edges via std::thread. Content, level and the 1/2/4/8 gate are exactly
+    /// what sweeper_main() wrote under mu_ before #4704; a default-constructed
+    /// outcome (a clean pass) logs nothing.
     static void log_pass_outcome(const PassOutcome& o) noexcept {
         try {
             if (o.recovered) {

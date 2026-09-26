@@ -11036,7 +11036,6 @@ void reg_run_log_off_lock(const RegLogOffLock& sc) {
     // (locals unwind in reverse: the mechanism joins its sweeper first, then the logger
     // restores the previous default logger, then the gate and atomics die).
     std::atomic<bool> failing{false};
-    std::atomic<int> throws{0};
     std::atomic<bool> parked{false};
     RegLogGate gate;
     // PfStallLogger copies the default logger's level; the `recovered` line is INFO, so a
@@ -11063,10 +11062,8 @@ void reg_run_log_off_lock(const RegLogOffLock& sc) {
         RegistryMechanismTestControls ctl;
         ctl.sweep_cadence = 5ms;
         ctl.sweep_hook = [&] {
-            if (failing.load(std::memory_order_acquire)) {
-                throws.fetch_add(1, std::memory_order_relaxed);
+            if (failing.load(std::memory_order_acquire))
                 throw std::bad_alloc{};
-            }
         };
         return ctl;
     };

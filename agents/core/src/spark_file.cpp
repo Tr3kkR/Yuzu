@@ -2917,10 +2917,14 @@ private:
         return out;
     }
 
-    /// Off-lock, noexcept: run() has NO outer catch, so a throw from a log call
-    /// here would be worker death, the very thing the pass catch exists to
-    /// prevent. Same wrapping rule as every other diagnostic in a recovery path
-    /// in this file.
+    /// Off-lock, noexcept with an internal catch: spdlog already catches a
+    /// single formatting/allocation failure internally (its own SPDLOG_TRY/
+    /// CATCH) and routes it to a rate-limited error handler without
+    /// rethrowing, so only a second, double allocation failure inside that
+    /// handler's own formatting can reach the catch(...) below - which would
+    /// otherwise be worker death, the very thing the pass catch exists to
+    /// prevent (run() has NO outer catch of its own). Same wrapping rule as
+    /// every other diagnostic in a recovery path in this file.
     static void log_pass_outcome(const PassOutcome& o) noexcept {
         try {
             if (o.recovered) {
