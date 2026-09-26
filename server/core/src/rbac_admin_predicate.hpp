@@ -284,6 +284,17 @@ inline constexpr std::string_view kRbacAdminGateUnavailableMessage =
 inline constexpr std::string_view kRbacAdminGateDeniedMessage = "administrator role required";
 inline constexpr std::string_view kRbacAdminGateDeniedAuditReason =
     "caller is not a durable RBAC administrator";
+/// Doomgoose external review, PR #4985 IMPORTANT finding #2: the `kUnavailable`
+/// outcome was previously invisible to operators — all 4 call sites'
+/// `on_unavailable` closures only touched the response, with no log line and
+/// no audit row, unlike every sibling degraded-store denial in this codebase
+/// (e.g. `AuthRoutes::require_permission`'s engine branch, which audits
+/// "engine principal denied: RBAC store unavailable" on the identical
+/// store-can't-confirm shape). Shared wording for the audit `detail` field —
+/// EXTEND this, never fork a second copy, matching
+/// `kRbacAdminGateDeniedAuditReason`'s own rule above.
+inline constexpr std::string_view kRbacAdminGateUnavailableAuditReason =
+    "RBAC admin gate could not confirm administrator authority — store degraded";
 
 /// Shared control-flow chokepoint for the two non-admit `RbacAdminGate`
 /// outcomes. Returns `true` (having already invoked exactly one of

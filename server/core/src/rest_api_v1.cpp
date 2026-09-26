@@ -5597,6 +5597,17 @@ void RestApiV1::register_routes(
             if (deny_unless_rbac_administrator(
                     gate,
                     [&] {
+                        // Doomgoose external review, PR #4985 IMPORTANT #2:
+                        // a kUnavailable gate outcome was previously invisible
+                        // to operators — log AND audit it, matching every
+                        // sibling degraded-store denial in this codebase
+                        // (e.g. AuthRoutes::require_permission's engine
+                        // branch).
+                        spdlog::warn("rbac.role.assigned: {} (user={})",
+                                     kRbacAdminGateUnavailableAuditReason, session->username);
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, "rbac.role.assigned", "denied", "User",
+                            session->username, std::string(kRbacAdminGateUnavailableAuditReason));
                         res.status = 503;
                         res.set_content(detail::a4_error(res, kRbacAdminGateUnavailableMessage),
                                         "application/json");
@@ -5819,6 +5830,17 @@ void RestApiV1::register_routes(
             if (deny_unless_rbac_administrator(
                     gate,
                     [&] {
+                        // Doomgoose external review, PR #4985 IMPORTANT #2:
+                        // a kUnavailable gate outcome was previously invisible
+                        // to operators — log AND audit it, matching every
+                        // sibling degraded-store denial in this codebase
+                        // (e.g. AuthRoutes::require_permission's engine
+                        // branch).
+                        spdlog::warn("rbac.role.unassigned: {} (user={})",
+                                     kRbacAdminGateUnavailableAuditReason, session->username);
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, "rbac.role.unassigned", "denied", "User",
+                            session->username, std::string(kRbacAdminGateUnavailableAuditReason));
                         res.status = 503;
                         res.set_content(detail::a4_error(res, kRbacAdminGateUnavailableMessage),
                                         "application/json");

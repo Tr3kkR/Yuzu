@@ -21997,6 +21997,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (deny_unless_rbac_administrator(
                         gate,
                         [&] {
+                            // Doomgoose external review, PR #4985 IMPORTANT
+                            // #2: a kUnavailable gate outcome was previously
+                            // invisible to operators — log AND audit it,
+                            // matching every sibling degraded-store denial in
+                            // this codebase (e.g.
+                            // AuthRoutes::require_permission's engine
+                            // branch).
+                            spdlog::warn("rbac.role.assigned: {} (user={})",
+                                         kRbacAdminGateUnavailableAuditReason, session->username);
+                            (void)audit_fn(req, "rbac.role.assigned", "denied", "User",
+                                           session->username,
+                                           std::string(kRbacAdminGateUnavailableAuditReason));
                             // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
                             res.set_content(
                                 a4_error(kInternalError, kRbacAdminGateUnavailableMessage,
@@ -22181,6 +22193,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (deny_unless_rbac_administrator(
                         gate,
                         [&] {
+                            // Doomgoose external review, PR #4985 IMPORTANT
+                            // #2: a kUnavailable gate outcome was previously
+                            // invisible to operators — log AND audit it,
+                            // matching every sibling degraded-store denial in
+                            // this codebase (e.g.
+                            // AuthRoutes::require_permission's engine
+                            // branch).
+                            spdlog::warn("rbac.role.unassigned: {} (user={})",
+                                         kRbacAdminGateUnavailableAuditReason, session->username);
+                            (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
+                                           session->username,
+                                           std::string(kRbacAdminGateUnavailableAuditReason));
                             // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
                             res.set_content(
                                 a4_error(kInternalError, kRbacAdminGateUnavailableMessage,
