@@ -54,7 +54,8 @@ TEST_CASE("is_rbac_administrator: RBAC off, durable role=admin -> kAdmin",
     REQUIRE_FALSE(h.rbac->is_rbac_enabled());
     REQUIRE(h.auth_db->upsert_user("adminuser", "hash", "salt", auth::Role::admin).has_value());
 
-    auto gate = is_rbac_administrator(make_session("adminuser"), h.auth_db.get(), h.rbac.get());
+    auto gate = is_rbac_administrator(make_session("adminuser"), h.auth_db.get(), h.rbac.get(),
+                                      RbacAdminSurface::kRest);
     CHECK(gate == RbacAdminGate::kAdmin);
 }
 
@@ -63,7 +64,8 @@ TEST_CASE("is_rbac_administrator: RBAC off, durable role=user -> kDenied",
     PredicateHarness h;
     REQUIRE(h.auth_db->upsert_user("plainuser", "hash", "salt", auth::Role::user).has_value());
 
-    auto gate = is_rbac_administrator(make_session("plainuser"), h.auth_db.get(), h.rbac.get());
+    auto gate = is_rbac_administrator(make_session("plainuser"), h.auth_db.get(), h.rbac.get(),
+                                      RbacAdminSurface::kRest);
     CHECK(gate == RbacAdminGate::kDenied);
 }
 
@@ -79,14 +81,16 @@ TEST_CASE("is_rbac_administrator: RBAC off, session role='admin' but NO durable 
     auth::Session s = make_session("nobody-durable");
     s.role = auth::Role::admin; // the session's own cached role — ignored
 
-    auto gate = is_rbac_administrator(s, h.auth_db.get(), h.rbac.get());
+    auto gate =
+        is_rbac_administrator(s, h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest);
     CHECK(gate == RbacAdminGate::kDenied);
 }
 
 TEST_CASE("is_rbac_administrator: RBAC off, null AuthDB -> kUnavailable",
           "[pg][rbac_admin_predicate]") {
     PredicateHarness h;
-    auto gate = is_rbac_administrator(make_session("whoever"), nullptr, h.rbac.get());
+    auto gate = is_rbac_administrator(make_session("whoever"), nullptr, h.rbac.get(),
+                                      RbacAdminSurface::kRest);
     CHECK(gate == RbacAdminGate::kUnavailable);
 }
 
@@ -99,7 +103,8 @@ TEST_CASE("is_rbac_administrator: RBAC on, principal_roles(user,*,Administrator)
     h.rbac->set_rbac_enabled(true);
     REQUIRE(h.rbac->assign_role({"user", "rbacadmin", "Administrator"}).has_value());
 
-    auto gate = is_rbac_administrator(make_session("rbacadmin"), h.auth_db.get(), h.rbac.get());
+    auto gate = is_rbac_administrator(make_session("rbacadmin"), h.auth_db.get(), h.rbac.get(),
+                                      RbacAdminSurface::kRest);
     CHECK(gate == RbacAdminGate::kAdmin);
 }
 
@@ -113,7 +118,8 @@ TEST_CASE("is_rbac_administrator: RBAC on, no principal_roles row -> kDenied "
     // mutually exclusive, never "OR"'d together.
     REQUIRE(h.auth_db->upsert_user("legacyadmin", "hash", "salt", auth::Role::admin).has_value());
 
-    auto gate = is_rbac_administrator(make_session("legacyadmin"), h.auth_db.get(), h.rbac.get());
+    auto gate = is_rbac_administrator(make_session("legacyadmin"), h.auth_db.get(), h.rbac.get(),
+                                      RbacAdminSurface::kRest);
     CHECK(gate == RbacAdminGate::kDenied);
 }
 
@@ -124,7 +130,8 @@ TEST_CASE("is_rbac_administrator: RBAC on, principal_roles row for a DIFFERENT "
     h.rbac->set_rbac_enabled(true);
     REQUIRE(h.rbac->assign_role({"user", "vieweronly", "Viewer"}).has_value());
 
-    auto gate = is_rbac_administrator(make_session("vieweronly"), h.auth_db.get(), h.rbac.get());
+    auto gate = is_rbac_administrator(make_session("vieweronly"), h.auth_db.get(), h.rbac.get(),
+                                      RbacAdminSurface::kRest);
     CHECK(gate == RbacAdminGate::kDenied);
 }
 
@@ -138,7 +145,8 @@ TEST_CASE("is_rbac_administrator: RBAC on, ONLY a group-held Administrator grant
     // "groupmember" holds no DIRECT principal_roles(user,...) row — only
     // group membership would grant it, which this predicate deliberately
     // does not resolve (decision 2 in the header comment).
-    auto gate = is_rbac_administrator(make_session("groupmember"), h.auth_db.get(), h.rbac.get());
+    auto gate = is_rbac_administrator(make_session("groupmember"), h.auth_db.get(), h.rbac.get(),
+                                      RbacAdminSurface::kRest);
     CHECK(gate == RbacAdminGate::kDenied);
 }
 
@@ -214,7 +222,8 @@ TEST_CASE("is_rbac_administrator: RBAC-on branch reached via a DEGRADED "
     // reached. Post-fix, the degraded case maps a missing row to
     // kUnavailable instead — "could not confirm", not "confirmed not
     // admin".
-    auto gate = is_rbac_administrator(make_session("whoever"), h.auth_db.get(), &replica_b);
+    auto gate = is_rbac_administrator(make_session("whoever"), h.auth_db.get(), &replica_b,
+                                      RbacAdminSurface::kRest);
     CHECK(gate == RbacAdminGate::kUnavailable);
 }
 
@@ -222,7 +231,8 @@ TEST_CASE("is_rbac_administrator: null RbacStore -> kUnavailable regardless of "
           "RBAC on/off",
           "[pg][rbac_admin_predicate]") {
     PredicateHarness h;
-    auto gate = is_rbac_administrator(make_session("whoever"), h.auth_db.get(), nullptr);
+    auto gate = is_rbac_administrator(make_session("whoever"), h.auth_db.get(), nullptr,
+                                      RbacAdminSurface::kRest);
     CHECK(gate == RbacAdminGate::kUnavailable);
 }
 
@@ -264,11 +274,13 @@ TEST_CASE("is_rbac_administrator: an engine-classed session is denied even if "
 
     auto s = make_session("coincidence");
     s.principal_kind = "engine";
-    CHECK(is_rbac_administrator(s, h.auth_db.get(), h.rbac.get()) == RbacAdminGate::kDenied);
+    CHECK(is_rbac_administrator(s, h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest) ==
+          RbacAdminGate::kDenied);
 
     auto s2 = make_session("coincidence2");
     s2.auth_source = "engine_token";
-    CHECK(is_rbac_administrator(s2, h.auth_db.get(), h.rbac.get()) == RbacAdminGate::kDenied);
+    CHECK(is_rbac_administrator(s2, h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest) ==
+          RbacAdminGate::kDenied);
 }
 
 TEST_CASE("is_rbac_administrator: a service-scoped session is denied even for a "
@@ -279,7 +291,57 @@ TEST_CASE("is_rbac_administrator: a service-scoped session is denied even for a 
 
     auto s = make_session("scopedadmin");
     s.token_scope_service = "some-service";
-    CHECK(is_rbac_administrator(s, h.auth_db.get(), h.rbac.get()) == RbacAdminGate::kDenied);
+    CHECK(is_rbac_administrator(s, h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest) ==
+          RbacAdminGate::kDenied);
+}
+
+// ── #520/Doomgoose (PR #4985 round-2, CRITICAL/BLOCKING): the REST-surface ──
+// ── MCP-tier structural denial, and the MCP surface's negative control ─────
+
+TEST_CASE("is_rbac_administrator: kRest denies a durable admin presenting ANY "
+          "non-empty mcp_tier, RBAC off",
+          "[pg][rbac_admin_predicate]") {
+    PredicateHarness h;
+    REQUIRE(h.auth_db->upsert_user("mcptoken-admin", "hash", "salt", auth::Role::admin)
+               .has_value());
+
+    for (const std::string& tier : {"readonly", "operator", "supervised"}) {
+        auto s = make_session("mcptoken-admin");
+        s.mcp_tier = tier;
+        INFO("mcp_tier = " << tier);
+        CHECK(is_rbac_administrator(s, h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest) ==
+              RbacAdminGate::kDenied);
+    }
+}
+
+TEST_CASE("is_rbac_administrator: kRest denies a durable admin presenting ANY "
+          "non-empty mcp_tier, RBAC on",
+          "[pg][rbac_admin_predicate]") {
+    PredicateHarness h;
+    h.rbac->set_rbac_enabled(true);
+    REQUIRE(h.rbac->assign_role({"user", "mcptoken-admin2", "Administrator"}).has_value());
+
+    for (const std::string& tier : {"readonly", "operator", "supervised"}) {
+        auto s = make_session("mcptoken-admin2");
+        s.mcp_tier = tier;
+        INFO("mcp_tier = " << tier);
+        CHECK(is_rbac_administrator(s, h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest) ==
+              RbacAdminGate::kDenied);
+    }
+}
+
+TEST_CASE("is_rbac_administrator: kMcp negative control — a supervised-tier "
+          "durable admin still reaches kAdmin (the fix must not over-deny the "
+          "legitimate MCP path)",
+          "[pg][rbac_admin_predicate]") {
+    PredicateHarness h;
+    REQUIRE(h.auth_db->upsert_user("mcp-legit-admin", "hash", "salt", auth::Role::admin)
+               .has_value());
+
+    auto s = make_session("mcp-legit-admin");
+    s.mcp_tier = "supervised";
+    CHECK(is_rbac_administrator(s, h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kMcp) ==
+          RbacAdminGate::kAdmin);
 }
 
 // ── is_self_target ───────────────────────────────────────────────────────────

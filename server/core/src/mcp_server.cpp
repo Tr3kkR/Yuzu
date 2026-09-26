@@ -2592,8 +2592,14 @@ static const ToolDef kTools[] = {
      R"j("role":{"type":"string","enum":["Administrator","PlatformEngineer","Operator","ApiTokenManager","Viewer","Reviewer"],"description":"One of the 6 fleet-wide-assignable built-in roles — see discover_permissions for the full role/securable catalog, including non-assignable roles like ITServiceOwner"})j"
      R"j(},"required":["principal_type","principal_id","role"]})j",
      R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_type":{"const":"user"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
-     R"j("target_provisioned":{"type":"string","enum":["true","false","unknown"],"description":"\"true\" iff principal_id has a currently-active auth.users row at assignment time; \"false\" means it does not — either no account ever existed at this username, or the account is currently deactivated (not distinguished); \"unknown\" means the AuthDB read degraded and this could not be determined (never conflated with \"false\")"},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j("target_provisioned":{"type":"string","enum":["true","false","unknown"],"description":"\"true\" iff principal_id has a currently-active auth.users row at assignment time; \"false\" means it does not — either no account ever existed at this username, or the account is currently deactivated (not distinguished); \"unknown\" means the AuthDB read degraded and this could not be determined (never conflated with \"false\")"})j"
+     // audit_persisted deliberately NOT documented here: an audit-persist
+     // failure on this tool always returns a hard JSON-RPC error (fail
+     // closed, #3937/#2466 parity), never a success payload with
+     // audit_persisted:false — unlike ~80 other tools in this file using the
+     // opposite "set-and-proceed" convention. It appears only inside the
+     // error response's own `data` (see the local `a4_error` lambda's
+     // `audit_ok` parameter).
      R"j(},"required":["assigned","principal_type","principal_id","role","target_provisioned"]})j"},
 
     {"unassign_rbac_role",
@@ -2612,8 +2618,10 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","description":"Target username"},)j"
      R"j("role":{"type":"string","minLength":1,"maxLength":64,"description":"The role name to revoke — deliberately NOT restricted to the 6 assignable names (unlike assign_rbac_role): unassign is a pure idempotent DELETE with no privilege granted, so it must stay able to clean up an out-of-band grant (e.g. ITServiceOwner or a custom role assigned by direct SQL) that assign_rbac_role itself could never have created"})j"
      R"j(},"required":["principal_id","role"]})j",
-     R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"})j"
+     // audit_persisted deliberately NOT documented here — see
+     // assign_rbac_role's identical schema comment above for why (fail
+     // closed, never a success payload with audit_persisted:false).
      R"j(},"required":["unassigned","principal_id","role"]})j"},
 
     // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
@@ -21981,7 +21989,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const auto gate = is_rbac_administrator(*session, auth_db, rbac_store);
+                const auto gate = is_rbac_administrator(*session, auth_db, rbac_store,
+                                                        RbacAdminSurface::kMcp);
                 // Doomgoose external review, PR #4985 MINOR "duplicated
                 // gate-denial classification" — shared chokepoint, see its
                 // own doc comment (rbac_admin_predicate.hpp).
@@ -22164,7 +22173,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const auto gate = is_rbac_administrator(*session, auth_db, rbac_store);
+                const auto gate = is_rbac_administrator(*session, auth_db, rbac_store,
+                                                        RbacAdminSurface::kMcp);
                 // Doomgoose external review, PR #4985 MINOR "duplicated
                 // gate-denial classification" — shared chokepoint, see its
                 // own doc comment (rbac_admin_predicate.hpp).

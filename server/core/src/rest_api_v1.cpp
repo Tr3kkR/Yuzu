@@ -300,6 +300,36 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
     return false;
 }
 
+// A2 (Doomgoose external review, PR #4985 round-2, CRITICAL/BLOCKING — #520):
+// an MCP-tier bearer token of ANY tier must never reach this REST admin pair
+// — `is_rbac_administrator(..., RbacAdminSurface::kRest)` ALSO denies this
+// structurally, but that shared chokepoint's audit reason
+// (`kRbacAdminGateDeniedAuditReason`, "caller is not a durable RBAC
+// administrator") would be misleading for THIS specific denial reason: the
+// caller may well BE a durable administrator — the denial is about which
+// TRANSPORT presented the credential, not whether the credential holds
+// authority. A CC7.2 audit-evidence accuracy concern, so this is its own
+// helper with its own audit detail, called BEFORE the predicate (mirrors
+// `deny_engine_session`'s own belt-and-suspenders placement). Returns true
+// (having already written the 403 A4 body) when the caller must stop; false
+// when the session carries no mcp_tier and the route may proceed.
+static bool deny_mcp_token_session(const auth::Session& s, const httplib::Request& req,
+                                   httplib::Response& res, const RestApiV1::AuditFn& audit,
+                                   const char* action, const char* target) {
+    if (!s.mcp_tier.empty()) {
+        (void)detail::emit_behavioral_audit(
+            audit, req, res, action, "denied", target, "",
+            "MCP token blocked from admin route (mcp_tier='" + s.mcp_tier + "')");
+        res.status = 403;
+        res.set_content(
+            detail::a4_error(res, "MCP tokens cannot perform admin operations; use the MCP tool "
+                                  "assign_rbac_role/unassign_rbac_role instead"),
+            "application/json");
+        return true;
+    }
+    return false;
+}
+
 // Maps an EnginePrincipalStore/ApiTokenStore `std::expected<..., string>`
 // failure message to an HTTP status. The stores are string-typed-error, not
 // exception-typed — this keeps the mapping in one place instead of
@@ -977,10 +1007,10 @@ const std::string& openapi_spec() {
       "post": {"summary": "Check if current user has a permission", "tags": ["RBAC"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"securable_type": {"type": "string"}, "operation": {"type": "string"}}}}}}, "responses": {"200": {"description": "Permission check result"}}}
     },
     "/rbac/roles/{name}/assignments": {
-      "post": {"summary": "Assign a built-in RBAC role to a human user, fleet-wide (A2)", "tags": ["RBAC"], "description": "Gated on a durable is_rbac_administrator check (re-read fresh from the store), NOT an ordinary permission check — see docs/user-manual/rbac.md \"Fleet-Wide Role Assignment\". principal_type must be \"user\"; ITServiceOwner is rejected (its confinement needs a management-group scope this route does not carry — use POST /api/v1/management-groups/{id}/roles instead). Pre-provisioning (a principal_id with no existing auth.users row) is allowed.", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"principal_type": {"type": "string", "enum": ["user"]}, "principal_id": {"type": "string"}}, "required": ["principal_type", "principal_id"]}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Unknown role, ITServiceOwner, principal_type != \"user\", or invalid principal_id format — the same uniform message for an unknown role and ITServiceOwner (M1: no role-catalog oracle)"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller does not hold a durable Administrator role, or is a service-scoped/engine session"}, "503": {"description": "RBAC/AuthDB store unavailable, or the audit write for this mutation failed (fail-closed)"}}}
+      "post": {"summary": "Assign a built-in RBAC role to a human user, fleet-wide (A2)", "tags": ["RBAC"], "description": "Gated on a durable is_rbac_administrator check (re-read fresh from the store), NOT an ordinary permission check — see docs/user-manual/rbac.md \"Fleet-Wide Role Assignment\". principal_type must be \"user\"; ITServiceOwner is rejected (its confinement needs a management-group scope this route does not carry — use POST /api/v1/management-groups/{id}/roles instead). Pre-provisioning (a principal_id with no existing auth.users row) is allowed.", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"principal_type": {"type": "string", "enum": ["user"]}, "principal_id": {"type": "string"}}, "required": ["principal_type", "principal_id"]}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Unknown role, ITServiceOwner, principal_type != \"user\", or invalid principal_id format — the same uniform message for an unknown role and ITServiceOwner (M1: no role-catalog oracle)"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the assign_rbac_role tool instead, which requires the supervised tier plus an approval ticket)"}, "503": {"description": "RBAC/AuthDB store unavailable, or the audit write for this mutation failed (fail-closed)"}}}
     },
     "/rbac/roles/{name}/assignments/{principal_id}": {
-      "delete": {"summary": "Revoke a fleet-wide RBAC role grant from a human user (A2)", "tags": ["RBAC"], "description": "Idempotent (success even when the role was not held). A caller may not remove their own Administrator assignment; removing the fleet's last remaining authenticatable Administrator grant is refused for anyone (atomic store-level guard).", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "principal_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller does not hold a durable Administrator role, is removing their own Administrator assignment, or is a service-scoped/engine session"}, "409": {"description": "Refused: would remove the fleet's last remaining authenticatable Administrator role grant"}, "503": {"description": "RBAC store unavailable, or the audit write for this mutation failed (fail-closed)"}}}
+      "delete": {"summary": "Revoke a fleet-wide RBAC role grant from a human user (A2)", "tags": ["RBAC"], "description": "Idempotent (success even when the role was not held). A caller may not remove their own Administrator assignment; removing the fleet's last remaining authenticatable Administrator grant is refused for anyone (atomic store-level guard).", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "principal_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is removing their own Administrator assignment, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the unassign_rbac_role tool instead, which requires the supervised tier plus an approval ticket)"}, "409": {"description": "Refused: would remove the fleet's last remaining authenticatable Administrator role grant"}, "503": {"description": "RBAC store unavailable, or the audit write for this mutation failed (fail-closed)"}}}
     },
     "/tag-categories": {
       "get": {"summary": "List tag categories and allowed values", "tags": ["Tags"], "responses": {"200": {"description": "List of tag categories"}}}
@@ -5550,12 +5580,15 @@ void RestApiV1::register_routes(
                 return;
             if (deny_engine_session(*session, req, res, audit_fn, "rbac.role.assigned", "User"))
                 return;
+            if (deny_mcp_token_session(*session, req, res, audit_fn, "rbac.role.assigned", "User"))
+                return;
             if (!rbac_store || !rbac_store->is_open()) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
-            const auto gate = is_rbac_administrator(*session, auth_db, rbac_store);
+            const auto gate =
+                is_rbac_administrator(*session, auth_db, rbac_store, RbacAdminSurface::kRest);
             // Doomgoose external review, PR #4985 MINOR "duplicated
             // gate-denial classification" — shared chokepoint, see its own
             // doc comment (rbac_admin_predicate.hpp).
@@ -5768,12 +5801,16 @@ void RestApiV1::register_routes(
                 return;
             if (deny_engine_session(*session, req, res, audit_fn, "rbac.role.unassigned", "User"))
                 return;
+            if (deny_mcp_token_session(*session, req, res, audit_fn, "rbac.role.unassigned",
+                                       "User"))
+                return;
             if (!rbac_store || !rbac_store->is_open()) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
-            const auto gate = is_rbac_administrator(*session, auth_db, rbac_store);
+            const auto gate =
+                is_rbac_administrator(*session, auth_db, rbac_store, RbacAdminSurface::kRest);
             // Doomgoose external review, PR #4985 MINOR "duplicated
             // gate-denial classification" — shared chokepoint, see its own
             // doc comment (rbac_admin_predicate.hpp).

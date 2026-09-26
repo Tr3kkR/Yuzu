@@ -12,17 +12,32 @@
  * McpEngineRolesHarness's "not an MCP token" convention (empty `mcp_tier`,
  * which makes `tier_allows()`/`requires_approval()` both no-op): both MCP
  * tools here carry the empty-`mcp_tier` deny-outright guard (#4309,
- * adversarial-review PR1/A2 round-2), so the harness's DEFAULT session tier
- * is `"supervised"` (matching what the tool descriptions claim) and a real
- * PG-backed `ApprovalManager` IS wired in. Every MCP call that is meant to
- * reach the tool handler goes through the full ticket-then-recall dance
- * (`RbacRoleHarness::mcp_call_tool_approved`/`mcp_mint_and_approve` — mint,
- * approve as "reviewer-bob", recall with `approval_id`), mirroring
- * `test_mcp_server.cpp`'s `SchemaGateHarness` pattern; the two dedicated
- * empty-tier tests explicitly reset `session_mcp_tier` to `""` to exercise
- * the new guard directly, bypassing C8's ticket flow entirely (an empty
- * tier is still a no-op for `tier_allows()`/`requires_approval()` — that
- * has not changed, only the NEW per-handler guard has been added on top).
+ * adversarial-review PR1/A2 round-2), so the harness's DEFAULT MCP-transport
+ * session tier (`session_mcp_tier`) is `"supervised"` (matching what the tool
+ * descriptions claim) and a real PG-backed `ApprovalManager` IS wired in.
+ * Every MCP call that is meant to reach the tool handler goes through the
+ * full ticket-then-recall dance (`RbacRoleHarness::mcp_call_tool_approved`/
+ * `mcp_mint_and_approve` — mint, approve as "reviewer-bob", recall with
+ * `approval_id`), mirroring `test_mcp_server.cpp`'s `SchemaGateHarness`
+ * pattern; the two dedicated empty-tier tests explicitly reset
+ * `session_mcp_tier` to `""` to exercise the new guard directly, bypassing
+ * C8's ticket flow entirely (an empty tier is still a no-op for
+ * `tier_allows()`/`requires_approval()` — that has not changed, only the NEW
+ * per-handler guard has been added on top).
+ *
+ * REST sessions carry their OWN, SEPARATE `rest_session_mcp_tier` member
+ * (default `""`) — #520/Doomgoose external review, PR #4985 round-2,
+ * CRITICAL/BLOCKING: before this fix, REST and MCP sessions shared ONE
+ * `session_mcp_tier` field (default `"supervised"`), so every REST
+ * happy-path test in this file was unknowingly exercising an MCP-tiered
+ * session against the REST route — exactly the credential-confusion gap
+ * `is_rbac_administrator(..., RbacAdminSurface::kRest)` now structurally
+ * denies. `is_rbac_administrator(..., RbacAdminSurface::kRest)` DOES read
+ * `session.mcp_tier` now (unlike before this fix) — REST's own
+ * `deny_mcp_token_session` helper pre-empts the predicate on the same field
+ * for the identical reason, so a REST test wanting the MCP-token-on-REST
+ * denial path sets `rest_session_mcp_tier` directly (see the two new
+ * "REST: MCP-tier-token denial" tests below).
  *
  * Covers: the is_rbac_administrator gate on both transports (RBAC-off
  * durable-AuthDB-reread AND RBAC-on principal_roles-reread), the
@@ -30,7 +45,8 @@
  * on MCP, an out-of-enum `role` is now actually caught by the tool's own
  * input schema before the handler's M1 logic runs at all — see that test's
  * own comment), the self-target and last-Administrator guards, service-scope
- * structural denial, the empty-`mcp_tier` deny-outright guard, and
+ * structural denial, the REST-surface MCP-tier-token structural denial, the
+ * empty-`mcp_tier` deny-outright guard (MCP surface only), and
  * audit-fail-closed on both mutations.
  *
  * PG-gated: RbacStore, AuthDB, AND ApprovalManager are all born-on-Postgres
@@ -120,8 +136,20 @@ struct RbacRoleHarness {
     // themselves claim, so an MCP call reaches the tool handler via the
     // real ticket-then-recall dance (mcp_call_tool_approved below) rather
     // than being intercepted by C8 before ever reaching it. The two
-    // dedicated empty-tier tests reset this to "" explicitly.
+    // dedicated empty-tier tests reset this to "" explicitly. MCP-transport
+    // sessions ONLY — see `rest_session_mcp_tier` below for why REST's own
+    // sessions do NOT share this field.
     std::string session_mcp_tier{"supervised"};
+    // #520/Doomgoose (PR #4985 round-2, CRITICAL/BLOCKING): REST sessions
+    // MUST default to an EMPTY mcp_tier. Before this fix, BOTH transports
+    // shared `session_mcp_tier` (default "supervised"), so every REST
+    // happy-path test in this file was UNKNOWINGLY exercising an MCP-tiered
+    // session against the REST route — exactly the credential-confusion gap
+    // `is_rbac_administrator(..., RbacAdminSurface::kRest)` now structurally
+    // denies. A REST test wanting to exercise the (mostly theoretical, since
+    // a real browser session never carries an mcp_tier) MCP-token-on-REST
+    // denial path sets THIS field directly.
+    std::string rest_session_mcp_tier{""};
     bool auth_enabled{true};
     bool audit_allow{true};
 
@@ -146,17 +174,17 @@ struct RbacRoleHarness {
         REQUIRE(auth_db->is_open());
         REQUIRE(appr->is_open());
 
-        auto session_of = [this]() {
+        // `tier` is the mcp_tier to stamp onto the built session — REST and
+        // MCP each pass their OWN member (`rest_session_mcp_tier` /
+        // `session_mcp_tier`) so the two transports can never accidentally
+        // share one convention again (#520/Doomgoose PR #4985 round-2).
+        auto session_of = [this](const std::string& tier) {
             auth::Session s;
             s.username = session_user;
             s.token_scope_service = session_token_scope_service;
             s.principal_kind = session_principal_kind;
             s.auth_source = session_auth_source;
-            // REST never reads session->mcp_tier (its own gate is
-            // is_rbac_administrator + step_up_fn) — this field only matters
-            // to the MCP transport below, where it drives tier_allows()/
-            // requires_approval() and the new empty-tier guard.
-            s.mcp_tier = session_mcp_tier;
+            s.mcp_tier = tier;
             return s;
         };
 
@@ -164,7 +192,10 @@ struct RbacRoleHarness {
                                                httplib::Response&) -> std::optional<auth::Session> {
             if (!auth_enabled)
                 return std::nullopt;
-            return session_of();
+            // is_rbac_administrator(..., RbacAdminSurface::kRest) structurally
+            // denies ANY non-empty mcp_tier — a real browser/cookie REST
+            // session never carries one, so this defaults empty.
+            return session_of(rest_session_mcp_tier);
         };
         // Deliberately permissive — neither route under test calls perm_fn at
         // all (gated on is_rbac_administrator instead); kept only because the
@@ -220,7 +251,7 @@ struct RbacRoleHarness {
                                               httplib::Response&) -> std::optional<auth::Session> {
             if (!auth_enabled)
                 return std::nullopt;
-            return session_of(); // mcp_tier from session_mcp_tier — see its own doc comment
+            return session_of(session_mcp_tier); // mcp_tier from session_mcp_tier — see its own doc comment
         };
         auto mcp_perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                               const std::string&) -> bool { return true; };
@@ -669,6 +700,60 @@ TEST_CASE("REST assign: a service-scoped token is denied even for a durable "
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+}
+
+// ── REST: MCP-tier-token denial (#520/Doomgoose external review, PR #4985 ──
+// ── round-2, CRITICAL/BLOCKING) ──────────────────────────────────────────────
+
+TEST_CASE("REST assign: an MCP-tier bearer token of any tier is denied 403, "
+          "even a durable admin — nothing assigned, audit names the reason",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    for (const std::string& tier : {"readonly", "supervised"}) {
+        h.rest_session_mcp_tier = tier;
+        INFO("mcp_tier = " << tier);
+        auto res = h.assign_rest(
+            "Operator", R"({"principal_type":"user","principal_id":"jane-)" + tier + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.rbac->get_principal_roles("user", "jane-" + tier).empty());
+
+        bool found = false;
+        for (const auto& a : h.audit_log)
+            if (a.action == "rbac.role.assigned" && a.result == "denied" &&
+                a.detail.find("MCP token") != std::string::npos)
+                found = true;
+        CHECK(found);
+    }
+}
+
+TEST_CASE("REST unassign: an MCP-tier bearer token of any tier is denied 403, "
+          "even a durable admin — the pre-seeded grant is NOT removed, audit "
+          "names the reason",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    // Pre-seed via the store directly (never through the REST route under
+    // test) so "the grant was not removed" is provable rather than assumed.
+    REQUIRE(h.rbac->assign_role({"user", "jane", "Operator"}).has_value());
+
+    for (const std::string& tier : {"readonly", "supervised"}) {
+        h.rest_session_mcp_tier = tier;
+        INFO("mcp_tier = " << tier);
+        auto res = h.unassign_rest("Operator", "jane");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.rbac->get_principal_roles("user", "jane").size() == 1);
+
+        bool found = false;
+        for (const auto& a : h.audit_log)
+            if (a.action == "rbac.role.unassigned" && a.result == "denied" &&
+                a.detail.find("MCP token") != std::string::npos)
+                found = true;
+        CHECK(found);
+    }
 }
 
 // ── REST: self-target + last-Administrator guards ───────────────────────────

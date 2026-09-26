@@ -62,7 +62,7 @@
 ///    delivery plan defers `principal_type=group` assignment entirely); this
 ///    predicate fails closed on that gap rather than silently admitting it.
 /// 3. **Service-scoped tokens and engine sessions are structurally denied**,
-///    unconditionally, before any I/O — the same posture
+///    unconditionally, before any I/O, on BOTH surfaces — the same posture
 ///    `AuthRoutes::require_admin` already carries (auth_routes.cpp) for
 ///    every other admin-only route. A service-scoped token's authority
 ///    ceiling is `ITServiceOwner`-equivalent regardless of what the minting
@@ -70,6 +70,33 @@
 ///    or hold `Administrator` (`RbacStore::validate_assignment` bars it
 ///    structurally), but denying it here too keeps this predicate fail-closed
 ///    entirely on its own, without relying on that other chokepoint holding.
+///    On the REST surface ONLY, an MCP-tier bearer token of ANY tier
+///    (`session.mcp_tier` non-empty) is ALSO structurally denied — mirroring
+///    `require_admin`'s posture and the platform's #520 rule ("a REST route
+///    hit by an MCP token must not bypass the ticket flow"): REST carries no
+///    maker-checker approval machinery, so an MCP-tiered credential reaching
+///    it would mint/revoke standing Administrator authority with neither
+///    REST's MFA step-up nor MCP's approval ticket. The MCP surface applies
+///    NO tier rule here — its own ladder (`tier_allows` gating
+///    `Security:Write` to the supervised tier only, `requires_approval`'s
+///    ticket flow, and the handler's own pre-existing empty-tier deny, the
+///    "#4309" guard) already fully governs tier for that surface; duplicating
+///    any of it in this predicate would break the existing #4309 tests. This
+///    is decided by the caller-supplied `RbacAdminSurface` parameter (below),
+///    which has NO default value BY DESIGN — a compile-time forcing function
+///    so every caller, present and future, must explicitly declare which
+///    transport it is on. Doomgoose external review, PR #4985 (round-2,
+///    CRITICAL/BLOCKING): this predicate previously never consulted
+///    `session.mcp_tier` at all, so an MCP bearer token minted at ANY tier
+///    (even the least-privileged) for a principal who separately held durable
+///    Administrator authority could reach the REST route directly, bypassing
+///    both controls — independently adjudicated by an enterprise-architect
+///    agent, who also designed this surface-parameterized fix (a blanket
+///    non-empty-`mcp_tier` deny inside the predicate was considered and
+///    REJECTED: it would make `assign_rbac_role`/`unassign_rbac_role`
+///    permanently unreachable, since their own dispatch path deliberately
+///    gates a supervised-tier caller through to this SAME predicate after the
+///    ticket flow).
 /// 4. **Pre-provisioning is a caller decision, not this predicate's.** This
 ///    file answers only "is the CALLING session an administrator" — whether
 ///    a role may be ASSIGNED to a target username with no `auth.users` row
@@ -84,6 +111,23 @@
 /// bug on every degrade.
 namespace yuzu::server {
 
+/// Which transport is calling `is_rbac_administrator`. NO default value, BY
+/// DESIGN (decision 3 above) — a deliberate compile-time forcing function so
+/// every caller, present and future, must explicitly declare which transport
+/// it is on. A NEW caller passing `kMcp` from a REST route, or a future
+/// change that adds a default argument, reopens the #520 gap the
+/// `kRest`-only tier check (below) exists to close.
+enum class RbacAdminSurface {
+    kRest, ///< The REST v1 route pair. An MCP-tier bearer token of ANY tier
+           ///< is structurally denied here — REST has no maker-checker
+           ///< approval flow to fall back on.
+    kMcp,  ///< The `assign_rbac_role`/`unassign_rbac_role` MCP tools. NO tier
+           ///< rule is applied here — the MCP transport's own ladder
+           ///< (`tier_allows`, `requires_approval`'s ticket flow, the
+           ///< handler's own #4309 empty-tier deny) already fully governs
+           ///< tier for this surface.
+};
+
 /// Outcome of `is_rbac_administrator`. Mirrors the shape of
 /// `EngineLookupStatus` (`engine_principal_store.hpp`) — a terminal ALLOW, a
 /// terminal DENY, and a retryable "could not confirm either way" — rather
@@ -91,28 +135,34 @@ namespace yuzu::server {
 enum class RbacAdminGate {
     kAdmin,       ///< Confirmed durable Administrator authority. Proceed.
     kDenied,      ///< Confirmed NOT administrator (or structurally excluded
-                  ///< — service-scoped token, engine session). Terminal,
+                  ///< — service-scoped token, engine session, or an
+                  ///< MCP-tier token presented to the REST surface). Terminal,
                   ///< 403-class.
     kUnavailable, ///< Could not confirm — a required store is null, closed,
                   ///< or a read degraded. Retryable, 503-class. NEVER treat
                   ///< this as either `kAdmin` or `kDenied`.
 };
 
-/// Evaluate the RBAC-administrator gate for `session`. See the file header
-/// for the full rule and its four deliberate scope decisions. `rbac_store`
-/// and `auth_db` are read-only from this function's perspective (no
-/// mutation); both are required — a null pointer for the store the active
-/// branch needs is `kUnavailable`, never treated as "assume the other
-/// branch".
+/// Evaluate the RBAC-administrator gate for `session` on the given `surface`.
+/// See the file header for the full rule and its four deliberate scope
+/// decisions. `rbac_store` and `auth_db` are read-only from this function's
+/// perspective (no mutation); both are required — a null pointer for the
+/// store the active branch needs is `kUnavailable`, never treated as "assume
+/// the other branch".
 [[nodiscard]] inline RbacAdminGate is_rbac_administrator(const auth::Session& session,
                                                           AuthDB* auth_db,
-                                                          const RbacStore* rbac_store) {
+                                                          const RbacStore* rbac_store,
+                                                          RbacAdminSurface surface) {
     // Structural exclusions first — no I/O, fail-closed, matches
     // AuthRoutes::require_admin's posture for every other admin-only route
-    // (decision 3 above).
+    // (decision 3 above) — on BOTH surfaces for engine/service-scope, and
+    // ADDITIONALLY on the REST surface for any non-empty mcp_tier (Doomgoose
+    // external review, PR #4985 round-2, CRITICAL/BLOCKING — #520).
     if (session.is_engine())
         return RbacAdminGate::kDenied;
     if (!session.token_scope_service.empty())
+        return RbacAdminGate::kDenied;
+    if (surface == RbacAdminSurface::kRest && !session.mcp_tier.empty())
         return RbacAdminGate::kDenied;
 
     // Both branches below need to know whether RBAC enforcement is in

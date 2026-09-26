@@ -2508,8 +2508,11 @@ and why this is a separate surface from `POST /api/v1/rbac/check`'s
 **durable** Administrator role held by the caller, re-read fresh from the
 store (never the session's cached role or a JIT `POST /api/v1/elevate`
 elevation) — **instead of**, not in addition to, an ordinary RBAC-securable
-permission check — plus MFA step-up. A service-scoped API token and an engine
-session are both structurally denied before any store read.
+permission check — plus MFA step-up. A service-scoped API token, an engine
+session, and an MCP-tier bearer token of ANY tier (including `supervised`)
+are all structurally denied before any store read — an MCP-tiered credential
+must use the `assign_rbac_role` MCP tool instead, which carries its own
+supervised-tier + approval-ticket gate ([#520](https://github.com/Tr3kkR/Yuzu/issues/520)).
 
 **Request body:**
 
@@ -2553,8 +2556,10 @@ is not one of the 6 assignable roles (`ITServiceOwner` and a genuinely
 unknown/custom role name return the identical client-facing message — no
 role-catalog oracle; the specific reason is audited server-side only; use
 `POST /api/v1/management-groups/{id}/roles` for `ITServiceOwner` instead);
-`401` — MFA step-up not satisfied; `403` — the caller does not hold a durable
-Administrator role, or is a service-scoped/engine session; `503` — the RBAC
+`401` — not authenticated, or MFA step-up not satisfied; `403` — the caller
+does not hold a durable Administrator role, is a service-scoped/engine
+session, or presented an MCP-tier bearer token of any tier (use the
+`assign_rbac_role` MCP tool instead); `503` — the RBAC
 or `AuthDB` store is unavailable, or (on an otherwise-successful assignment)
 its audit row could not persist — treat the grant as unconfirmed and
 reconcile via a read. Audited `rbac.role.assigned` — see
@@ -2568,7 +2573,7 @@ Revoke a fleet-wide RBAC role grant from a human user. Idempotent —
 unassigning a role the principal did not hold still returns success.
 
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
-above, plus MFA step-up.
+above (including the MCP-tier-token structural denial), plus MFA step-up.
 
 **Response:**
 
@@ -2576,8 +2581,10 @@ above, plus MFA step-up.
 { "data": { "unassigned": true }, "meta": { "api_version": "v1" } }
 ```
 
-**Errors:** `401` — MFA step-up not satisfied; `403` — the caller does not
-hold a durable Administrator role, is a service-scoped/engine session, or
+**Errors:** `401` — not authenticated, or MFA step-up not satisfied; `403` —
+the caller does not hold a durable Administrator role, is a
+service-scoped/engine session, presented an MCP-tier bearer token of any tier
+(use the `unassign_rbac_role` MCP tool instead), or
 (`{name}=="Administrator"` only) is attempting to remove their **own**
 Administrator assignment (self-lockout
 guard — a caller can never revoke their own standing Administrator authority
