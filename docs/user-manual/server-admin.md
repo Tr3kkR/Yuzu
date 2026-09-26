@@ -2465,11 +2465,11 @@ A nonzero result means that host's `installed_count` will report a higher number
 
 ### vNEXT - agent logging is now asynchronous, with a new self-exit code 5 (#4666 PR-2) (NOT breaking)
 
-**What changed.** The agent no longer writes log lines synchronously on the thread that produced them; `main.cpp` installs a bounded async hand-off logger as the process's spdlog default (see "Agent logging is now asynchronous", the paragraph immediately before *Stopping a wedged agent* under *systemd Units*, further down this page, for the queue-size/memory-cost/overrun details). Agent shutdown gains one more possible self-exit code, **5**, distinct from the existing 1/3/4, fired from either of two causes at that step: tearing down that logger (flushing its queue, joining its worker thread) does not complete within an internal 2-second watchdog, **or the teardown itself fails outright** (an immediate exit with no wait at all — see *Stopping a wedged agent* above for both causes in full).
+**What changed.** The agent no longer writes log lines synchronously on the thread that produced them; `main.cpp` installs a bounded async hand-off logger as the process's spdlog default (see "Agent logging is now asynchronous", the paragraph immediately before *Stopping a wedged agent* under *systemd Units*, further down this page, for the queue-size/memory-cost/overrun details). Agent shutdown gains one more possible self-exit code, **5**, distinct from the existing 1/3/4, fired from either of two causes at that step: tearing down that logger (flushing its queue, joining its worker thread) does not complete within an internal 2-second watchdog, **or the teardown itself fails outright** (an immediate exit with no wait at all — see *Stopping a wedged agent* under *systemd Units*, further down this page, for both causes in full).
 
 **Impact.** Not a breaking change: no flag, wire format, API, or default behavior changes, and no operator action is required. Log output looks the same (same pattern/JSON formatting, same `--log-file`/rotation behavior) with one exception below. The externally-visible differences are: (1) under sustained log-sink overload, the agent can now silently drop older queued lines (`overrun_oldest`) rather than blocking, so a very bursty logger under a stuck sink may show gaps instead of a stall; (2) a shutdown wedge that used to hang or need `SIGKILL` before this and the related #2233 watchdogs landed can now self-exit with code 5 specifically, in addition to the pre-existing 1/3/4; (3) the "Received signal, shutting down..." line the agent prints on `SIGINT`/`SIGTERM`/Ctrl-C used to be a raw, fixed-format write straight to stderr — it is now routed through the same configured logger as everything else, so it picks up the configured pattern (or JSON structure under `--log-format json`) and now also lands in `--log-file` when one is configured, not stderr alone. A plain substring match against the message text (the default text pattern keeps the original words verbatim) is unaffected; a line-anchored or byte-exact matcher, or one that assumed this specific line was stderr-only, needs updating; (4) that same line is now an ordinary `info`-level call rather than an unconditional raw write, so at `--log-level warn` or above — a configuration this page itself recommends for agents to cut noise, see "If log volume matters" above — the line is silently **absent entirely**, whereas before it always printed regardless of level. If you rely on this line's presence to confirm a clean/intentional stop, either keep `--log-level` at `info` or below, or switch to checking the process exit code (0 = clean) instead.
 
-**Who should check.** Any operator running a supervisor script or monitoring rule that pattern-matches the agent's process exit code against a fixed set (`{0,1,3,4}` or similar) should widen it to include `5`. An unrecognised exit code there should not be interpreted as "impossible" or treated as a different failure class than the documented watchdog exits already are. See *Stopping a wedged agent* above for what each code means and how they interact.
+**Who should check.** Any operator running a supervisor script or monitoring rule that pattern-matches the agent's process exit code against a fixed set (`{0,1,3,4}` or similar) should widen it to include `5`. An unrecognised exit code there should not be interpreted as "impossible" or treated as a different failure class than the documented watchdog exits already are. See *Stopping a wedged agent* under *systemd Units*, further down this page, for what each code means and how they interact.
 
 ## Settings Page
 
@@ -4505,16 +4505,17 @@ heartbeat field surfacing how many lines were dropped this way: an
 binary reads it yet (planned for a later PR's heartbeat poller). A sink-level
 write/format failure (as opposed to an overrun) is tracked internally too —
 count plus the last 256 bytes of the failing message, in `LogHandoff`'s
-private `ErrorState`. Test-only accessors exist (`log_errors_total()`,
-`last_log_error_for_test()`) but nothing in the shipped binary reads them
-outside tests yet — the same later-PR heartbeat poller planned for
-`overrun_total()` above. The only production-visible signal today is a
-rate-limited (once per second) fallback line to stderr at the moment of
-failure, reproducing what spdlog's own default error handler always did
-before #4666 PR-2 installed this one. Like the ordinary console sink, that
-fallback line is unlikely to be visible at all under a genuine
-Windows-service session (`--install-service`, no console) — the same reason
-this page's console sink is itself conditional. If log lines appear to go
+private `ErrorState`. Two accessors exist: `log_errors_total()`, exercised
+by this PR's own unit test; and `last_log_error_for_test()`, which despite
+its name is not currently called by any test or production code. Neither
+has a production/heartbeat consumer yet — the same later-PR heartbeat
+poller planned for `overrun_total()` above. The only production-visible
+signal today is a rate-limited (once per second) fallback line to stderr at
+the moment of failure, reproducing what spdlog's own default error handler
+always did before #4666 PR-2 installed this one. That fallback line is
+unlikely to be visible at all under a genuine Windows-service session
+(`--install-service`, no console): the agent attaches no stderr sink at
+all in that mode, log-file destination or not. If log lines appear to go
 missing under load with no error printed, check disk space and fd limits on
 the log destination first: `overrun_oldest` drops are silent in this
 release, with no counter or alert to point at them yet. There is no `--log-sync` flag or other escape
@@ -4551,7 +4552,8 @@ logger — the exe-image-swap step this exists to protect is unconditional on
 every platform, not gated to macOS, even though the underlying hazard it
 guards against is real only there: macOS's agent and its shared library run
 in separate spdlog registries, so a failed swap there can leave a live
-reference past the watchdog; on Linux/Windows the registry is shared and a
+reference past the watchdog; on Linux (confirmed) and Windows (inferred from
+dynamic spdlog linkage, not directly measured) the registry is shared and a
 later teardown step already nulls it regardless, so a transient failure at
 this specific step forces the same hard exit there too even though nothing
 was actually left dangling). An operator seeing code 5 land instantly,

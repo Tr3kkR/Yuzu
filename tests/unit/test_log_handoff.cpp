@@ -651,11 +651,11 @@ TEST_CASE("U7b: a --log-file open failure falls back to console-only logging ins
 }
 
 // ---------------------------------------------------------------------------
-// U8: a throwing sink is contained by the non-I/O error handler
+// U8: a throwing sink is contained by the error handler
 // ---------------------------------------------------------------------------
 
-TEST_CASE("U8: a throwing sink is contained by the non-I/O error handler; the worker "
-          "continues and the default fprintf handler is never reached",
+TEST_CASE("U8: a throwing sink is contained by the error handler; the worker "
+          "continues and spdlog's own default fprintf handler is never reached",
           "[log_handoff]") {
     auto sink = std::make_shared<ThrowOnceSink>();
     auto result = LogHandoff::create_with_sinks({sink});

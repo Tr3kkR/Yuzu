@@ -152,10 +152,20 @@
 /// must ALSO be called in the exe image (this function returns the shared_ptr<logger>
 /// specifically so main.cpp can do that), and teardown() needs an exe-image half too
 /// (PR-2's job, shipped -- this class only tears down the registry of the image IT runs
-/// in). Despite two registries, install()-side logging (Guardian/TriggerEngine/
-/// SparkEngine, all compiled into the core library) already reaches the async
-/// hand-off logger correctly on macOS too, since install() itself runs in the core
-/// library's own image; the exe-image half is load-bearing on the TEARDOWN side only.
+/// in). Despite two registries, core-library-compiled logging (Guardian/TriggerEngine/
+/// SparkEngine) already reaches the async hand-off logger correctly on macOS WITHOUT
+/// the exe-image install() call, since install() itself runs in the core library's own
+/// image -- that call is not what those call sites depend on. The exe-image half is
+/// load-bearing on BOTH sides, just for a DIFFERENT set of call sites each time: on the
+/// INSTALL side, for main.cpp's OWN exe-image-originated spdlog:: calls (its startup
+/// banner, its F3 orphan-worker diagnostic, etc. -- confirmed by
+/// tests/unit/test_log_handoff_multi_image.cpp's MI-1b(a): without the exe-image
+/// install()/set_default_logger() call, those specific lines do NOT reach the sink on
+/// macOS); and on the TEARDOWN side, for releasing the exe-image's own kept-alive
+/// registry reference so it cannot outlive the watchdog. Do not "simplify" this to
+/// "only teardown needs the exe-image call" -- that would silently drop macOS
+/// visibility of main.cpp's own log lines, including the orphaned-worker
+/// spdlog::critical() diagnostic.
 ///
 /// CONSTRUCTION FAILURE (plan 1.7, Decision 7): two DISTINCT, DISTINGUISHABLE failure
 /// surfaces, matched precisely to the plan's carve-out --
