@@ -3715,6 +3715,15 @@ void check_production_order_degraded_still_arms(SparkType type) {
         *p.add_rules() = make_rule_for_type(type, "r1");
         REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
                     .exit_code == 0);
+        // Settle before stop(): the dispatch's attach is NonWaiting (rung 9c PR-2 Unit
+        // 6) - calling stop() while that attempt is still in flight raced a SIGSEGV
+        // under repeated seeded reruns (#4685 PR #5021, external adversarial review).
+        // Every other test in this file settles before tearing down; this Phase-1
+        // block (whose OWN classification isn't under test) had skipped it.
+        REQUIRE(yuzu::test::spin_until([&] {
+            engine.journal_maintenance_tick();
+            return engine.ack_pending_count_for_test() == 0 && engine.active_io_workers() == 0;
+        }));
         engine.stop();
         spark_engine.stop();
     }
