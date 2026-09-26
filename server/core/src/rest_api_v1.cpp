@@ -1329,14 +1329,14 @@ const std::string& openapi_spec() {
         // Access Reviews (SOC 2 CC6.2) paths.
         R"json(,
     "/access-reviews/export": {
-      "get": {"summary": "Stateless cross-principal grant export (SOC 2 CC6.2)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every user/group/engine-principal's DIRECT role grants right now, with effective_permission_count, last activity, classification, lifecycle_state, and provenance (source). Deliberately gated on a GLOBAL AccessReview:Read (a dedicated securable seeded to Administrator + the Reviewer role, NOT AuditLog:Read), not the ADR-0017 confinement-filtered list gate — a scoped slice would be useless as fleet-wide CC6.2 evidence. Self-audited as access_review.exported.", "parameters": [{"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}], "responses": {"200": {"description": "JSON: data[].{principal_type, principal_id, display_name, owner_or_email, roles[], effective_permission_count, last_activity_ms, last_activity_kind, classification, lifecycle_state, source}. CSV: same fields, Content-Disposition: attachment.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the export succeeded but its own audit row failed to persist."}}}, "400": {"description": "format not json|csv"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "A read across users/groups/engine-principals/tokens failed — never a silent partial export"}}}
+      "get": {"summary": "Stateless cross-principal grant export (SOC 2 CC6.2)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every user/group/engine-principal's DIRECT role grants right now, with effective_permission_count, last activity, classification, lifecycle_state, and provenance (source). Deliberately gated on a GLOBAL AccessReview:Read (a dedicated securable seeded to Administrator + the Reviewer role, NOT AuditLog:Read), not the ADR-0017 confinement-filtered list gate — a scoped slice would be useless as fleet-wide CC6.2 evidence. Self-audited as access_review.exported.", "parameters": [{"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}], "responses": {"200": {"description": "JSON: data[].{principal_type, principal_id, display_name, owner_or_email, roles[], effective_permission_count, last_activity_ms, last_activity_kind, classification, lifecycle_state, source}, rbac_enforcement (enabled|disabled|degraded — whether RBAC actually governs this grant population right now; degraded means the read couldn't confirm state, so gates deny defensively, NOT that an admin turned RBAC off). CSV: same row fields, Content-Disposition: attachment, PLUS an unconditional leading metadata line `# rbac_enforcement=<enabled|disabled|degraded>` before the header row (present even for a zero-row population) — this is the retained offline evidence artifact, so the stamp travels with the file itself, not only the JSON sibling response.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the export succeeded but its own audit row failed to persist."}}}, "400": {"description": "format not json|csv"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "A read across users/groups/engine-principals/tokens failed — never a silent partial export"}}}
     },
     "/access-reviews": {
-      "get": {"summary": "List every review campaign (SOC 2 CC6.2 cadence evidence)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every campaign's metadata (NOT its attestations — use GET /access-reviews/{id} for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence. Self-audited as access_review.list.", "responses": {"200": {"description": "{data:[{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms}], meta}"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}},
-      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
+      "get": {"summary": "List every review campaign (SOC 2 CC6.2 cadence evidence)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every campaign's metadata (NOT its attestations — use GET /access-reviews/{id} for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence. Self-audited as access_review.list.", "responses": {"200": {"description": "{data:[{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms, rbac_enforcement}], meta}. rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state AT OPEN, frozen with the rest of the campaign; \"\" for a campaign opened before this field existed."}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}},
+      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). The fleet's current RBAC enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same moment — see GET /access-reviews/{id}. Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
     },
     "/access-reviews/{id}": {
-      "get": {"summary": "Full evidentiary state of one review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Campaign metadata plus every frozen attestation row (pending/attested/flagged_revoke) plus pending_count. Self-audited as access_review.get.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{campaign:{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms}, attestations[].{principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, justification, grant_snapshot}, pending_count}"}, "403": {"description": "Requires AccessReview:Read"}, "404": {"description": "No campaign with that id"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}}
+      "get": {"summary": "Full evidentiary state of one review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Campaign metadata plus every frozen attestation row (pending/attested/flagged_revoke) plus pending_count. Self-audited as access_review.get.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{campaign:{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms, rbac_enforcement}, attestations[].{principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, justification, grant_snapshot}, pending_count}. campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN; \"\" for a campaign opened before this field existed."}, "403": {"description": "Requires AccessReview:Read"}, "404": {"description": "No campaign with that id"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}}
     },
     "/access-reviews/{id}/attestations": {
       "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
@@ -1491,9 +1491,14 @@ const std::string& openapi_spec() {
     "/result-sets": {
       "get": {"summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403) — owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50)"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>], next_cursor}"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — a genuine database read failure (Retry-After present)"}}},
       "post": {"summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reasoning as the GET list). Synchronous — lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (governance B2: the parent is owner-checked before the lineage edge is persisted).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"}, "parent_id": {"type": "string", "maxLength": 64, "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string"}}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS), parent_id supplied but empty/non-string (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}}}
-    },
+    },)json"
+        // Fresh literal split (MSVC C2026 16,380-byte cap) — #4980 fix: the
+        // #4980 service-scope 403 description addition below pushed this
+        // literal back over the cap; split immediately before it, same
+        // idiom as the #3992 F2 / #4540 splits elsewhere in this file.
+        R"json(
     "/result-sets/from-inventory-query": {
-      "post": {"summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same securable as GET /api/v1/inventory/software). Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"type": "string"}}}}, "parent_id": {"type": "string", "maxLength": 64}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set); or, when parent_id is supplied, RESULT_SET_STORE_UNAVAILABLE reading the parent set's own members page mid-pagination (#4306, a distinct cause from the Inventory-store read degrading)"}}}
+      "post": {"summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same securable as GET /api/v1/inventory/software). Service-scoped API tokens are denied outright (403, #4980 — same cross-service-reach reasoning as the other 8 non-dispatch result-set routes; the fleet_read_fn admit-and-confine mechanism this route also uses for management-group confinement does not by itself close the service-scope axis, since the created set is owner-scoped to the minting principal's identity, not the token's own service tag). Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"type": "string"}}}}, "parent_id": {"type": "string", "maxLength": 64}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "403": {"description": "Result-set create denied to a service-scoped token (#4980, checked before any other gate); unlike its 8 non-dispatch siblings, this route also has a real Inventory:Read RBAC gate underneath that check, so a caller past the service-scope check can still be denied here by that gate: no management-group grant for Inventory:Read, an MCP-tier restriction, or, for an ADR-1005 engine principal, RBAC disabled or no grant for Inventory:Read"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set); or, when parent_id is supplied, RESULT_SET_STORE_UNAVAILABLE reading the parent set's own members page mid-pagination (#4306, a distinct cause from the Inventory-store read degrading)"}}}
     },
     "/result-sets/from-tar-query": {
       "post": {"summary": "Create a result set from an async dispatched TAR SQL query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the tar plugin in parent_id's scope (or __all__ when parent_id is omitted); SQL is sandboxed agent-side by the read-only TarDatabase::execute_user_query authorizer (#760/#631), the server only length-checks (max 100 KiB). Membership is every agent that returned ≥ 1 row, or every responder when include_empty=true. Async — lands a pending row the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string", "maxLength": 64}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH — a command already dispatched but the store fault persisting the pending row afterward (#4306, previously 400); do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch) — the per-owner quota could not be verified before dispatch (#4306); nothing sent, safe to retry"}}}
@@ -6848,6 +6853,13 @@ void RestApiV1::register_routes(
                 return;
             }
             const auto& rows = *rows_res;
+            // A3 (RBAC delivery plan): stamp the export with whether RBAC is
+            // actually enforced right now — without this, the grant
+            // population above certifies nothing about whether it governs
+            // real access. Computed independently of build_access_review
+            // (it's fleet-wide, not per-row) via the same RbacStore this
+            // route already holds.
+            const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
 
             // Evidence access is itself auditable (CC6.2/CC7.2): the export still
             // proceeds if the audit row fails to persist, but the failure is made
@@ -6857,7 +6869,8 @@ void RestApiV1::register_routes(
             try {
                 audit_emitted =
                     audit_fn(req, "access_review.exported", "success", "AccessReview", "",
-                            "format=" + format + " rows=" + std::to_string(rows.size()));
+                            "format=" + format + " rows=" + std::to_string(rows.size()) +
+                                " rbac_enforcement=" + rbac_enforcement);
             } catch (const std::exception& ex) {
                 spdlog::warn("access_review.exported audit emission threw: {}", ex.what());
             }
@@ -6875,7 +6888,7 @@ void RestApiV1::register_routes(
                     "Content-Disposition",
                     "attachment; filename=\"access-review-" +
                         std::to_string(static_cast<std::int64_t>(std::time(nullptr))) + ".csv\"");
-                res.set_content(to_csv(rows), "text/csv");
+                res.set_content(to_csv(rows, rbac_enforcement), "text/csv");
                 return;
             }
 
@@ -6897,7 +6910,20 @@ void RestApiV1::register_routes(
                             .add("lifecycle_state", r.lifecycle_state)
                             .add("source", r.source));
             }
-            res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size())),
+            // Hand-built (not list_json) so rbac_enforcement can sit alongside
+            // data/pagination/meta as a top-level field, same idiom as the
+            // auth-sample export's "sampling" block above.
+            std::string pagination = JObj()
+                                         .add("total", static_cast<int64_t>(rows.size()))
+                                         .add("start", static_cast<int64_t>(0))
+                                         .add("page_size", static_cast<int64_t>(50))
+                                         .str();
+            res.set_content(JObj()
+                                .raw("data", arr.str())
+                                .raw("pagination", pagination)
+                                .add("rbac_enforcement", rbac_enforcement)
+                                .raw("meta", R"({"api_version":"v1"})")
+                                .str(),
                             "application/json");
         });
 
@@ -6950,7 +6976,8 @@ void RestApiV1::register_routes(
                             .add("created_by", c.created_by)
                             .add("created_at_ms", c.created_at_ms)
                             .add("closed_by", c.closed_by)
-                            .add("closed_at_ms", c.closed_at_ms));
+                            .add("closed_at_ms", c.closed_at_ms)
+                            .add("rbac_enforcement", c.rbac_enforcement));
             }
             (void)audit_fn(req, "access_review.list", "success", "AccessReview", "",
                            "count=" + std::to_string(rows_res->size()));
@@ -7006,6 +7033,14 @@ void RestApiV1::register_routes(
                 return;
             }
 
+            // A3 (RBAC delivery plan): the enforcement state stamped onto this
+            // campaign row at freeze time — computed from the same RbacStore
+            // INSTANCE, read immediately after the grant population above
+            // (a separate, later call — not the same read; it can trigger
+            // its own maybe_refresh_generation() round-trip), never
+            // re-derived on a later read (matches every other frozen field).
+            const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
+
             // Expand each row to one GrantRef per (principal, role) pair — the
             // shape access_review_store.hpp's open_campaign requires — carrying an
             // opaque JSON snapshot of the row's non-role fields as observed right
@@ -7028,7 +7063,8 @@ void RestApiV1::register_routes(
                     frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot});
             }
 
-            auto open_res = access_review_store->open_campaign(title, session->username, frozen);
+            auto open_res = access_review_store->open_campaign(title, session->username, frozen,
+                                                                rbac_enforcement);
             if (!open_res) {
                 try {
                     (void)audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview",
@@ -7048,7 +7084,8 @@ void RestApiV1::register_routes(
             try {
                 open_audit_emitted =
                     audit_fn(req, "access_review.campaign_opened", "success", "AccessReview",
-                            *open_res, "grants=" + std::to_string(frozen.size()));
+                            *open_res, "grants=" + std::to_string(frozen.size()) +
+                                           " rbac_enforcement=" + rbac_enforcement);
             } catch (const std::exception& ex) {
                 spdlog::warn("access_review.campaign_opened audit emission threw: {}", ex.what());
             }
@@ -7104,7 +7141,8 @@ void RestApiV1::register_routes(
                 .add("created_by", view.campaign.created_by)
                 .add("created_at_ms", view.campaign.created_at_ms)
                 .add("closed_by", view.campaign.closed_by)
-                .add("closed_at_ms", view.campaign.closed_at_ms);
+                .add("closed_at_ms", view.campaign.closed_at_ms)
+                .add("rbac_enforcement", view.campaign.rbac_enforcement);
 
             JArr attestations;
             for (const auto& a : view.attestations) {
@@ -10390,8 +10428,36 @@ void RestApiV1::register_routes(
         // narrowed to that set's current members.
         sink.Post("/api/v1/result-sets/from-inventory-query",
                   [auth_fn, fleet_read_fn, audit_fn, result_set_store, inventory_store,
-                   metrics_registry, rs_to_json, rs_err,
-                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                   metrics_registry, rs_to_json, rs_err, load_owned,
+                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                    httplib::Response& res) {
+                      // #4980: this tool's 8 non-dispatch siblings in the
+                      // result-sets family hard-deny a service-scoped token
+                      // outright via this same helper (see the GET/POST
+                      // /api/v1/result-sets handlers above). This route
+                      // instead gated purely via fleet_read_fn's own
+                      // admit-and-confine branch, which ADMITS a service-
+                      // scoped caller (narrowed to its scope) rather than
+                      // denying it — but the result set this call
+                      // materializes is owner-scoped to session->username
+                      // (the minting PRINCIPAL's identity, not the token's
+                      // own service tag), so a service-scoped token holding
+                      // Inventory:Read could mint a result set the minting
+                      // principal's OTHER tokens/session can then read —
+                      // the exact cross-service-reach class the siblings'
+                      // hard-deny exists to prevent. No `.permission` label
+                      // (explicit "" — matches every sibling call site
+                      // above): a service-scoped caller holding
+                      // Inventory:Read is STILL denied outright after this
+                      // fix, so naming Inventory:Read as "the permission
+                      // that would help" would be a false self-remediation
+                      // claim.
+                      if (deny_fleet_wide_service_scoped(
+                              req, res, "result_set.create.access_denied", "ResultSet",
+                              "result-set-from-inventory-query create denied to a "
+                              "service-scoped token",
+                              "service-scoped tokens may not create result sets", "", ""))
+                          return;
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;

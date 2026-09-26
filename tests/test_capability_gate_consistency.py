@@ -102,6 +102,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -127,20 +128,22 @@ FRAGMENT_FILES = [
 # Wave 8 PR8.6: +2 app_control (wdac_policy/applocker_policy) — read-only
 # posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
 # Wave 8 PR8.1-a1: +2 platform_security (secure_boot/code_integrity).
+# Wave 10 PR10.1-b: +2 runtimes (dotnet/jvm).
 # Wave 8 PR8.1-b: +1 system_hardening (posture).
+# Wave 10 PR10.1-c: +2 pkg_inventory (managers/packages).
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
 # 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
 # 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) +
-# 1 (system_hardening) = 220. This constant has been bumped independently on
-# several sides of several merges (PR #4719 and PR #4964 CI are the trail; #4721
-# tracks deriving it per fragment). The rule is always the same: find the shared
-# baseline all sides agree on and add EVERY side's new plugin on top of it, never
-# pick one side's total -- and re-derive by RUNNING parse_fragment_gate_rows over
-# FRAGMENT_FILES rather than trusting hand arithmetic, which has drifted before
-# (206, then 203, then repeatedly since).
-EXPECTED_TOTAL_ROWS = 220
+# 1 (system_hardening) + 2 (pkg_inventory, managers/packages) = 222.
+# This constant has been bumped independently on several sides of several merges
+# (PR #4719 and PR #4964 CI are the trail; #4721 tracks deriving it per fragment).
+# The rule is always the same: find the shared baseline all sides agree on and add
+# EVERY side's new plugin on top of it, never pick one side's total -- and re-derive
+# by RUNNING parse_fragment_gate_rows over FRAGMENT_FILES rather than trusting hand
+# arithmetic, which has drifted before (206, then 203, then repeatedly since).
+EXPECTED_TOTAL_ROWS = 222
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

@@ -38,6 +38,7 @@
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
+#include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -152,6 +153,7 @@ struct LabeledSpan {
         {"platform_security", capdecls::plugin_action_catalogue_platform_security(), false},
         {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
         {"system_hardening", capdecls::plugin_action_catalogue_system_hardening(), false},
+        {"pkg_inventory", capdecls::plugin_action_catalogue_pkg_inventory(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -160,7 +162,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-one sources exactly as a live composition site would use.
+    // literally, twenty-two sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -182,6 +184,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::plugin_action_catalogue_system_hardening(),
+        capdecls::plugin_action_catalogue_pkg_inventory(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -348,6 +351,29 @@ TEST_CASE("capability catalogue: classify() resolves every declared plugin.actio
             CHECK(result->plugin == row.plugin);
             CHECK(result->action == row.action);
         }
+    }
+}
+
+/// Exact-row pin for `pkg_inventory` (Wave 10 PR10.1-c). Both actions are
+/// zero-subprocess filesystem reads: ReadOnly/None under the Inventory
+/// securable, no execute gate. Pinning the fields directly means a future
+/// reclassification (e.g. to Security or a gated tier) fails here loudly.
+TEST_CASE("capability catalogue: pkg_inventory.managers and pkg_inventory.packages pin their "
+          "exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_pkg_inventory();
+    REQUIRE(rows.size() == 2);
+    for (const auto action : {"managers", "packages"}) {
+        const auto it =
+            std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
+        REQUIRE(it != rows.end());
+        CHECK(it->plugin == "pkg_inventory");
+        CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+        CHECK(it->mutability == Mutability::None);
+        CHECK(it->securable == "Inventory");
+        CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->risk_tier == authz::RiskTier::Low);
+        CHECK(it->execute_gate == ExecuteGate::None);
     }
 }
 
