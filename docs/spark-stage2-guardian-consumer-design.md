@@ -1433,10 +1433,10 @@ further recorded limits.
      Registry starts its backoff wait after its tail.
    - Completion passes. A File pass run for a real IOCP completion counts toward the three
      failures and is never throttled or absorbed; a successful one ends the episode.
-   - Clearing `inert`. File clears it on the first successful pass with no equivalent of
+   - Clearing `degraded_`. File clears it on the first successful pass with no equivalent of
      Registry's `if (core_)` check (Registry clears it only while its thread pool exists). The
-     File worker is the only writer of `inert` while it runs, so a recovery cannot clear a
-     boot-time inert.
+     File worker is the only writer of `degraded_` while it runs (`boot_inert_` is written only
+     by `start()`, #4685), so a recovery pass cannot clear a boot-time `boot_inert_`.
 4. Latency and limits, at the default 50 ms cadence:
    - `inert` flips after three consecutive failed passes, about 150 ms of backoff (50 ms, then
      100 ms) after the first failure, and clears at the next successful pass. After the cause is
@@ -1463,11 +1463,11 @@ further recorded limits.
      `ShutdownDeadlineGuard`, `kShutdownDeadlineGrace`, armed in `AgentImpl::stop()` and in
      `run()`'s teardown, ends in `hard_exit(4)` rather than an indefinite hang). The two
      mechanisms are not the same shape: File's `log_pass_outcome()` runs OFF `mu_`
-     (`spark_file.cpp:3297`/`:3352`, after `lk.unlock()`), so a stalled sink there stalls only
+     (`spark_file.cpp:3311`/`:3366`, after `lk.unlock()`), so a stalled sink there stalls only
      IOCP draining and the worker join in `stop()` - `arm()`/`disarm()`/`stats()` keep working.
      Registry's equivalent lines run WHILE `mu_` IS HELD: the recovery log
-     (`spark_registry.cpp:1895`) is released at `:1901` on the recovery path, and the failure and
-     inert-transition logs (`:1912`, `:1916`) are released at `:1919` on the failure path - two
+     (`spark_registry.cpp:1908`) is released at `:1916` on the recovery path, and the failure and
+     inert-transition logs (`:1927`, `:1932`) are released at `:1935` on the failure path - two
      different unlock points, neither reached from the other branch in the same pass. Either way
      a stalled sink there stalls every other caller of
      `mu_` (`arm()`, `disarm()`, `apply_test_controls()`) too, not only this worker's own
