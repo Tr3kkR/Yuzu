@@ -2938,6 +2938,47 @@ TEST_CASE("rbac_generation::is_stale_beyond_bound", "[rbac_store]") {
     CHECK_FALSE(is_stale_beyond_bound(999, 0, 1000));
 }
 
+// Doomgoose external review, PR #4985 IMPORTANT finding #3 — direct coverage
+// of the ALLOWLIST classifier itself, no DB (a pure std::string_view
+// function). From the A2 route this classifier serves, the 400 branch is
+// actually UNREACHABLE today: `principal_type` is hardcoded `"user"` and
+// `principal_id` has already passed `is_valid_username` (which rejects `:`,
+// so none of `validate_assignment`'s engine-namespace messages can ever
+// reach it either) — the 3 regression tests added alongside this fix (REST/
+// MCP store-fault-maps-to-503, REST get_role()-integrity-fault-maps-to-503)
+// therefore only exercise the 503/default side of the classifier through
+// the route. This test exercises the ALLOWLIST side directly, so a future
+// edit to `validate_assignment`'s wording that silently drifts from this
+// classifier's own strings is caught here rather than nowhere.
+TEST_CASE("rbac_assign_error_is_client_fault classifies the known "
+          "client-validation shapes true and everything else (including "
+          "store faults) false",
+          "[rbac_store]") {
+    using yuzu::server::rbac_assign_error_is_client_fault;
+
+    // The 5 known validate_assignment/F1 client-validation shapes.
+    CHECK(rbac_assign_error_is_client_fault(
+        "principal_id in the reserved 'engine:' namespace may only be assigned under "
+        "principal_type=\"engine\""));
+    CHECK(rbac_assign_error_is_client_fault("unrecognized principal_type 'bogus'"));
+    CHECK(rbac_assign_error_is_client_fault(
+        "engine principal_id must be in the reserved 'engine:<slug>' namespace with a "
+        "non-empty slug"));
+    CHECK(rbac_assign_error_is_client_fault(
+        "engine principals cannot be granted the admin/full-access role 'Administrator' — no "
+        "admin, ever (design §4.2)"));
+    CHECK(rbac_assign_error_is_client_fault(
+        "engine principals cannot be granted a built-in system role 'Administrator' — no "
+        "built-in role, ever (design §4.2)"));
+
+    // Store/query faults — must default to false (503), never the allowlist.
+    CHECK_FALSE(rbac_assign_error_is_client_fault("database not open"));
+    CHECK_FALSE(rbac_assign_error_is_client_fault("assign_role failed"));
+    CHECK_FALSE(rbac_assign_error_is_client_fault(
+        "ERROR:  relation \"rbac_store.principal_roles\" does not exist"));
+    CHECK_FALSE(rbac_assign_error_is_client_fault(""));
+}
+
 // fjarvis F2 (#2703, HIGH), schema-level layer: `rbac_meta.value` for
 // key='rbac_enabled' is now constrained to exactly "true"/"false" (migration
 // v2). A write attempting anything else — a hand-edit, a future bug writing
