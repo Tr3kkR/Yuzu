@@ -251,6 +251,11 @@ What you may observe after upgrading:
   to the app role, applied at **first boot only**. An existing database does not pick this up on upgrade —
   apply the `ALTER SYSTEM` (restart) and the `GRANT` by hand as that section shows, or a backup job or ad-hoc
   session can still take the slot the `/readyz` probe needs to reconnect. PostgreSQL 16 or newer.
+  **A new boot-time failure mode on the Postgres container itself**, not just the server binary: both
+  `yuzu-postgres` images now refuse to start if `YUZU_PG_RESERVED_CONNECTIONS` is set at or past
+  `max_connections − superuser_reserved_connections` — that value would leave zero connection slots any
+  other client could ever use. Only reachable by explicitly setting the env var too high; the shipped
+  default (40) never triggers it.
 - **A new alert, `YuzuServerPostgresUnreachable`**, and three `yuzu_server_pg_reachab*` metrics — see
   `docs/user-manual/metrics.md`.
 - **New flag `--shutdown-drain-seconds`** (`YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, max 60). On
