@@ -5548,8 +5548,10 @@ void RestApiV1::register_routes(
     // ordinary Security:Write permission check — see that header's file
     // comment for the full rule and its four deliberate scope decisions
     // (no JIT elevation, no group-held Administrator, structural
-    // service-scope/engine-session denial, pre-provisioning is this route's
-    // own call).
+    // service-scope/engine-session/MCP-tier-token denial — this route's own
+    // `deny_mcp_token_session` belt pre-empts the predicate's REST-surface
+    // tier check for audit-truth reasons, see that helper's own comment —
+    // pre-provisioning is this route's own call).
     //
     // Route shape: POST .../roles/{name}/assignments +
     // {principal_type, principal_id} body, DELETE

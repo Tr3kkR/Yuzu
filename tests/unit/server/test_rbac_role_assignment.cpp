@@ -720,10 +720,13 @@ TEST_CASE("REST assign: an MCP-tier bearer token of any tier is denied 403, "
         CHECK(res->status == 403);
         CHECK(h.rbac->get_principal_roles("user", "jane-" + tier).empty());
 
+        // `mcp_tier='<tier>'` (not just "MCP token") so iteration 2 cannot be
+        // silently satisfied by iteration 1's accumulated audit row — each
+        // iteration proves its OWN denial fired for its OWN tier.
         bool found = false;
         for (const auto& a : h.audit_log)
             if (a.action == "rbac.role.assigned" && a.result == "denied" &&
-                a.detail.find("MCP token") != std::string::npos)
+                a.detail.find("mcp_tier='" + tier + "'") != std::string::npos)
                 found = true;
         CHECK(found);
     }
@@ -747,10 +750,11 @@ TEST_CASE("REST unassign: an MCP-tier bearer token of any tier is denied 403, "
         CHECK(res->status == 403);
         CHECK(h.rbac->get_principal_roles("user", "jane").size() == 1);
 
+        // See the assign test's identical comment above.
         bool found = false;
         for (const auto& a : h.audit_log)
             if (a.action == "rbac.role.unassigned" && a.result == "denied" &&
-                a.detail.find("MCP token") != std::string::npos)
+                a.detail.find("mcp_tier='" + tier + "'") != std::string::npos)
                 found = true;
         CHECK(found);
     }
