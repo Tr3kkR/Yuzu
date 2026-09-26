@@ -2560,7 +2560,11 @@ identical client-facing message — no role-catalog oracle; the specific
 reason is audited server-side only; use `POST
 /api/v1/management-groups/{id}/roles` for `ITServiceOwner` instead), or the
 store rejects the grant for a genuine client-validation reason (a malformed
-or reserved-namespace `principal_id`); `401` — not authenticated, or MFA
+or reserved-namespace `principal_id`) — this branch is defensive and not
+reachable via this route today, since `principal_type` is hardcoded `"user"`
+and `principal_id` has already passed the same charset check the DELETE
+route enforces, but stays classified 400 (not 503) for if that ever
+changes; `401` — not authenticated, or MFA
 step-up not satisfied; `403` — the caller does not hold a durable
 Administrator role, is a service-scoped/engine session, or presented an
 MCP-tier bearer token of any tier (use the `assign_rbac_role` MCP tool

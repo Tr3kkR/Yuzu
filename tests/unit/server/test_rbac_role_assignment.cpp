@@ -623,12 +623,16 @@ TEST_CASE("REST assign: a wrong-typed principal_id (number/bool/object/"
     // default), which then fails the EXISTING `principal_id.empty()` check
     // — the SAME 400 a genuinely-missing principal_id gets (see "a JSON
     // body missing principal_id is rejected 400" above), which is
-    // deliberately unaudited on THIS codebase's own established convention:
-    // `audit_target_id` (the CWE-117-neutralized copy audit calls embed) is
-    // computed AFTER this check, precisely so a hostile/oversized principal_id
-    // is never embedded raw before it has been neutralized. This test's
+    // deliberately left UNAUDITED, matching the pre-existing unaudited
+    // "invalid JSON" 400 branch a few lines above it (both are
+    // pre-validation rejections). This is NOT a CWE-117 necessity —
+    // `audit_token()`/`log_token()` are order-independent and safe to call
+    // on any string at any point, including empty, so this branch COULD be
+    // audited if a future change wants it to be (Gate 8 re-review, PR
+    // #4985 pass 13: an earlier version of this comment incorrectly
+    // claimed the ordering was forced by CWE-117 safety). This test's
     // point is "no uncaught exception, no 500" — not that this specific
-    // branch newly becomes audited.
+    // branch is, or must stay, unaudited.
     for (nlohmann::json bad_id : {nlohmann::json(123), nlohmann::json(false),
                                   nlohmann::json::object(), nlohmann::json::array()}) {
         nlohmann::json body = {{"principal_type", "user"}, {"principal_id", bad_id}};
