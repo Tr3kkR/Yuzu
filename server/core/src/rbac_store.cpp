@@ -1453,39 +1453,46 @@ void RbacStore::set_rbac_enabled(bool enabled) {
     apply_local_generation(*new_gen);
 }
 
-bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
-    // Permit the full-fleet fallback (return false) ONLY for a store that is
+RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
+    // THE single derivation of enforcement state from the 3 raw accessors —
+    // rbac_enforcement_in_effect() below is now a one-line PROJECTION of
+    // THIS function's result (security-guardian re-review, PR #4985 merge
+    // reconciliation: the two were previously two independently-written
+    // function bodies kept in sync by a "keep any future change... in sync
+    // here" comment alone — a real risk once this label became load-bearing
+    // for is_rbac_administrator's own RBAC-on/off branch routing, not just
+    // an export string. Delegating makes "the two can never silently drift
+    // apart" true by CONSTRUCTION instead of by convention).
+    //
+    // Permit the fresh-disabled outcome (kDisabled) ONLY for a store that is
     // loaded, explicitly disabled, AND whose disabled view is currently
-    // FRESH. Null / load-failed (!is_open()) fail CLOSED — see the header
-    // for the #1498 rationale.
+    // FRESH. Null / load-failed (!is_open()) fails CLOSED (kDegraded) — see
+    // the header for the #1498 rationale.
     if (!store || !store->is_open())
-        return true;
+        return RbacEnforcementLabel::kDegraded;
     if (store->is_rbac_enabled())
-        return true;
+        return RbacEnforcementLabel::kEnabled;
     // adversarial-review round (#2703): is_rbac_enabled()==false is not, on
     // its own, proof RBAC is genuinely disabled — maybe_refresh_generation()
     // (just invoked by the call above) deliberately never touches a stale
     // cached rbac_enabled_ on a failed refresh, so a replica that has never
     // itself observed a remote enable stays cached false indefinitely
-    // through an outage. Treat a degraded view (the refresh did not land)
-    // the same as "enabled" here — the one place this distinction is
+    // through an outage. A degraded view (the refresh did not land) reads as
+    // kDegraded here, never kDisabled — the one place this distinction is
     // security-relevant, unlike the raw is_rbac_enabled() accessor other
     // (non-confinement) callers use.
-    return store->rbac_enabled_view_degraded();
+    //
+    // (cpp-safety re-review, PR #4985 fix round, corrected by a security-
+    // guardian follow-up pass: `noexcept` here is honest only to the same
+    // degree as `is_rbac_enabled()`/`rbac_enabled_view_degraded()` not
+    // throwing in practice — `is_open()` IS itself `noexcept`, those two are
+    // not. Not a new risk this delegation introduces.)
+    return store->rbac_enabled_view_degraded() ? RbacEnforcementLabel::kDegraded
+                                                : RbacEnforcementLabel::kDisabled;
 }
 
-RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
-    // Mirrors rbac_enforcement_in_effect()'s branch order and short-circuiting
-    // exactly (see that function's comments for the rationale on each step) —
-    // this is the SAME derivation, just split into three outcomes instead of
-    // two. Keep any future change to that function's branches in sync here.
-    if (!store || !store->is_open())
-        return RbacEnforcementLabel::kDegraded;
-    if (store->is_rbac_enabled())
-        return RbacEnforcementLabel::kEnabled;
-    if (store->rbac_enabled_view_degraded())
-        return RbacEnforcementLabel::kDegraded;
-    return RbacEnforcementLabel::kDisabled;
+bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
+    return rbac_enforcement_label(store) != RbacEnforcementLabel::kDisabled;
 }
 
 // to_string(RbacEnforcementLabel) is constexpr and header-inline (rbac_store.hpp) —
@@ -1985,14 +1992,126 @@ std::expected<void, std::string> RbacStore::assign_role(const PrincipalRole& pr)
     return {};
 }
 
-std::expected<void, std::string> RbacStore::unassign_role(const std::string& principal_type,
-                                                          const std::string& principal_id,
-                                                          const std::string& role_name) {
+std::expected<bool, std::string> RbacStore::unassign_role(const std::string& principal_type,
+                                                           const std::string& principal_id,
+                                                           const std::string& role_name) {
     if (!open_)
         return std::unexpected("database not open");
     std::optional<std::uint64_t> new_gen;
+    bool last_admin_reject = false;
+    bool removed = false;
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // A2 last-Administrator guard ("A2 — Global human
+        // role assignment/unassignment"). Scoped to role_name=="Administrator"
+        // ONLY — every other unassign (including both existing engine-only
+        // callers, rest_api_v1.cpp:3274 and mcp_server.cpp:21915) stays a pure
+        // DELETE with no extra behavior. Unconditional would be WRONG, not
+        // just unnecessary: a fresh install holds ZERO Administrator
+        // `principal_roles` rows until A2's own assign route bootstraps the
+        // first one, so an unconditional post-delete count would spuriously
+        // reject unassigning e.g. a Viewer grant on a store that has never
+        // had an Administrator row at all.
+        //
+        // `principal_type = 'user'` ONLY (adversarial-review PR1/A2 finding
+        // — was `IN ('user', 'group')`): the admin GATE this guard exists to
+        // protect (`rbac_admin_predicate.hpp::is_rbac_administrator`) never
+        // resolves a group-held Administrator row — group membership is a
+        // documented, deliberate exclusion there. Counting a group row as a
+        // "surviving" Administrator here, while the gate can never actually
+        // pass through one, would let the last GATE-PASSING (user) admin be
+        // removed whenever a group row also exists — a false sense of safety
+        // from a row nothing can authenticate as. Match the gate exactly.
+        //
+        // JOIN auth.users u ON u.username = pr.principal_id, WHERE u.is_active (governance
+        // BLOCKING #1, full-pipeline review on 765bc7ec1): a bare `principal_roles` row count
+        // is a count of GRANTS, not of administrators who are even potentially authenticatable
+        // — `is_active` is a NECESSARY precondition every LOCAL PASSWORD login path filters
+        // on, not a sufficient one (see auth_db.cpp's `migrations()` comment on
+        // `users.is_active` for what else gates the local path, and for why an OIDC/SAML
+        // session never reads this column at all). A2 explicitly permits pre-provisioning
+        // (assigning Administrator to a username with no `auth.users` row yet — see
+        // `target_provisioned` at the assign route), and `AuthDB::remove_user` is a SOFT
+        // delete (`UPDATE auth.users
+        // SET is_active = FALSE ...`, auth_db.cpp — there is no hard-delete/cascade path
+        // anywhere in this codebase), so BOTH a ghost (never-logged-in) row AND a
+        // deactivated/removed account would previously count as a "surviving" administrator
+        // when neither is even a candidate to authenticate as one (a ghost row has no
+        // credentials to authenticate with at all; a deactivated account fails the `is_active`
+        // precondition every LOCAL PASSWORD login path enforces). The JOIN excludes a
+        // nonexistent username (no matching row) and `u.is_active` excludes both deactivated
+        // and (soft-)deleted accounts
+        // — the same filter covers all three sub-cases named in the finding. This is safe ONLY
+        // because `RbacStore` and `AuthDB` are ALWAYS constructed
+        // on the SAME PgPool/database in production — ONE `--postgres-dsn`,
+        // ONE `pg_pool_` member, both stores built from it
+        // (server.cpp:4603,6118; ADR-0006) — so `auth.users` is guaranteed
+        // reachable from this same transaction/connection, never a
+        // cross-database call. A degraded/missing `auth` schema fails the
+        // whole SELECT (PGRES_TUPLES_OK check below), which aborts this
+        // transaction and returns `unexpected` — fail-closed by
+        // construction, no separate degraded-vs-absent branch needed.
+        //
+        // Concurrency: lock the CANDIDATE Administrator rows with `FOR
+        // UPDATE OF pr` (the `principal_roles` alias only — never lock
+        // `auth.users` rows here, which would serialize unassigns against
+        // unrelated logins/role-changes, out of scope for this guard)
+        // before the DELETE. Without this, two concurrent unassigns each
+        // removing one of the last two Administrator grants can both read
+        // "1 remaining" under READ COMMITTED (neither sees the other's
+        // still-uncommitted delete) and both commit, landing at zero — the
+        // exact TOCTOU a route-level pre-check would also be vulnerable to.
+        // `FOR UPDATE OF pr` blocks the second transaction on the first's
+        // row lock until it commits/rolls back, so the second re-evaluates
+        // the count against the first's now-durable delete. The LOCK set
+        // and the COUNT set below both go through the identical JOIN, so
+        // the lock always covers exactly the rows the count depends on.
+        // Doomgoose external review, PR #4985 (governance ledger a2-p7-doomgoose-1):
+        // the lock query's own result set is the ONLY correct membership test
+        // for "was the row being deleted itself one of the counted rows" — a
+        // ghost/deactivated Administrator grant that never appears here (it
+        // fails the `auth.users`/`is_active` JOIN) must never trip the
+        // post-delete refusal below, because deleting a row that was never
+        // counted cannot be what drove the count from >0 to 0. Capture the
+        // locked principal_ids so the refusal can be scoped to "this delete
+        // was itself one of them" rather than "the count is now 0" alone —
+        // the two are NOT equivalent when the count was already 0 going in
+        // (e.g. the only Administrator row left is a ghost/deactivated one).
+        // (cpp-safety re-review, PR #4985 fix round: this reasoning assumes
+        // `auth.users.is_active` is stable between the lock SELECT above and
+        // the DELETE below — `auth.users` is deliberately left unlocked by
+        // this guard, out of scope per the "never lock auth.users rows here"
+        // note further up. The scenario this narrowing newly permits is a
+        // principal reactivated inside that same window who is also the
+        // fleet's sole Administrator grant. UPDATE (Doomgoose external
+        // review, PR #4985, finding #1): this WAS a real, live exposure, not
+        // merely a theoretical one — "the fleet was already at zero COUNTED
+        // admins at lock time" does not make removing a since-reactivated
+        // sole admin's grant safe; A2's bootstrap-from-zero path covers a
+        // fleet that has NEVER had an admin, not one whose real admin just
+        // got reactivated mid-unassign. Closed below by a fresh, targeted
+        // post-DELETE re-check of `auth.users.is_active` for the specific
+        // deleted principal_id — see that comment, further down, for the
+        // fix and its own honestly-documented residual window.)
+        std::unordered_set<std::string> locked_admin_principal_ids;
+        if (role_name == "Administrator") {
+            pg::PgResult lock_rows = pg::exec_params(
+                c,
+                "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+                "JOIN auth.users u ON u.username = pr.principal_id "
+                "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' "
+                "AND u.is_active "
+                "FOR UPDATE OF pr",
+                std::vector<std::string>{});
+            if (lock_rows.status() != PGRES_TUPLES_OK) {
+                err = PQerrorMessage(c);
+                return false;
+            }
+            for (int i = 0; i < PQntuples(lock_rows.get()); ++i) {
+                locked_admin_principal_ids.insert(text_col(lock_rows.get(), i, 0));
+            }
+        }
+
         pg::PgResult r = pg::exec_params(
             c,
             "DELETE FROM rbac_store.principal_roles WHERE principal_type = $1 AND principal_id = $2 "
@@ -2002,13 +2121,88 @@ std::expected<void, std::string> RbacStore::unassign_role(const std::string& pri
             err = PQerrorMessage(c);
             return false;
         }
+        removed = std::string(PQcmdTuples(r.get())) != "0";
+
+        // Only fire the count when this DELETE actually removed a row that was
+        // itself among the locked/counted rows above — an idempotent no-op
+        // unassign (the principal never held the role) must not spuriously
+        // reject, and neither must removing a row the count never included in
+        // the first place (a ghost/deactivated grant: `principal_type` isn't
+        // "user", or the principal_id never matched the JOIN/`is_active`
+        // filter above). Only `principal_type == "user"` rows are ever placed
+        // in `locked_admin_principal_ids`, so this also naturally excludes a
+        // group-held "Administrator" row per the "match the gate exactly"
+        // rule above.
+        //
+        // TOCTOU close (Doomgoose external review, PR #4985, finding #1):
+        // `locked_admin_principal_ids` is a snapshot taken BEFORE the DELETE, and
+        // `auth.users` is deliberately left unlocked (see the "never lock auth.users
+        // rows here" note above) — so a row that was ghost/deactivated at lock time
+        // (and therefore excluded from the locked set) can be reactivated by a fully
+        // independent, concurrent transaction (e.g. `AuthDB::reactivate_user`) in the
+        // gap between the lock query and this DELETE. If that reactivated principal
+        // is the fleet's ONLY real Administrator, trusting the stale snapshot alone
+        // would evaluate `removed_a_counted_admin` false and skip the recount below
+        // entirely — silently removing the last real admin's grant with no refusal.
+        // Close this with a FRESH, targeted re-check of `auth.users.is_active` for
+        // the SPECIFIC principal_id just deleted, run here (after the DELETE, same
+        // transaction) rather than relying on the earlier snapshot for this decision:
+        // under READ COMMITTED this fresh statement sees any reactivation that has
+        // ALREADY COMMITTED by this point. Only needed when the principal wasn't
+        // already in the locked set — if it was, the recount below already fires
+        // regardless.
+        bool reactivated_since_lock = false;
+        if (role_name == "Administrator" && removed && principal_type == "user" &&
+            locked_admin_principal_ids.count(principal_id) == 0) {
+            pg::PgResult fresh_active = pg::exec_params(
+                c, "SELECT is_active FROM auth.users WHERE username = $1",
+                std::vector<std::string>{principal_id});
+            if (fresh_active.status() != PGRES_TUPLES_OK) {
+                err = PQerrorMessage(c);
+                return false;
+            }
+            reactivated_since_lock = PQntuples(fresh_active.get()) == 1 &&
+                                     to_bool(PQgetvalue(fresh_active.get(), 0, 0));
+        }
+        // Residual window, documented honestly rather than claimed fully closed
+        // (matching this codebase's own accepted-staleness convention elsewhere,
+        // e.g. #2703's bounded stale-serve): a reactivation that commits strictly
+        // AFTER this fresh check but BEFORE this transaction's own commit is still
+        // unseen by this guard. Deliberately NOT closed by locking `auth.users`
+        // here — that remains the explicitly out-of-scope alternative per the
+        // "never lock auth.users rows here" design note above.
+        const bool removed_a_counted_admin =
+            removed && principal_type == "user" &&
+            (locked_admin_principal_ids.count(principal_id) > 0 || reactivated_since_lock);
+        if (role_name == "Administrator" && removed_a_counted_admin) {
+            pg::PgResult remaining = pg::exec_params(
+                c,
+                "SELECT count(*) FROM rbac_store.principal_roles pr "
+                "JOIN auth.users u ON u.username = pr.principal_id "
+                "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' "
+                "AND u.is_active",
+                std::vector<std::string>{});
+            if (remaining.status() != PGRES_TUPLES_OK || PQntuples(remaining.get()) != 1) {
+                err = PQerrorMessage(c);
+                return false;
+            }
+            if (std::string(PQgetvalue(remaining.get(), 0, 0)) == "0") {
+                last_admin_reject = true;
+                return false; // aborts the transaction — the DELETE above rolls back
+            }
+        }
+
         new_gen = bump_generation_in_txn(c);
         return new_gen.has_value();
     });
+    if (last_admin_reject)
+        return std::unexpected("cannot remove the last remaining Administrator role grant — "
+                               "the fleet would be left with " +
+                               std::string(kRbacLastAdminRefusalMarker));
     if (!ok)
         return std::unexpected(err.empty() ? "unassign_role failed" : err);
     apply_local_generation(*new_gen);
-    return {};
+    return removed;
 }
 
 // ── Groups CRUD ──────────────────────────────────────────────────────────────
