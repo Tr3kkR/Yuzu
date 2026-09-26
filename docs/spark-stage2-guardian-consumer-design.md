@@ -78,7 +78,7 @@ history:
     deadline-stamp bullet gains the matching clause. The operator manual's "Diagnosing an inert
     File worker or Registry sweeper" bullet is corrected the same way; `docs/spark-flip-gate.md`
     gains a closed-by-fix #4704 entry in section 5 and section 7's #4704 precondition is marked
-    fixed. PR #N, full `/governance` (Spark row).
+    fixed. PR #5004 (open, not yet merged), full `/governance` (Spark row).
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -1476,11 +1476,15 @@ further recorded limits.
      `arm()`/`disarm()`/`stats()` keep working for a stall on one of the three pass-outcome
      lines above. Registry's per-key `warn` lines (`fail_backend_locked()`,
      `resolve_probe_locked()`, `park_lost_locked()`) are still written under `mu_`; they were
-     outside #4704's ruled scope and are tracked as #4999. File has its own analogous per-key
-     sites still under its own lock (e.g. `defer_backend_retry_locked()`/`fail_backend_locked()`
-     reached from `watch_incarnation()`); #4999 does not yet cover them, and they need either a
-     widened scope on that issue or a sibling issue before this residual can be called closed on
-     either mechanism.
+     outside #4704's ruled scope and are tracked as #4999 (amended post-filing to correct a
+     stale citation and add `publish_locked()`'s own two sites, 5 total). File has its own
+     analogous per-key sites still under its own lock (e.g.
+     `defer_backend_retry_locked()`/`fail_backend_locked()` reached from `watch_incarnation()`),
+     tracked separately as #5002. Both issues are currently E6-capped by the same
+     `prefer_spark_=false` compensating control and are likely superseded once #4666's async log
+     hand-off is wired in as the process's default logger (#4666's own PR-2, already a blocking
+     F14 precondition here for unrelated reasons) - re-check whether either issue's fix is still
+     needed once that lands, rather than assuming per-site surgery is still required.
 5. The `pass_failed`, `pass_failures_consecutive` and `pass_backoff_ms` counters are readable only
    through the test seam (`file_debug_counters_for_test`, Windows only). The operator-visible
    signals are the log lines `spark_file: worker pass failed (consecutive #N) - retrying in M ms`,
