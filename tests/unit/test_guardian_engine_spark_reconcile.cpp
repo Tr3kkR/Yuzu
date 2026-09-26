@@ -3718,8 +3718,10 @@ void check_production_order_degraded_still_arms(SparkType type) {
         // Settle before stop(): the dispatch's attach is NonWaiting (rung 9c PR-2 Unit
         // 6) - calling stop() while that attempt is still in flight raced a SIGSEGV
         // under repeated seeded reruns (#4685 PR #5021, external adversarial review).
-        // Every other test in this file settles before tearing down; this Phase-1
-        // block (whose OWN classification isn't under test) had skipped it.
+        // Every test whose push actually arms something settles before tearing down
+        // (a push that only classifies Unsupported, e.g. :769, never add_pending()s
+        // anything, so there's nothing to settle); this Phase-1 block's push arms a
+        // rule (its own classification isn't under test) and had skipped it.
         REQUIRE(yuzu::test::spin_until([&] {
             engine.journal_maintenance_tick();
             return engine.ack_pending_count_for_test() == 0 && engine.active_io_workers() == 0;
@@ -3750,7 +3752,16 @@ void check_production_order_degraded_still_arms(SparkType type) {
     // does (rung 9c PR-2 Unit 6) - it does not settle before returning, so wait for the
     // commit rather than asserting immediately (mirrors "start_local degrades per-rule..."
     // above: REQUIRE(spin_until([&] { return engine.spark_armed_rule_count() == 2; })).
-    REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == 1; }));
+    // Also wait for full quiescence (ack_pending_count_for_test()==0 &&
+    // active_io_workers()==0), not just the count becoming visible, before this
+    // function's own stop() calls below - same class of gap as the AC7 Phase-1
+    // SIGSEGV this file's other settle-waits were added to fix (cpp-safety Gate 3,
+    // this scoped review round).
+    REQUIRE(yuzu::test::spin_until([&] {
+        engine.journal_maintenance_tick();
+        return engine.spark_armed_rule_count() == 1 && engine.ack_pending_count_for_test() == 0 &&
+               engine.active_io_workers() == 0;
+    }));
 
     CHECK(engine.rule_count() == 1);
     CHECK(engine.armed_guard_count() == 0);
