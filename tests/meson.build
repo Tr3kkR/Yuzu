@@ -543,6 +543,12 @@ agent_test_exe = executable(
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_local_security_policy_parsers.cpp',          # #4997 remediation: pure sudoers lexer/secedit
+                                                # INI/pwpolicy/scratch-sweep decisions, labelled inline
+                                                # reconstructions (no OS call, no real capture: the plugin's
+                                                # sources are host-specific system files, not fixture-able)
+    'unit/test_local_security_policy_local_dispatcher.cpp', # #4997 remediation: real plugin via
+                                                # LocalDispatcher, unguarded on every OS
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -720,6 +726,7 @@ agent_test_exe = executable(
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
+                local_security_policy_plugin_lib,  # #4997 remediation
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak

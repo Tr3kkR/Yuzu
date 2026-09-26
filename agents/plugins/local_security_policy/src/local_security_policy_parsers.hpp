@@ -99,15 +99,40 @@ inline std::optional<std::string> decode_utf16le_bom(std::span<const std::uint8_
     return out;
 }
 
+/// Case-insensitive `std::map` ordering/lookup for INI section and key names (the INF
+/// rule): `secedit_export_complete` already compares section/key names case-insensitively,
+/// but a plain `std::map<std::string,...>` orders and looks up by exact bytes, so a
+/// differently-cased section or key that passed the completeness check was invisible to
+/// `secedit_policy_rows`'s row lookups -- a present setting silently read as the legitimate
+/// modal value `absent` (#4997). `is_transparent` lets `.find()` take a `std::string_view`
+/// literal directly, same call sites as before. Values keep whatever casing the export
+/// file used -- only lookup/ordering are case-insensitive, so the audit row loop below
+/// (which prints the stored key verbatim) is unaffected.
+struct CaseInsensitiveLess {
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const {
+        const std::size_t n = std::min(a.size(), b.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            const int ca = std::tolower(static_cast<unsigned char>(a[i]));
+            const int cb = std::tolower(static_cast<unsigned char>(b[i]));
+            if (ca != cb) return ca < cb;
+        }
+        return a.size() < b.size();
+    }
+};
+
 /// `[Section]` / `key = value` INI (secedit .inf). `;` comments and lines
-/// before the first section are ignored; a repeated key keeps the last value.
-/// std::map, not unordered: secedit_policy_rows iterates `[Event Audit]`
-/// directly, so the key order IS the audit_policy row order on the wire.
-using InfSections = std::map<std::string, std::map<std::string, std::string>>;
+/// before the first section are ignored; a repeated key keeps the last value
+/// (case-insensitively -- see CaseInsensitiveLess -- so `MinimumPasswordLength` and a
+/// later `minimumpasswordlength` in the same section are the same key). std::map, not
+/// unordered: secedit_policy_rows iterates `[Event Audit]` directly, so the key order IS
+/// the audit_policy row order on the wire.
+using InfSections =
+    std::map<std::string, std::map<std::string, std::string, CaseInsensitiveLess>, CaseInsensitiveLess>;
 
 inline InfSections parse_inf_sections(std::string_view text) {
     InfSections out;
-    std::map<std::string, std::string>* cur = nullptr;
+    std::map<std::string, std::string, CaseInsensitiveLess>* cur = nullptr;
     for (auto raw : split_lines(text)) {
         const auto line = trim_ws(raw);
         if (line.empty() || line.front() == ';') continue;
@@ -581,13 +606,19 @@ private:
         command_args(b);
     }
 
-    /// toke.l GOTCMND: arguments run to an unescaped `#`, `:`, `,`, `=` or the line end.
+    /// toke.l GOTCMND: arguments run to an unescaped `#`, `:`, `,` or the line end. `=` is
+    /// an ordinary argument character here (env assignments, `--flag=value`) -- it is NOT
+    /// in this break set, unlike command()'s own PATH-name scan just above, where `=` DOES
+    /// end the token per toke.l's PATH rule and must stay excluded there. Including it here
+    /// too used to cut a legal `NOPASSWD: /usr/bin/rsync --rsync-path=x` at the `=`,
+    /// misreporting it `unmodelled` (#4997; loud via the undecoded_passwd_tag fail-safe,
+    /// since the raw NOPASSWD: text survives -- not silent, but still wrong).
     void command_args(std::size_t b) {
         bad_ = false;
         bool have_arg = false;
         while (i_ < s_.size() && newline_len(i_) == 0) {
             const char ch = s_[i_];
-            if (std::string_view{"#:,="}.find(ch) != npos) break;
+            if (std::string_view{"#:,"}.find(ch) != npos) break;
             if (ch == ' ' || ch == '\t' || ch == '\r') {
                 blank_ = true;
                 ++i_;
@@ -788,8 +819,14 @@ inline std::vector<SudoersEntry> parse_sudoers(std::string_view text) {
                 scope = std::string{std::array{"user:", "host:", "cmnd:", "runas:"}[k]} + std::string{word.substr(9)};
             }
             out.push_back({"defaults", scope, "-", "-", std::string{rest}});
-        } else if (word == "User_Alias" || word == "Runas_Alias" || word == "Host_Alias" ||
-                   word == "Cmnd_Alias") {
+        } else if (
+            // `Cmd_Alias` is a sudo-legal synonym for `Cmnd_Alias` (toke.l's alias rule
+            // matches `(Host|Cmnd|Cmd|User|Runas)_Alias`) -- omitting it let a line like
+            // `Cmd_Alias SHELLS = /bin/sh` fall through to parse_user_spec below and
+            // silently invent a user_spec row for a fictitious principal "Cmd_Alias" on
+            // host "SHELLS", under a clean OK/FULL result with no failure token (#4997).
+            word == "User_Alias" || word == "Runas_Alias" || word == "Host_Alias" ||
+            word == "Cmnd_Alias" || word == "Cmd_Alias") {
             const auto eq = rest.find('=');
             out.push_back({"alias", std::string{word} + ":" + std::string{trim_ws(rest.substr(0, eq))},
                            "-", "-", eq == std::string_view::npos ? "" : std::string{trim_ws(rest.substr(eq + 1))}});

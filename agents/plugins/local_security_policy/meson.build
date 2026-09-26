@@ -12,7 +12,9 @@ elif host_machine.system() == 'darwin'
                                            include_type: 'system')
 endif
 
-shared_library(
+# Assigned so tests/meson.build's link_depends can order this build ahead of
+# test_local_security_policy_local_dispatcher.cpp, which loads the real library by path.
+local_security_policy_plugin_lib = shared_library(
   'local_security_policy',
   files(
     'src/local_security_policy_plugin.cpp',
