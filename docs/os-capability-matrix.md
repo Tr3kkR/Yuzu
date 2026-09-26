@@ -195,7 +195,6 @@ processes, worst) — rung states *how* a leg acquires its capability per
 docs/adr/3002-acquisition-ladder.md, never how mature or hardened the
 implementation is.
 
-
 <!-- BEGIN GENERATED: capmatrix-gen (#2204) — do not hand-edit; regenerate with
      tools/capmatrix-gen, verified by scripts/ci/check-capability-matrix.sh -->
 | Plugin | Action | OS | Support | Rung | Mechanism | Fallback |

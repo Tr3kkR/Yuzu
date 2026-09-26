@@ -4,5 +4,4 @@ policy|chrome|mandatory|machine|ExtensionInstallForcelist|list|["aaaabbbbccccddd
 policy|chrome|mandatory|machine|HomepageLocation|string|https://intranet.example.com/|/etc/opt/chrome/policies/managed/seeded.json|-
 policy|chrome|mandatory|machine|RestoreOnStartup|int|4|/etc/opt/chrome/policies/managed/seeded.json|-
 policy|chrome|recommended|machine|BookmarkBarEnabled|bool|true|/etc/opt/chrome/policies/recommended/seeded.json|-
-[result_status] OK / FULL / 
-
+[result_status] OK / FULL /

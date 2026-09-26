@@ -18,15 +18,22 @@
  *   name     the policy name exactly as the browser documents it
  *   type     bool | int | real | string | list | dict | null | unmodelled
  *   value    bool "true"/"false"; int/real as decimal text; string verbatim;
- *            list/dict as compact JSON text; null "null"; unmodelled "-"
+ *            list/dict as compact JSON text (see `json_escaped` below); null
+ *            "null"; unmodelled "-"
  *   source   the LOGICAL absolute file (or registry key) the policy was read
  *            from, e.g. /etc/opt/chrome/policies/managed/corp.json — never an
  *            injected test root
  *   detail   "-" normally; `json_type` for an `unmodelled` value (the only
- *            unmodelled qualifier emitted today), and `nul_replaced` /
- *            `utf8_replaced` / `truncated` (appended, comma-joined) when any
- *            free-text field held an embedded NUL, a byte that is not valid
- *            UTF-8, or more than kMaxFieldBytes
+ *            unmodelled qualifier emitted today); `json_escaped` for a
+ *            list/dict value whose JSON dump contains a backslash (a nested
+ *            string held a `"`, `\` or control character) — `safe_output_field`
+ *            below folds every literal backslash to `/` before the row is
+ *            written, so an escaped list/dict value on the wire is no longer
+ *            valid JSON; the row still carries the best-effort (folded) text,
+ *            never blanked, but `json_escaped` says not to trust it as JSON;
+ *            and `nul_replaced` / `utf8_replaced` / `truncated` (appended,
+ *            comma-joined) when any free-text field held an embedded NUL, a
+ *            byte that is not valid UTF-8, or more than kMaxFieldBytes
  *
  * Every free-text field goes through yuzu::util::safe_output_field
  * (sdk/include/yuzu/string_utils.hpp): a value ending in a backslash or
@@ -452,10 +459,16 @@ struct JsonShape {
         return {PolicyType::Real, detail::dump_json(j), {}};
     if (j.is_string())
         return {PolicyType::String, j.get<std::string>(), {}};
-    if (j.is_array())
-        return {PolicyType::List, detail::dump_json(j), {}};
-    if (j.is_object())
-        return {PolicyType::Dict, detail::dump_json(j), {}};
+    if (j.is_array()) {
+        std::string raw = detail::dump_json(j);
+        const bool escaped = raw.find('\\') != std::string::npos;
+        return {PolicyType::List, std::move(raw), escaped ? "json_escaped" : std::string{}};
+    }
+    if (j.is_object()) {
+        std::string raw = detail::dump_json(j);
+        const bool escaped = raw.find('\\') != std::string::npos;
+        return {PolicyType::Dict, std::move(raw), escaped ? "json_escaped" : std::string{}};
+    }
     if (j.is_null())
         return {PolicyType::Null, "null", {}};
     return unmodelled_value("json_type");

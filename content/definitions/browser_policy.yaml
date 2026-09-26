@@ -113,7 +113,7 @@ spec:
         platforms: [linux]
       - name: value
         type: string
-        description: 'The policy value as text: true or false for a bool, decimal text for int and real, the string verbatim, compact JSON text for a list or dict, the literal null for null, and "-" for unmodelled. Reported verbatim: a value can carry a credential-bearing URL or an enrollment token an administrator put in the file. On a status row: the state, constrained or unavailable.'
+        description: 'The policy value as text: true or false for a bool, decimal text for int and real, the string verbatim, compact JSON text for a list or dict (flagged json_escaped in detail, and no longer valid JSON, if the escaper folded a backslash inside it), the literal null for null, and "-" for unmodelled. Reported verbatim: a value can carry a credential-bearing URL or an enrollment token an administrator put in the file. On a status row: the state, constrained or unavailable.'
         example: https://intranet.example.com
         platforms: [windows, linux, darwin]
       - name: source

@@ -185,6 +185,50 @@ TEST_CASE("browser_policy: every JSON type lands on the type enum", "[browser_po
     check("l", PolicyType::List, R"([1,"a"])");
     check("d", PolicyType::Dict, R"({"k":[]})");
     check("n", PolicyType::Null, "null");
+    // Neither list/dict value above contains a backslash, so neither is folded --
+    // detail stays empty. Pinned explicitly since the sibling test below covers
+    // the opposite (escaped) case and the two must not be confused.
+    CHECK(find_row(p.rows, "l")->value.detail.empty());
+    CHECK(find_row(p.rows, "d")->value.detail.empty());
+}
+
+TEST_CASE("browser_policy: a list/dict value the wire escaper would fold is flagged json_escaped, "
+          "never silently presented as valid JSON",
+          "[browser_policy][parsers]") {
+    // safe_output_field folds every literal backslash to '/', so a JSON dump
+    // containing one (a nested string held a `"`, `\` or control character) is
+    // no longer valid JSON once written to the wire. json_to_policy_value must
+    // flag this in `detail` while still keeping the (folded) value -- never
+    // blank it to unmodelled, which would throw away otherwise-useful content.
+    {
+        const auto v = json_to_policy_value(nlohmann::json::parse(R"(["a\"b"])"));
+        CHECK(v.type == PolicyType::List);
+        CHECK(v.value == R"(["a\"b"])"); // dump_json's own escaping, unfolded at this layer
+        CHECK(v.detail == "json_escaped");
+    }
+    {
+        const auto v = json_to_policy_value(nlohmann::json::parse(R"({"k":"line1\nline2"})"));
+        CHECK(v.type == PolicyType::Dict);
+        CHECK(v.detail == "json_escaped");
+    }
+    // A value with no backslash anywhere in its dump is never flagged, even
+    // when it holds other JSON punctuation (quotes around ordinary strings).
+    {
+        const auto v = json_to_policy_value(nlohmann::json::parse(R"(["plain","value"])"));
+        CHECK(v.type == PolicyType::List);
+        CHECK(v.detail.empty());
+    }
+    // End-to-end through the wire escaper: the folded value on the actual row
+    // is no longer valid JSON, but the row still carries it, with the flag.
+    {
+        PolicyRow r;
+        r.name = "Escaped";
+        r.scope = "machine";
+        r.source = "/x";
+        r.value = json_to_policy_value(nlohmann::json::parse(R"(["a\"b"])"));
+        const std::string wire = format_policy_row(r);
+        CHECK(wire == R"(policy|chrome|mandatory|machine|Escaped|list|["a/"b"]|/x|json_escaped)");
+    }
 }
 
 TEST_CASE("browser_policy: a value the mapper does not model is the literal unmodelled outcome",
@@ -565,7 +609,12 @@ TEST_CASE("browser_policy: max_nesting_depth counts brackets outside strings and
     CHECK(max_nesting_depth("") == 0);
     CHECK(max_nesting_depth("{}") == 1);
     CHECK(max_nesting_depth(R"({"a":[[1],{"b":[]}]})") == 4);
-    CHECK(max_nesting_depth(R"({"a":"[[[[ {{{{ \" ]]]] "})") == 1); // brackets inside a string
+    // Hoisted out of the CHECK() argument position (not inlined as a raw string literal there):
+    // MSVC's traditional preprocessor mistokenizes a raw string containing an embedded `"` when
+    // it appears as a macro argument (#4998 review) -- a plain statement isn't a macro argument,
+    // so the same literal here compiles everywhere.
+    const std::string kNestedQuoteInString = R"({"a":"[[[[ {{{{ \" ]]]] "})";
+    CHECK(max_nesting_depth(kNestedQuoteInString) == 1); // brackets inside a string
     CHECK(max_nesting_depth(R"({"a":"\\"}[[)") == 2);               // \\ then the closing quote
     CHECK(max_nesting_depth("{// [[[[\n}") == 1);                   // line comment, ended by LF
     CHECK(max_nesting_depth("/* [[[[ */{}") == 1);                  // block comment
@@ -581,7 +630,9 @@ TEST_CASE("browser_policy: max_nesting_depth counts brackets outside strings and
     CHECK(max_nesting_depth(R"({"a":[[[1]]],"b":[]})") == 4);
     // An escaped quote does not end the string, so the brackets after it are still inside it.
     // MUTATION: drop the backslash skip -> the string ends early and the `[[[[` counts.
-    CHECK(max_nesting_depth(R"({"a":"x\"[[[["})") == 1);
+    // Hoisted for the same MSVC macro-argument reason as kNestedQuoteInString above.
+    const std::string kEscapedQuoteThenBrackets = R"({"a":"x\"[[[["})";
+    CHECK(max_nesting_depth(kEscapedQuoteThenBrackets) == 1);
     // Parse level, same two shapes: 33 nested arrays after a shallow key, and after an escaped
     // quote, are still json_too_deep (the guard must see them wherever they sit).
     const auto parse_text = [](const std::string& text) {
