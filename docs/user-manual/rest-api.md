@@ -3244,23 +3244,68 @@ The export is itself audited as `access_review.exported`.
 **Responses:** `200` — JSON: `data[]` of `{principal_type, principal_id,
 display_name, owner_or_email, roles[], effective_permission_count,
 last_activity_ms, last_activity_kind, classification, lifecycle_state,
-source}`. CSV: the same fields with a `Content-Disposition: attachment`
-header. `400` if `format` is not `json`/`csv`. `403` without
-`AccessReview:Read` (or an engine-classed caller — see the note above). `503` —
+source}`, plus a top-level `rbac_enforcement` field (`"enabled"` |
+`"disabled"` | `"degraded"` — see below). CSV: the same row fields with a
+`Content-Disposition: attachment` header, **plus an unconditional leading
+metadata line** — `# rbac_enforcement=<enabled|disabled|degraded>` — before
+the header row. This line is present even when the grant population is
+empty, so "no grants" is never ambiguous with "the stamp was omitted"; a
+consumer treating the CSV as strict single-header tabular data skips this
+first line before the real header. The CSV is the retained, offline
+evidence artifact an auditor pulls for a hand-off — the stamp travels with
+the file itself, not only this route's JSON form. `400` if `format`
+is not `json`/`csv`. `403` without `AccessReview:Read` (or an engine-classed
+caller — see the note above). `503` —
 **fail-loud**: a read across users, groups, engine-principals, or tokens
 failed. This endpoint never returns a silent partial export — an empty 200
 always means "no grants", never "the read partially failed". If the
 export's own audit row fails to persist, the response carries a
 `Sec-Audit-Failed: true` header (the export still returns).
 
-**CSV formula-injection neutralization.** Every CSV field is RFC-4180
-escaped, and any field whose first byte is one Excel/Sheets treats as a
-formula trigger (`=`, `+`, `-`, `@`, tab, CR) is additionally prefixed with
-a literal `'` **before** the RFC-4180 quoting pass (CWE-1236). Several
+**`rbac_enforcement`.** Whether RBAC actually governs the grant population
+above, **right now** — without this, the export can certify a fleet-wide
+grant listing that has no bearing on real access control (RBAC ships off by
+default). Three values, derived from `rbac_enforcement_label()`
+(`rbac_store.hpp`), which mirrors the fail-closed `rbac_enforcement_in_effect`
+predicate's own branch order exactly:
+
+**Precedence: a cached-`enabled` read always wins, even over a stale view.**
+The store checks "is RBAC enabled" first; only when that reads OFF does it
+go on to ask whether the OFF reading itself is fresh. So a store that is
+cached ON but whose refresh has gone stale still reports `enabled` here —
+it never falls through to `degraded` merely because the view is old (gates
+deny in both cases either way, so this costs nothing on the authorization
+side; it only affects which of these three labels an evidence export
+shows).
+
+| Value | Meaning |
+|---|---|
+| `enabled` | RBAC reads as ON right now (a cached ON always reports this, live or stale) — grants above are enforced. |
+| `disabled` | RBAC reads as OFF, **and** that OFF reading is confirmed fresh (not stale) — grants above are **not** enforced; any authenticated session gets the legacy fallback. |
+| `degraded` | The store could not confirm a genuine OFF: it's unreachable/unopened, or it reads OFF from a STALE cached view — gates **deny** defensively in this state, same as `enabled`, but this is **not** an administrator's deliberate choice to turn RBAC on. Never misread `degraded` as "ungoverned". |
+
+The frozen campaign row (`POST /api/v1/access-reviews` below) carries the
+same field, stamped once at open — never re-derived on a later read, and
+(per this feature's no-prune retention) **permanently** — a `degraded` or
+stale-cached-`enabled` reading recorded during a partition is not
+self-correcting on a closed campaign the way the live export is on its
+next pull. To infer whether a given reading was actually fresh, correlate
+against `yuzu_server_rbac_read_degrade_total{reason=~"generation_refresh_failed.*"}`
+around the pull/open time. Full discussion, including why this never
+affects actual authorization (gates deny on the identical degraded view
+independently of this stamp): `rbac.md` → "The access-review export's
+`rbac_enforcement` stamp inherits this same degrade-vs-outage ambiguity".
+
+**CSV formula-injection neutralization.** Every CSV data-row field is
+RFC-4180 escaped, and any field whose first byte is one Excel/Sheets treats
+as a formula trigger (`=`, `+`, `-`, `@`, tab, CR) is additionally prefixed
+with a literal `'` **before** the RFC-4180 quoting pass (CWE-1236). Several
 fields on this export are influenceable by an external identity provider
 (SCIM `userName`, an engine principal's `display_name`) — this is not a
 theoretical input, and the neutralization applies unconditionally to every
-row, orphan rows included.
+row, orphan rows included. The leading `# rbac_enforcement=...` metadata
+line is exempt — its value is always one of the three fixed literals above,
+never externally influenced.
 
 Known scoping notes (accurate as shipped, not defects to "fix" reflexively):
 `last_activity_kind` is `"n/a"` for every user row today — `AuthDB` has no
@@ -3284,7 +3329,11 @@ cadence without already knowing a `campaign_id` out-of-band.
 **Permission:** `AccessReview:Read`.
 
 **Responses:** `200` — `{data: [{campaign_id, title, status, created_by,
-created_at_ms, closed_by, closed_at_ms}], meta}`. `403` without
+created_at_ms, closed_by, closed_at_ms, rbac_enforcement}], meta}`.
+`rbac_enforcement` (`"enabled"` | `"disabled"` | `"degraded"` — see
+`GET .../export` above) is the fleet's RBAC state **at open**, frozen with
+the rest of the campaign; `""` for a campaign opened before this field
+existed. `403` without
 `AccessReview:Read` (or an engine-classed caller). `503` — the access-review
 store is unavailable, or a genuine read failure.
 
@@ -3299,7 +3348,10 @@ after this call returns is out of scope for **this** campaign (review it in
 the next one); a grant revoked afterward stays reviewable — the frozen row
 is not re-derived from live state. This freeze-at-open property is what
 makes "every grant that existed when the campaign opened has a reviewable
-row" provable rather than assumed.
+row" provable rather than assumed. The fleet's RBAC enforcement state
+(`enabled`/`disabled`/`degraded`, see `GET .../export` above) is stamped
+onto the campaign at this same moment — see `GET /api/v1/access-reviews/{id}`
+below.
 
 **Permission:** `AccessReview:Attest`.
 
@@ -3318,8 +3370,8 @@ or `title` missing/empty. `403` without `AccessReview:Attest` (or an
 engine-classed caller). `503` — the access-review store is unavailable, or
 the grant-population read failed.
 
-Audited as `access_review.campaign_opened` (`detail` carries `grants=<N>`
-on success).
+Audited as `access_review.campaign_opened` (`detail` carries
+`grants=<N> rbac_enforcement=<value>` on success).
 
 #### `GET /api/v1/access-reviews/{id}`
 
@@ -3336,7 +3388,8 @@ attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`
   "campaign": {
     "campaign_id": "...", "title": "...", "status": "open",
     "created_by": "alice", "created_at_ms": 0,
-    "closed_by": "", "closed_at_ms": 0
+    "closed_by": "", "closed_at_ms": 0,
+    "rbac_enforcement": "enabled"
   },
   "attestations": [
     {
@@ -3424,9 +3477,9 @@ Audited as `access_review.closed`.
 
 | Action | Description |
 |---|---|
-| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv> rows=<N>`. `result=success`. |
+| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv> rows=<N> rbac_enforcement=<value>`. `result=success`. |
 | `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews`. `target_type=AccessReview`. `result=success`. |
-| `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N>` on success. `result` ∈ {`success`, `failure`}. |
+| `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N> rbac_enforcement=<value>` on success. `result` ∈ {`success`, `failure`}. |
 | `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`. `result` ∈ {`success`, `failure`}. |
 | `access_review.flagged` | Reviewer recorded `decision=flagged_revoke` via the same endpoint. Same target/result shape as `access_review.attested` — a separate verb so flagged grants are separately countable/alertable. **Evidence only — does not revoke.** |
 | `access_review.closed` | Campaign closed via `POST /api/v1/access-reviews/{id}/close`. `target_id=<campaign_id>`. `result` ∈ {`success`, `failure`}. |

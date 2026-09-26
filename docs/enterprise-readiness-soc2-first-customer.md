@@ -99,6 +99,26 @@ before #2376, treat the grant-population export as having been accessible to all
 authenticated principals unless RBAC was explicitly enabled on that deployment.** Full
 decision record: `docs/security-reviews/authz-topology-floor-2026-08-05.md`.
 
+**Addendum — the access-review export now states whether RBAC was actually enforced
+(CC6.2, RBAC delivery plan A3).** #2376 above closed *who* can read the grant-population
+export; it did not address a separate gap this section's own evidence framing had:
+listing every grant proves nothing about whether that population governed real access at
+all, since RBAC ships disabled by default. `GET /api/v1/access-reviews/export` (and its
+MCP twin `export_access_review`) now carry a top-level `rbac_enforcement` field —
+`enabled` | `disabled` | `degraded` — and `POST /api/v1/access-reviews` freezes the same
+value onto the campaign row at open time, so a closed review campaign records what RBAC's
+state actually was when the population was certified, not just the population itself.
+**Caveat an assessor should know:** the stamp is a point-in-time read, not a continuously
+monitored guarantee — a transient RBAC-store partition can produce a `degraded` reading
+(the read couldn't confirm state; gates still denied defensively) or, on a cached-enabled
+replica, a stale-but-unflagged `enabled` reading, and a closed campaign's frozen stamp
+never self-corrects on a later read the way the live export does on its next pull. Full
+discussion, including the operator-facing metric to correlate against
+(`yuzu_server_rbac_read_degrade_total{reason=~"generation_refresh_failed.*"}`):
+`docs/user-manual/rbac.md` → "The access-review export's `rbac_enforcement` stamp
+inherits this same degrade-vs-outage ambiguity"; field reference:
+`docs/user-manual/rest-api.md` → `GET /api/v1/access-reviews/export`.
+
 **Addendum — service-scoped token fleet-wide confinement, durably closed
 (CC6.1/CC6.3, guardian-confinement-2298 PR 3 — "the flip", 2026-08-18).**
 `require_permission`'s service-scoped branch previously admitted any

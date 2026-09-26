@@ -543,6 +543,10 @@ agent_test_exe = executable(
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_pkg_inventory_parsers.cpp',          # Wave 10 PR10.1-c: pure row formatters/tokens + synthetic in-code macOS walk cases (no committed fixture)
+    'unit/test_pkg_inventory_macos_parsers.cpp',    # Wave 10 PR10.1-c: injected-root Homebrew walk over a REAL CAPTURE Cellar tree
+    'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
+    '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -559,6 +563,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
+    include_directories('../agents/plugins/pkg_inventory/src'),  # Wave 10 PR10.1-c: pkg_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
     include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
@@ -618,6 +623,8 @@ agent_test_exe = executable(
              # this same define.
              # Wave 8 PR8.1-a1: test_platform_security_{parsers,win_parsers}.cpp read
              # Docker/this-Mac/the-rig REAL CAPTURE fixtures via this same define.
+             # Wave 10 PR10.1-c: test_pkg_inventory_macos_parsers.cpp reads the this-Mac REAL
+             # CAPTURE tree manifest via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
@@ -720,6 +727,7 @@ agent_test_exe = executable(
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
+                pkg_inventory_plugin_lib,  # Wave 10 PR10.1-c
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -2598,6 +2606,18 @@ test('assert-suite-cover selftest',
 test('issue lifecycle docs',
   _python3_test,
   args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
+# RBAC doc/seed parity (#480): rbac.md's system-role, securable-type, operation
+# and authorization-topology-floor tables must match rbac_store.cpp's seed
+# arrays and authz_topology_floor.hpp's kTopologyFloor. Also runs in
+# .github/workflows/docs-lint.yml on every PR; registered here for local
+# `meson test --suite docs` parity with the sibling python doc-tests.
+test('rbac doc counts',
+  _python3_test,
+  args: [files('test_rbac_doc_counts.py')],
   suite: 'docs',
   timeout: 10,
 )
