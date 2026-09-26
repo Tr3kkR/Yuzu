@@ -3006,13 +3006,16 @@ Before upgrading any component:
   "Received signal, shutting down..." line on `SIGINT`/`SIGTERM`/Ctrl-C used
   to be a raw stderr-only write and now goes through the same configured
   logger as everything else, so it also lands in `--log-file` and picks up
-  JSON formatting under `--log-format json`. The other new
-  operator-visible surface is a fifth self-exit code: tearing down the async
-  logger during shutdown is itself bounded by a 2-second internal watchdog,
-  and a wedge there self-terminates with **exit code 5**, distinct from the
-  existing 1, 3, and 4. A supervisor script or alert keyed to a fixed exit-code
-  set should widen it to include 5. See *Stopping a wedged agent* in
-  [Server Administration](server-admin.md).
+  JSON formatting under `--log-format json` — and, since it's now an
+  ordinary `info`-level line rather than an unconditional raw write, it is
+  silently **absent entirely** at `--log-level warn` or above (previously it
+  always printed regardless of level). The other new operator-visible
+  surface is a fifth self-exit code: tearing down the async logger during
+  shutdown either times out on a 2-second internal watchdog or fails
+  outright, and either cause self-terminates with **exit code 5**, distinct
+  from the existing 1, 3, and 4. A supervisor script or alert keyed to a
+  fixed exit-code set should widen it to include 5. See *Stopping a wedged
+  agent* in [Server Administration](server-admin.md).
 - [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
   as above, now applied to the server — graceful shutdown runs on a dedicated
   watcher thread (fixes the same abort/hang class on `SIGTERM`, previously

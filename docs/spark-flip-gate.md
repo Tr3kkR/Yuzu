@@ -1806,10 +1806,15 @@ this doc's own #4666 references above) installs that primitive as the process's 
 default logger, so every bare `spdlog::` call anywhere in the process, including the
 Spark runtime's own arm-committed/late-arm/sweep-residue lines and the `T_wire` line on
 the legacy guard worker, now enqueues onto the bounded async queue and returns rather
-than blocking on sink I/O, on Linux and Windows (confirmed single spdlog registry per
-process on both; see `docs/darwin-compat.md`'s new "spdlog registry identity across
-images" row for the still-pending macOS measurement and its own residual gap even once
-that lands). This is the mechanism the precondition asked for: it comes from installing
+than blocking on sink I/O, on Linux confirmed and Windows inferred (single spdlog
+registry per process, measured directly on Linux via `tests/unit/test_log_handoff_multi_image.cpp`
+and `tests/shell/test_spdlog_registry_identity.sh`; Windows was not measured by either
+fixture — the shell probe explicitly SKIPs there — and is inferred from dynamic spdlog
+linkage rather than observed). See `docs/darwin-compat.md`'s "spdlog registry identity
+across images" row for the macOS result, now measured: TWO separate registries there, with
+the exe-image swap load-bearing on the teardown side only (install-side logging already
+reaches the async hand-off correctly regardless, since `LogHandoff::install()` is compiled
+into the core library). This is the mechanism the precondition asked for: it comes from installing
 one process-wide default logger, not from touching each call site individually. What PR-2
 does NOT do, despite an earlier PR-1-era header comment predicting it would: it adds no
 `drain_log_bounded()` pre-abort breadcrumb calls inside `guardian_engine.cpp` or

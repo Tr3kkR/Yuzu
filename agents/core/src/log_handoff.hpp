@@ -11,8 +11,16 @@
 /// PR-1 built the primitive -- StallObservableSink, LogHandoff, drain_log_bounded() --
 /// as a correct, fully unit-tested, standalone unit. PR-2 (LANDED) wires it into
 /// production: main.cpp's/service_win.cpp's real install()/teardown() call sites
-/// (agent_log_wiring.hpp) and the F3 orphan-exit drain_log_bounded() calls in both
-/// files. The guardian_engine.cpp/guardian_spark_runtime.hpp drain_log_bounded() call
+/// (agent_log_wiring.hpp) and FOUR production drain_log_bounded() call sites (each
+/// firewalled in its own try/catch(...), since the call is not declared noexcept):
+/// main.cpp's F3 orphan-exit check; service_win.cpp's post-agent->run() best-effort
+/// drain immediately before the "operator stop always wins" report_status() chain;
+/// service_win.cpp's own F3 orphan-exit check; and service_win.cpp's
+/// completion-handshake-timeout drain in run_service(), fired if service_main does not
+/// finish within its grace window of the SCM dispatcher returning, just before the
+/// hard_exit(kShutdownDeadlineExitCode) that follows a failed
+/// wait_for_service_main_completion() (governance hardening round addition). The
+/// guardian_engine.cpp/guardian_spark_runtime.hpp drain_log_bounded() call
 /// sites PR-1's own plan once expected here were evaluated and deliberately NOT added
 /// by PR-2 -- neither file has a hard_exit() call site that would need one (grep-
 /// confirmed; see docs/spark-flip-gate.md's own status update and this file's PR-2
@@ -581,6 +589,13 @@ private:
         mutable std::mutex mu;
         std::uint64_t count{0};
         std::string last_message;
+        // Rate-limits the stderr fallback the error handler prints (governance
+        // hardening round, sre finding): spdlog's OWN default error handler --
+        // which this custom one replaces -- prints to stderr at most once per
+        // second; this field reproduces that same throttle so replacing the
+        // default handler doesn't silently drop an operator-visible signal that
+        // existed before this primitive was wired into production (#4666 PR-2).
+        std::chrono::steady_clock::time_point last_emit{};
     };
 
     LogHandoff() = default;

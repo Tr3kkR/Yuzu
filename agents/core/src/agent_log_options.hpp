@@ -9,11 +9,11 @@
 /// caller of make_log_handoff_options(). No I/O, no logging, throws nothing
 /// itself.
 
-#include "log_handoff.hpp"
-
 #include <cstddef>
 #include <filesystem>
 #include <string>
+
+#include "log_handoff.hpp"
 
 namespace yuzu::agent {
 

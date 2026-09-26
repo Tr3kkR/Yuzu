@@ -392,6 +392,16 @@ TEST_CASE("MI-3: dispatching agent_actions's real set_log_level action against a
     const auto* descriptor = handle->descriptor();
     REQUIRE(descriptor != nullptr);
 
+    // Governance hardening round, plugin-developer finding: do_set_log_level() below
+    // calls the RAW, REGISTRY-WIDE spdlog::set_level() -- not scoped to this test's own
+    // LogHandoff instance -- so it persists past this test case's own teardown and into
+    // whichever test Catch2's randomized order runs next in this same process. Snapshot
+    // and restore it regardless of outcome (the plugin's call can mutate the global
+    // default even on the "did NOT reach this image" branch below, if it lands on a
+    // registry this image doesn't read from but a LATER test's install() still would).
+    const auto original_level = spdlog::get_level();
+    yuzu::test::ScopeExit restore_level_on_exit{[original_level] { spdlog::set_level(original_level); }};
+
     auto sink = std::make_shared<GatedCaptureSink>(/*initially_paused=*/false);
     auto result = LogHandoff::create_with_sinks({sink});
     REQUIRE(result.has_value());

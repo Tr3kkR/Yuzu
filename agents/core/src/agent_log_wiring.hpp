@@ -29,16 +29,15 @@
 /// see log_handoff.hpp's THREAD-SAFETY CONTRACT / TEARDOWN CONTRACT) run AFTER every
 /// later-declared object has already been destroyed and can no longer log.
 
-#include "hard_exit.hpp"
-#include "log_handoff.hpp"
-
-#include <yuzu/json_log_formatter.hpp>
+#include <memory>
+#include <string_view>
 
 #include <spdlog/sinks/null_sink.h>
 #include <spdlog/spdlog.h>
 
-#include <memory>
-#include <string_view>
+#include "hard_exit.hpp"
+#include "log_handoff.hpp"
+#include <yuzu/json_log_formatter.hpp>
 
 namespace yuzu::agent {
 

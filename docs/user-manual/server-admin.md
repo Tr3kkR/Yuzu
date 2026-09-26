@@ -2467,7 +2467,7 @@ A nonzero result means that host's `installed_count` will report a higher number
 
 **What changed.** The agent no longer writes log lines synchronously on the thread that produced them; `main.cpp` installs a bounded async hand-off logger as the process's spdlog default (see "Agent logging is now asynchronous", the paragraph immediately before *Stopping a wedged agent* under *systemd Units*, further down this page, for the queue-size/memory-cost/overrun details). Agent shutdown gains one more possible self-exit code, **5**, distinct from the existing 1/3/4, fired if tearing down that logger (flushing its queue, joining its worker thread) does not complete within an internal 2-second watchdog.
 
-**Impact.** Not a breaking change: no flag, wire format, API, or default behavior changes, and no operator action is required. Log output looks the same (same pattern/JSON formatting, same `--log-file`/rotation behavior) with one exception below. The externally-visible differences are: (1) under sustained log-sink overload, the agent can now silently drop older queued lines (`overrun_oldest`) rather than blocking, so a very bursty logger under a stuck sink may show gaps instead of a stall; (2) a shutdown wedge that used to hang or need `SIGKILL` before this and the related #2233 watchdogs landed can now self-exit with code 5 specifically, in addition to the pre-existing 1/3/4; (3) the "Received signal, shutting down..." line the agent prints on `SIGINT`/`SIGTERM`/Ctrl-C used to be a raw, fixed-format write straight to stderr — it is now routed through the same configured logger as everything else, so it picks up the configured pattern (or JSON structure under `--log-format json`) and now also lands in `--log-file` when one is configured, not stderr alone. A plain substring match against the message text (the default text pattern keeps the original words verbatim) is unaffected; a line-anchored or byte-exact matcher, or one that assumed this specific line was stderr-only, needs updating.
+**Impact.** Not a breaking change: no flag, wire format, API, or default behavior changes, and no operator action is required. Log output looks the same (same pattern/JSON formatting, same `--log-file`/rotation behavior) with one exception below. The externally-visible differences are: (1) under sustained log-sink overload, the agent can now silently drop older queued lines (`overrun_oldest`) rather than blocking, so a very bursty logger under a stuck sink may show gaps instead of a stall; (2) a shutdown wedge that used to hang or need `SIGKILL` before this and the related #2233 watchdogs landed can now self-exit with code 5 specifically, in addition to the pre-existing 1/3/4; (3) the "Received signal, shutting down..." line the agent prints on `SIGINT`/`SIGTERM`/Ctrl-C used to be a raw, fixed-format write straight to stderr — it is now routed through the same configured logger as everything else, so it picks up the configured pattern (or JSON structure under `--log-format json`) and now also lands in `--log-file` when one is configured, not stderr alone. A plain substring match against the message text (the default text pattern keeps the original words verbatim) is unaffected; a line-anchored or byte-exact matcher, or one that assumed this specific line was stderr-only, needs updating; (4) that same line is now an ordinary `info`-level call rather than an unconditional raw write, so at `--log-level warn` or above — a configuration this page itself recommends for agents to cut noise, see "Where the lines go" below — the line is silently **absent entirely**, whereas before it always printed regardless of level. If you rely on this line's presence to confirm a clean/intentional stop, either keep `--log-level` at `info` or below, or switch to checking the process exit code (0 = clean) instead.
 
 **Who should check.** Any operator running a supervisor script or monitoring rule that pattern-matches the agent's process exit code against a fixed set (`{0,1,3,4}` or similar) should widen it to include `5`. An unrecognised exit code there should not be interpreted as "impossible" or treated as a different failure class than the documented watchdog exits already are. See *Stopping a wedged agent* above for what each code means and how they interact.
 
@@ -4502,12 +4502,21 @@ still-queued message to admit the new one, so a busy agent under a stuck sink
 can lose log lines rather than pause. There is currently no counter or
 heartbeat field surfacing how many lines were dropped this way: an
 `overrun_total()` accessor exists on the primitive but nothing in the shipped
-binary reads it yet (planned for a later PR's heartbeat poller). There is no
-`--log-sync` flag or other escape hatch back to synchronous logging; this is
-unconditional for every build. A `--log-file` that cannot be opened still
-falls back to console-only logging exactly as before (`used_log_file_fallback()`
-prints the same kind of startup diagnostic), except the console sink is now
-async too, not synchronous as it was pre-#4666.
+binary reads it yet (planned for a later PR's heartbeat poller). A sink-level
+write/format failure (as opposed to an overrun) is tracked internally too —
+count plus the last 256 bytes of the failing message, in `LogHandoff`'s
+private `ErrorState` — but that state likewise has no accessor exposed
+anywhere, not even for tests; it exists only to drive a rate-limited (once per
+second) fallback line to stderr at the moment of failure, and is otherwise
+unreachable after the fact. If log lines appear to go missing under load with
+no error printed, check disk space and fd limits on the log destination
+first: `overrun_oldest` drops are silent in this release, with no counter or
+alert to point at them yet. There is no `--log-sync` flag or other escape
+hatch back to synchronous logging; this is unconditional for every build. A
+`--log-file` that cannot be opened still falls back to console-only logging
+exactly as before (`used_log_file_fallback()` prints the same kind of startup
+diagnostic), except the console sink is now async too, not synchronous as it
+was pre-#4666.
 
 **Stopping a wedged agent (Linux/macOS).** `SIGTERM`/`SIGINT` (`systemctl stop`,
 Ctrl-C) triggers a graceful agent stop — plugin shutdown, thread joins, store
@@ -4526,12 +4535,19 @@ below) if guardian/spark/DEX teardown or any other blocking step hasn't
 returned within it. Separately again (#4666 PR-2), once the rest of shutdown
 has already finished (after both watchdogs above have been cancelled and
 after the F3 orphan-exit check below has run), the agent tears down its own
-async log hand-off logger before the process exits: a 2-second internal
-watchdog on that specific step self hard-exits with **code 5** (distinct from
-codes 1/3/4) if flushing the queue and joining the logging worker thread
-hasn't finished in time. You do not need to send a second signal to recover
-from a code-4 or code-5-class wedge; doing so just makes the exit happen
-sooner (code 1) instead of after the relevant internal deadline. **Codes 3, 4,
+async log hand-off logger before the process exits: **code 5** (distinct from
+codes 1/3/4) fires from EITHER of two causes at that step — a 2-second
+internal watchdog if flushing the queue and joining the logging worker thread
+hasn't finished in time, **or an immediate exit (no 2-second wait at all) if
+the teardown itself fails outright** (an exception during the flush/join
+sequence, or — on macOS specifically, where the agent and its shared library
+run in separate spdlog registries — a failure while releasing this image's
+own reference to the logger). An operator seeing code 5 land instantly,
+with no apparent delay, should not read that as a broken or skipped
+watchdog; it means the second cause fired. You do not need to send a second
+signal to recover from a code-4 or code-5-class wedge; doing so just makes
+the exit happen sooner (code 1) instead of after the relevant internal
+deadline. **Codes 3, 4,
 and 5 are sequential, non-overlapping checkpoints in the same shutdown, not
 independent watchdogs racing each other**: code 4's watchdogs run first
 (during `stop()`/`run()`-exit teardown), the F3 orphan check (code 3) runs
