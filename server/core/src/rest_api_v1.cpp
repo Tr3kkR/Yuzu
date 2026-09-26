@@ -1033,7 +1033,11 @@ const std::string& openapi_spec() {
     },
     "/audit/auth-sample": {
       "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
-    },
+    },)json"
+        // Split again (MSVC C2026 16,380-byte cap) — A2's rbac/roles/{name}/
+        // assignments entries pushed this segment over the limit; concatenated
+        // at compile time, byte-identical JSON.
+        R"json(
     "/inventory/tables": {
       "get": {"summary": "List available inventory data types", "tags": ["Inventory"], "description": "Lists distinct plugins that have reported inventory data, with agent counts and last collection timestamps.", "responses": {"200": {"description": "List of inventory tables", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InventoryTable"}}}}}}
     },
