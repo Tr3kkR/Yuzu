@@ -3772,6 +3772,17 @@ void check_boot_inert_false_but_watch_refused_stays_failed(SparkType type) {
         f.mechanism->set_fail_next_watch(); // single-shot - re-arm before every retry
         auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
         REQUIRE(dr.exit_code == 0);
+        // Drain to full quiescence before asserting or re-arming the fail flag for the
+        // next iteration - guardian_dispatch_push_bytes_for_test's own attach is
+        // NonWaiting (rung 9c PR-2 Unit 6): without this wait, a still-in-flight
+        // resolution from THIS iteration can consume the NEXT iteration's single-shot
+        // set_fail_next_watch() instead of a fresh watch() call, so a genuine refusal
+        // gets silently skipped and the retry arms for real - observed as a CI flake
+        // (spark_armed_rule_count()==1 on an intermediate retry, #4685 PR #5021).
+        REQUIRE(yuzu::test::spin_until([&] {
+            f.engine->journal_maintenance_tick();
+            return f.engine->ack_pending_count_for_test() == 0 && f.engine->active_io_workers() == 0;
+        }));
         CHECK(f.engine->policy_generation() == 0); // held, every retry - no K-waiver for Failed
         CHECK(f.engine->armed_guard_count() == 0); // no legacy fallback
         CHECK(f.engine->spark_armed_rule_count() == 0);
