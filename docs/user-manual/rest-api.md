@@ -3244,23 +3244,68 @@ The export is itself audited as `access_review.exported`.
 **Responses:** `200` — JSON: `data[]` of `{principal_type, principal_id,
 display_name, owner_or_email, roles[], effective_permission_count,
 last_activity_ms, last_activity_kind, classification, lifecycle_state,
-source}`. CSV: the same fields with a `Content-Disposition: attachment`
-header. `400` if `format` is not `json`/`csv`. `403` without
-`AccessReview:Read` (or an engine-classed caller — see the note above). `503` —
+source}`, plus a top-level `rbac_enforcement` field (`"enabled"` |
+`"disabled"` | `"degraded"` — see below). CSV: the same row fields with a
+`Content-Disposition: attachment` header, **plus an unconditional leading
+metadata line** — `# rbac_enforcement=<enabled|disabled|degraded>` — before
+the header row. This line is present even when the grant population is
+empty, so "no grants" is never ambiguous with "the stamp was omitted"; a
+consumer treating the CSV as strict single-header tabular data skips this
+first line before the real header. The CSV is the retained, offline
+evidence artifact an auditor pulls for a hand-off — the stamp travels with
+the file itself, not only this route's JSON form. `400` if `format`
+is not `json`/`csv`. `403` without `AccessReview:Read` (or an engine-classed
+caller — see the note above). `503` —
 **fail-loud**: a read across users, groups, engine-principals, or tokens
 failed. This endpoint never returns a silent partial export — an empty 200
 always means "no grants", never "the read partially failed". If the
 export's own audit row fails to persist, the response carries a
 `Sec-Audit-Failed: true` header (the export still returns).
 
-**CSV formula-injection neutralization.** Every CSV field is RFC-4180
-escaped, and any field whose first byte is one Excel/Sheets treats as a
-formula trigger (`=`, `+`, `-`, `@`, tab, CR) is additionally prefixed with
-a literal `'` **before** the RFC-4180 quoting pass (CWE-1236). Several
+**`rbac_enforcement`.** Whether RBAC actually governs the grant population
+above, **right now** — without this, the export can certify a fleet-wide
+grant listing that has no bearing on real access control (RBAC ships off by
+default). Three values, derived from `rbac_enforcement_label()`
+(`rbac_store.hpp`), which mirrors the fail-closed `rbac_enforcement_in_effect`
+predicate's own branch order exactly:
+
+**Precedence: a cached-`enabled` read always wins, even over a stale view.**
+The store checks "is RBAC enabled" first; only when that reads OFF does it
+go on to ask whether the OFF reading itself is fresh. So a store that is
+cached ON but whose refresh has gone stale still reports `enabled` here —
+it never falls through to `degraded` merely because the view is old (gates
+deny in both cases either way, so this costs nothing on the authorization
+side; it only affects which of these three labels an evidence export
+shows).
+
+| Value | Meaning |
+|---|---|
+| `enabled` | RBAC reads as ON right now (a cached ON always reports this, live or stale) — grants above are enforced. |
+| `disabled` | RBAC reads as OFF, **and** that OFF reading is confirmed fresh (not stale) — grants above are **not** enforced; any authenticated session gets the legacy fallback. |
+| `degraded` | The store could not confirm a genuine OFF: it's unreachable/unopened, or it reads OFF from a STALE cached view — gates **deny** defensively in this state, same as `enabled`, but this is **not** an administrator's deliberate choice to turn RBAC on. Never misread `degraded` as "ungoverned". |
+
+The frozen campaign row (`POST /api/v1/access-reviews` below) carries the
+same field, stamped once at open — never re-derived on a later read, and
+(per this feature's no-prune retention) **permanently** — a `degraded` or
+stale-cached-`enabled` reading recorded during a partition is not
+self-correcting on a closed campaign the way the live export is on its
+next pull. To infer whether a given reading was actually fresh, correlate
+against `yuzu_server_rbac_read_degrade_total{reason=~"generation_refresh_failed.*"}`
+around the pull/open time. Full discussion, including why this never
+affects actual authorization (gates deny on the identical degraded view
+independently of this stamp): `rbac.md` → "The access-review export's
+`rbac_enforcement` stamp inherits this same degrade-vs-outage ambiguity".
+
+**CSV formula-injection neutralization.** Every CSV data-row field is
+RFC-4180 escaped, and any field whose first byte is one Excel/Sheets treats
+as a formula trigger (`=`, `+`, `-`, `@`, tab, CR) is additionally prefixed
+with a literal `'` **before** the RFC-4180 quoting pass (CWE-1236). Several
 fields on this export are influenceable by an external identity provider
 (SCIM `userName`, an engine principal's `display_name`) — this is not a
 theoretical input, and the neutralization applies unconditionally to every
-row, orphan rows included.
+row, orphan rows included. The leading `# rbac_enforcement=...` metadata
+line is exempt — its value is always one of the three fixed literals above,
+never externally influenced.
 
 Known scoping notes (accurate as shipped, not defects to "fix" reflexively):
 `last_activity_kind` is `"n/a"` for every user row today — `AuthDB` has no
@@ -3284,7 +3329,11 @@ cadence without already knowing a `campaign_id` out-of-band.
 **Permission:** `AccessReview:Read`.
 
 **Responses:** `200` — `{data: [{campaign_id, title, status, created_by,
-created_at_ms, closed_by, closed_at_ms}], meta}`. `403` without
+created_at_ms, closed_by, closed_at_ms, rbac_enforcement}], meta}`.
+`rbac_enforcement` (`"enabled"` | `"disabled"` | `"degraded"` — see
+`GET .../export` above) is the fleet's RBAC state **at open**, frozen with
+the rest of the campaign; `""` for a campaign opened before this field
+existed. `403` without
 `AccessReview:Read` (or an engine-classed caller). `503` — the access-review
 store is unavailable, or a genuine read failure.
 
@@ -3299,7 +3348,10 @@ after this call returns is out of scope for **this** campaign (review it in
 the next one); a grant revoked afterward stays reviewable — the frozen row
 is not re-derived from live state. This freeze-at-open property is what
 makes "every grant that existed when the campaign opened has a reviewable
-row" provable rather than assumed.
+row" provable rather than assumed. The fleet's RBAC enforcement state
+(`enabled`/`disabled`/`degraded`, see `GET .../export` above) is stamped
+onto the campaign at this same moment — see `GET /api/v1/access-reviews/{id}`
+below.
 
 **Permission:** `AccessReview:Attest`.
 
@@ -3318,8 +3370,8 @@ or `title` missing/empty. `403` without `AccessReview:Attest` (or an
 engine-classed caller). `503` — the access-review store is unavailable, or
 the grant-population read failed.
 
-Audited as `access_review.campaign_opened` (`detail` carries `grants=<N>`
-on success).
+Audited as `access_review.campaign_opened` (`detail` carries
+`grants=<N> rbac_enforcement=<value>` on success).
 
 #### `GET /api/v1/access-reviews/{id}`
 
@@ -3336,7 +3388,8 @@ attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`
   "campaign": {
     "campaign_id": "...", "title": "...", "status": "open",
     "created_by": "alice", "created_at_ms": 0,
-    "closed_by": "", "closed_at_ms": 0
+    "closed_by": "", "closed_at_ms": 0,
+    "rbac_enforcement": "enabled"
   },
   "attestations": [
     {
@@ -3424,9 +3477,9 @@ Audited as `access_review.closed`.
 
 | Action | Description |
 |---|---|
-| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv> rows=<N>`. `result=success`. |
+| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv> rows=<N> rbac_enforcement=<value>`. `result=success`. |
 | `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews`. `target_type=AccessReview`. `result=success`. |
-| `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N>` on success. `result` ∈ {`success`, `failure`}. |
+| `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N> rbac_enforcement=<value>` on success. `result` ∈ {`success`, `failure`}. |
 | `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`. `result` ∈ {`success`, `failure`}. |
 | `access_review.flagged` | Reviewer recorded `decision=flagged_revoke` via the same endpoint. Same target/result shape as `access_review.attested` — a separate verb so flagged grants are separately countable/alertable. **Evidence only — does not revoke.** |
 | `access_review.closed` | Campaign closed via `POST /api/v1/access-reviews/{id}/close`. `target_id=<campaign_id>`. `result` ∈ {`success`, `failure`}. |
@@ -5965,15 +6018,19 @@ route had NO authorization check of any kind before this fix, CWE-862: any
 authenticated session could query up to 5000 fleet-wide inventory records
 with zero scoping. Unlike the async producers below, it is a synchronous
 read, not a dispatch, so it gates on the same securable as `GET
-/api/v1/inventory/software` rather than `Execution:Execute`. **Unlike its
-result-set siblings, a service-scoped token is admitted and confined here,
-not denied outright** - see the "Result Sets" section below for the exact
-gate and the tracked cross-service-reach gap, `#4307`). The owner-scoped
-result-set row it creates is only readable/mutable by its own creator
-through the routes below, which — like their HTMX dashboard twins — also
-deny a service-scoped token outright: `session->username` is the *minting*
-principal's identity, not the token's own service tag, so without this a
-service token could reach any other token the same minter held.
+/api/v1/inventory/software` rather than `Execution:Execute`. **A
+service-scoped token is denied outright here too (#4980)**, same as its
+result-set siblings — before #4980, under RBAC-on, this route
+admitted-and-confined a service-scoped token via `fleet_read_fn` instead of
+denying it, a tracked cross-service-reach gap (`#4307`); `fleet_read_fn`
+still hard-denied a service-scoped token under RBAC-off (the default), same
+as the `require_permission` gate it briefly replaced (see the "Result Sets"
+section below for the full history). The owner-scoped result-set row it creates is only
+readable/mutable by its own creator through the routes below, which — like
+their HTMX dashboard twins — also deny a service-scoped token outright:
+`session->username` is the *minting* principal's identity, not the token's
+own service tag, so without this a service token could reach any other
+token the same minter held.
 
 #### `POST /api/v1/result-sets/from-tar-query`<br>`POST /api/v1/result-sets/from-instruction-result`<br>`POST /api/v1/result-sets/{id}/re-eval`
 
@@ -6243,7 +6300,7 @@ The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-wal
 
 **JSON nesting depth bound (json-dump-depth-guard fix), all four producers plus re-eval.** `nlohmann::json::dump()` is unboundedly recursive; the [MCP transport's 32-level guard](../mcp-server.md) (#2437) checked only the live `/mcp/` request body, leaving a gap on REST. `POST /api/v1/result-sets`, `/from-inventory-query`, `/from-tar-query`, and `/from-instruction-result` now reject (`400 RESULT_SET_BAD_REQUEST`) a request body nesting deeper than 32 levels before it is parsed, reusing the same `kMcpMaxJsonDepth` constant MCP enforces so the two surfaces cannot drift apart. `POST /api/v1/result-sets/{id}/re-eval` applies the same check to the row's **stored** `source_payload` before parsing it, since the table is shared with MCP's `reevaluate_result_set` and a row poisoned by any write path (including one predating this fix) would otherwise be re-dumped on a later read. **Heal on reject (#4493).** This specific re-eval attempt still fails with `400 RESULT_SET_BAD_REQUEST`, but the route now also discards the poisoned `source_payload` in place (status-agnostic - `materialized` and `failed` rows are healed too, not just `pending`) before returning, so every subsequent read of the row is safe instead of re-detecting the same poison forever; the row's `status` and members are never touched. The response body says "...and has been discarded..." only when the heal write actually committed - a rare heal-write failure returns a differently-worded `400` and leaves the row unchanged for the next retry.
 
-**MCP twins (#2146 Batch B2):** every one of these 12 REST v1 operations has an MCP tool twin (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`) — see [mcp-server.md](../mcp-server.md)'s "Result sets" tool family. The three async producer tools share the exact same `Execution:Execute` + per-device confined-dispatch gate (#1788) as their REST twins below; 8 of the remaining 9 are owner-scoped exactly like the REST routes (a service-scoped API token is denied outright). **`create_result_set_from_inventory_query`/`POST /api/v1/result-sets/from-inventory-query` are the one exception**: both gate via the admit-then-filter `fleet_read_fn` chokepoint, whose service-scope branch admits-and-confines a service-scoped token rather than hard-denying it - since the created result set is still owner-scoped to the minting token, a service token can mint a set the minter's other tokens/session can then read, a real cross-service-reach gap tracked in #4307.
+**MCP twins (#2146 Batch B2):** every one of these 12 REST v1 operations has an MCP tool twin (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`) — see [mcp-server.md](../mcp-server.md)'s "Result sets" tool family. The three async producer tools share the exact same `Execution:Execute` + per-device confined-dispatch gate (#1788) as their REST twins below; all 9 of the remaining tools/routes are owner-scoped exactly like the REST routes (a service-scoped API token is denied outright). **`create_result_set_from_inventory_query`/`POST /api/v1/result-sets/from-inventory-query` joined them in #4980**: both gate via the admit-then-filter `fleet_read_fn`/`fleet_read_fn_` chokepoint for scope confinement, but a service-scoped token is now hard-denied structurally BEFORE that chokepoint ever runs on either transport — MCP already enforced this via its C8 generic-tier gate's structural `ServiceScopeClass::denied` default (empirically verified during #4980, never actually reachable there); the REST route lacked the equivalent and gated purely via `fleet_read_fn`, whose service-scope branch admits-and-confines a service-scoped token rather than denying it outright — since the created result set is still owner-scoped to the minting token's principal, a service token could mint a set the minter's other tokens/session could then read. This REST-side gap was originally tracked as #4307 and is closed by #4980's `deny_fleet_wide_service_scoped` call on the route, matching its 8 siblings.
 
 `ResultSet` is not a seeded RBAC securable; every route below is session-authenticated and **owner-scoped** instead (a result set is only readable/mutable by the principal that created it). A service-scoped API token is denied outright on every route (`403`): ownership keys on `session->username`, which for a service token is the **minting operator's** identity, not the token's own service tag — without this deny, any other service token the same operator holds could reach the same owner-scoped result sets.
 
@@ -7737,7 +7794,7 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `rule_id` | string | Yes | Stable operator-chosen id. Must match `[A-Za-z0-9._-]+`. |
+| `rule_id` | string | Yes | Stable operator-chosen id. Must match `[A-Za-z0-9._-]+`, at most 256 bytes. Enforced at creation (#4665) — a violation returns `400`, not just documented convention. |
 | `name` | string | Yes | Human-readable name (unique per server). |
 | `spark` | object | Structured | `{type, params}` trigger block, e.g. `{"type":"registry-change"}` or `{"type":"file-change"}`. |
 | `assertion` | object | Structured | `{type, params}` desired-state block, e.g. `registry-value-equals`, `file-exists`, `file-hash-equals`. |
@@ -7753,8 +7810,8 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 The catalog of valid `spark` / `assertion` / `remediation` types and their `params` (including the resilience-policy bounds) is discoverable at [`GET /api/v1/guaranteed-state/schemas`](#get-apiv1guaranteed-stateschemas).
 
 - **Response:** `201` with `data.rule_id`.
-- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
-- **Audit:** `guaranteed_state.rule.create` (`success` / `denied`).
+- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), a `rule_id` that doesn't match `[A-Za-z0-9._-]+` or exceeds 256 bytes (#4665), or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
+- **Audit:** `guaranteed_state.rule.create` (`success` / `denied`; an invalid `rule_id` is audited as `denied` too — #4665).
 - **MCP twin:** `create_guardian_rule` (#2146 Batch B1) — same store write and validation.
 
 #### `GET /api/v1/guaranteed-state/rules/{rule_id}`

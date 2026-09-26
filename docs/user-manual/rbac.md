@@ -4,7 +4,7 @@ Yuzu implements granular role-based access control with deny-overrides-allow sem
 
 ## Enabling RBAC
 
-RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role) — **except** a small, fixed set of reads that require admin regardless of the toggle; see "The authorization topology floor" below. When enabled, every API call and UI action is checked against the caller's assigned roles.
+RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role) — **except** a small, fixed set of reads that the fallback still refuses to a non-admin; see "The authorization topology floor" below. When enabled, every API call and UI action is checked against the caller's assigned roles.
 
 Toggle RBAC via the Settings page or the server configuration file:
 
@@ -161,9 +161,12 @@ enabled = true
 
 ## The authorization topology floor (#2376)
 
-Five reads are treated as **authorization topology** rather than ordinary
-operational data, and require the `admin` session role no matter how the
-`[rbac] enabled` toggle is set:
+Ten reads are treated as **authorization topology** rather than ordinary
+operational data. Wherever the legacy RBAC-off fallback is the branch in
+effect, they require the `admin` session role — the generic “any Read is
+allowed” rule does not reach them. (With RBAC **enabled** they are ordinary
+permission checks, so a seeded `Reviewer` holding `AccessReview:Read` is
+admitted; the floor never overrides a live RBAC grant.)
 
 | Securable:Operation | Surface |
 |---|---|
@@ -172,14 +175,19 @@ operational data, and require the `admin` session role no matter how the
 | `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools |
 | `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` |
 | `OidcConfig:Read` (#4031) | OIDC SSO configuration status, `GET /api/v1/settings/oidc` |
+| `TlsConfig:Read` (#4028) | TLS settings read-twins, `GET /api/v1/settings/tls` and `GET /api/v1/settings/https` |
+| `PluginSigning:Read` (#4028) | Plugin trust-bundle distribution, `GET /api/v2/agent/plugin-policy` (#4144 — there is deliberately no `/api/v1/settings/plugin-signing` route; the v1 predecessor stayed on `require_admin`) |
+| `ServerConfig:Read` (#4028) | Server runtime-configuration read-twins — `GET /api/v1/settings/server-config`, `/settings/gateway`, `/settings/mcp` and `/settings/data-retention` |
+| `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
+| `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2) |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
-that includes these five. On a default install (RBAC ships disabled) that
+that includes these ten. On a default install (RBAC ships disabled) that
 handed a plain `user` session read access to the authorization topology
 itself: who holds what role, and the complete access-review grant
 population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
-access. The floor closes that gap by denying these five reads to a
+access. The floor closes that gap by denying these ten reads to a
 non-admin whenever the legacy fallback is the branch in effect — never by
 changing behavior under a live RBAC grant.
 
@@ -190,7 +198,7 @@ particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
 + `AccessReview:Attest`) continues to reach the access-review export exactly
 as before — the floor never overrides that grant.
 
-**If you are relying on a non-admin reaching one of these five reads on an
+**If you are relying on a non-admin reaching one of these ten reads on an
 RBAC-disabled install,** that access is now denied. The supported remedy is
 to enable RBAC and grant the appropriate role rather than to expect a
 non-admin session to reach authorization topology while RBAC is off:
@@ -237,6 +245,44 @@ See `docs/auth-architecture.md` → "The authorization topology floor
 `docs/security-reviews/authz-topology-floor-2026-08-05.md` for the recorded
 decision (including what was deliberately excluded from the floor and why).
 
+**The access-review export's `rbac_enforcement` stamp inherits this same
+degrade-vs-outage ambiguity — read this if you're relying on it as
+evidence.** `enabled`/`disabled`/`degraded` (full description:
+`rest-api.md` → the `GET /api/v1/access-reviews/export` section) is derived
+from the identical fail-closed machinery described above under "RBAC store
+integrity (fail-closed / deny-on-degrade)" — a replica whose generation
+refresh has failed reports `degraded`, same as a replica whose RBAC store is
+unreachable. **Correlate against
+`yuzu_server_rbac_read_degrade_total{reason=~"generation_refresh_failed.*"}`**
+(and the narrower `stale_beyond_accepted_bound` reason) if you need to
+distinguish "the store genuinely couldn't confirm state at pull time" from
+"an administrator turned RBAC on/off" — the stamp alone cannot make that
+distinction for you.
+
+**The frozen campaign row is a strictly worse case than the live export.**
+`GET .../export` recomputes `rbac_enforcement` fresh on every pull — a
+transient degrade self-corrects the next time someone re-runs the export.
+`POST /api/v1/access-reviews` (opening a review campaign) computes the
+stamp **once**, at open time, and — per this feature's deliberate no-prune
+retention policy — that campaign row persists **indefinitely**. A
+`degraded` (or, on the cached-enabled short-circuit documented in
+`rest-api.md`, an `enabled`) stamp recorded during a transient partition is
+therefore **permanent evidence with no later self-correction**: re-reading
+the same closed campaign always returns the value frozen at open, never a
+retry. If a campaign was opened during a known RBAC-store incident, treat
+its `rbac_enforcement` value as suspect and open a fresh campaign once the
+store is confirmed healthy, rather than trusting the frozen one.
+
+**This is an evidence-confidence gap, never a security-control failure.**
+A stale or degraded `rbac_enforcement` reading never weakens actual
+authorization — `check_permission`/`check_scoped_permission` independently
+deny on the exact same degraded view (deny-on-degrade, ADR-0041, as
+described throughout this section); nothing about the access-review stamp
+being wrong changes what a real request is allowed to do. The risk is
+purely that an auditor reading the export or a closed campaign draws the
+wrong conclusion about what state RBAC was in — not that access control
+itself misbehaves.
+
 ## Concepts
 
 | Concept | Description |
@@ -250,16 +296,17 @@ decision (including what was deliberately excluded from the floor and why).
 
 ## System Roles
 
-Six roles are created automatically and cannot be deleted:
+Seven roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 5 CRUD operations on all 23 securable types, plus Push on GuaranteedState, Attest on AccessReview, and Rotate on ApiToken (P2 #11, SOC 2 CC6.3 — self-service human token rotation) (118 permissions) | Server admins, security team leads |
+| **Administrator** | All 5 CRUD operations on all 38 securable types, plus Push on GuaranteedState, Attest on AccessReview, and Rotate on ApiToken (P2 #11, SOC 2 CC6.3 — self-service human token rotation) (193 permissions) | Server admins, security team leads |
 | **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
 | **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete, Rotate on ApiToken (4 permissions) | Create, revoke, rotate, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Decommission:Delete (92 permissions). Excludes UserManagement, Security, ApiToken, AccessReview, EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
-| **Viewer** | Read on 21 securable types (all except Infrastructure and AccessReview) (21 permissions) | Helpdesk staff, auditors, read-only dashboards |
+| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Workflow:Read, plus Decommission:Delete (93 permissions). Excludes 20 of the 38 securable types, including UserManagement, Security, ApiToken, AccessReview and EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
+| **Viewer** | Read on 24 securable types (24 permissions) — an explicit allow-list in `rbac_store.cpp`'s seed, *not* “everything except” | Helpdesk staff, auditors, read-only dashboards |
+| **Reviewer** | Read and Attest on AccessReview (2 permissions) | Periodic access reviews (SOC 2 CC6.2) — the non-admin role that can attest or flag a grant |
 
 ## Securable Types
 
@@ -288,6 +335,21 @@ Six roles are created automatically and cannot be deleted:
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
 | `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection). Administrator-only by default (absent from the Viewer read-list); every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
 | `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (five per-agent stores spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`; a companion package adds a sixth, `Forensics`-governed store) in one grant, replacing a hand-maintained per-store conjunction. |
+| `SoftwareLicensing` | Discovered software-licence facts synced from endpoints (ADR-0024) |
+| `AccessReview` | Periodic access-review campaigns and attestations (SOC 2 CC6.2). Seeded to Administrator and `Reviewer` only — deliberately NOT `AuditLog`, see "The authorization topology floor" above |
+| `Workflow` | Multi-step workflow definitions and executions |
+| `ProductPack` | Installed product packs |
+| `PluginConfig` | Per-plugin configuration and kill switches |
+| `PluginSecret` | Per-plugin secret material — never Operator-readable |
+| `UploadGrant` | Upload-grant mint/revoke lifecycle |
+| `PowerManagement` | `power_health.set_power_plan`, the plugin surface's only destructive power action |
+| `Directory` | AD/Entra-synced user and group data |
+| `TlsConfig` | TLS settings. Server-administration: denied to every MCP tier, and admin-floored when RBAC is off |
+| `PluginSigning` | Plugin-signature enforcement settings. Server-administration, same posture as `TlsConfig` |
+| `ServerConfig` | Server runtime configuration. Server-administration, same posture as `TlsConfig` |
+| `AnalyticsConfig` | Analytics/offload configuration. Server-administration, same posture as `TlsConfig` |
+| `Enrollment` | Auto-approve enrollment rules and pending-agent visibility |
+| `OidcConfig` | OIDC SSO configuration |
 
 ## Operations
 
@@ -421,9 +483,15 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/rbac/roles
       "description": "Read-only access to operational data",
       "is_system": true,
       "created_at": 1710849600
+    },
+    {
+      "name": "Reviewer",
+      "description": "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)",
+      "is_system": true,
+      "created_at": 1710849600
     }
   ],
-  "pagination": { "total": 6, "start": 0, "page_size": 50 },
+  "pagination": { "total": 7, "start": 0, "page_size": 50 },
   "meta": { "api_version": "v1" }
 }
 ```
@@ -451,7 +519,7 @@ curl -s -b cookies.txt \
 }
 ```
 
-(Truncated for brevity. The full ITServiceOwner role contains 92 permissions across 18 securable types — the 92nd is the targeted `Decommission:Delete` grant, Wave 7 PR7.2.)
+(Truncated for brevity. The full ITServiceOwner role contains 93 permissions across 18 securable types — the 90 CRUD grants plus three targeted ones: `GuaranteedState:Push`, `Workflow:Read` (#4030) and `Decommission:Delete` (Wave 7 PR7.2).)
 
 ### Custom Roles (Planned)
 

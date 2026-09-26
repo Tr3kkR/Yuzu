@@ -4778,6 +4778,84 @@ TEST_CASE("MCP Guardian: create_guardian_rule denies a service-scoped token "
     CHECK(ts.audit_log.back() == "mcp.create_guardian_rule|denied");
 }
 
+TEST_CASE("MCP Guardian: create_guardian_rule rejects a charset-invalid rule_id (#4665)",
+          "[pg][mcp][integration][guardian][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+
+    int id = 210;
+    for (const std::string& bad_id :
+         {std::string("has space"), std::string("has=eq"), std::string("has\nnewline"),
+          std::string("has\xC3\xA9" "byte")}) {
+        INFO("bad_id = " << bad_id);
+        nlohmann::json req{
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", id++},
+            {"params",
+             {{"name", "create_guardian_rule"},
+              {"arguments", {{"rule_id", bad_id}, {"name", "n"}, {"yaml_source", "x"}}}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("[A-Za-z0-9._-]+") !=
+              std::string::npos);
+        CHECK(ts.audit_log.back() == "guaranteed_state.rule.create|denied");
+    }
+}
+
+TEST_CASE("MCP Guardian: create_guardian_rule rule_id at the 256-byte boundary (#4665)",
+          "[pg][mcp][integration][guardian][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+
+    const std::string id256(256, 'a');
+    nlohmann::json ok_req{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 220},
+        {"params",
+         {{"name", "create_guardian_rule"},
+          {"arguments", {{"rule_id", id256}, {"name", "n256"}, {"yaml_source", "x"}}}}}};
+    auto ok_res = ts.call(ok_req.dump());
+    REQUIRE(ok_res);
+    CHECK(ok_res->status == 200);
+    auto ok_body = nlohmann::json::parse(ok_res->body);
+    REQUIRE(ok_body.contains("result"));
+    auto ok_data =
+        nlohmann::json::parse(ok_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(ok_data["created"] == true);
+    CHECK(ok_data["rule_id"] == id256);
+    CHECK(ts.audit_log.back() == "guaranteed_state.rule.create|success");
+
+    const std::string id257(257, 'a');
+    nlohmann::json bad_req{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 221},
+        {"params",
+         {{"name", "create_guardian_rule"},
+          {"arguments", {{"rule_id", id257}, {"name", "n257"}, {"yaml_source", "x"}}}}}};
+    auto bad_res = ts.call(bad_req.dump());
+    REQUIRE(bad_res);
+    CHECK(bad_res->status == 200);
+    auto bad_body = nlohmann::json::parse(bad_res->body);
+    REQUIRE(bad_body.contains("error"));
+    CHECK(bad_body["error"]["code"] == kInvalidParams);
+    CHECK(ts.audit_log.back() == "guaranteed_state.rule.create|denied");
+}
+
 TEST_CASE("MCP Guardian: get_guardian_rule on an unknown rule_id errors, not a store degrade",
           "[pg][mcp][integration][guardian]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
@@ -8306,6 +8384,71 @@ TEST_CASE("MCP C8: a non-service session still reaches list_agents "
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
     CHECK_FALSE(body.contains("error"));
+}
+
+// #4980: create_result_set_from_inventory_query's kToolSecurity row uses the
+// default 2-element form ({"Inventory", "Write"}, see the row's own comment a
+// few hundred lines above in mcp_server.cpp), which defaults `service_scope`
+// to ServiceScopeClass::denied — the SAME classification list_agents uses
+// above. This test empirically PROVES the C8 structural gate (mcp_server.cpp,
+// "C8: Generic tier + approval checks via kToolSecurity") intercepts a
+// service-scoped caller for THIS tool specifically, before the handler's own
+// fleet_read_fn_ admit-and-confine call ever runs — fleet_read_fn_for_test is
+// wired to fail the test outright if it is invoked, so this is not just an
+// error-code assertion, it is a proof of non-reachability. This closes the
+// verification step of #4980 (filed off an earlier governance review, #4307):
+// on the code as it stands on this branch, MCP was ALREADY safe — the
+// "admitted-and-confined here rather than hard-denied" gap the issue and
+// docs/user-manual/mcp.md described only ever existed on the REST twin (fixed
+// separately in this same change), never on MCP. Keep this test permanently
+// as the regression proof for that finding.
+TEST_CASE("MCP C8: create_result_set_from_inventory_query is denied for a "
+          "service-scoped token before fleet_read_fn_ ever runs (#4980)",
+          "[mcp][integration][security][service_scope][result-sets]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.metrics_for_test = &reg;
+    // A captured bool, not a Catch2 FAIL() inside the lambda: the dispatcher
+    // likely wraps tool bodies in a catch(...) boundary, which would silently
+    // swallow an in-lambda FAIL() and turn a real regression into a quiet
+    // pass. The reached flag is checked on the test thread after the call
+    // returns, matching this file's own established idiom (see e.g.
+    // `last_scoped_agent` a few hundred lines above). McpTestServer::call()
+    // invokes the handler synchronously on the test thread (no cross-thread
+    // hazard here), so the swallowed-assertion risk above is the reason for
+    // this idiom, not a thread-safety one.
+    bool fleet_read_fn_reached = false;
+    ts.fleet_read_fn_for_test = [&fleet_read_fn_reached](
+                                    const httplib::Request&, httplib::Response&,
+                                    const std::string&,
+                                    const std::string&) -> yuzu::server::authz::FleetReadGate {
+        fleet_read_fn_reached = true;
+        return {.admitted = true, .scope = {}};
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":50,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":"linux"}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    // The actual proof of non-reachability: C8 must short-circuit BEFORE the
+    // handler's own fleet_read_fn_ admit-and-confine call ever runs.
+    CHECK_FALSE(fleet_read_fn_reached);
+
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.create_result_set_from_inventory_query|denied")
+            saw_denied = true;
+        CHECK(a != "mcp.create_result_set_from_inventory_query|success");
+    }
+    CHECK(saw_denied);
+
+    CHECK(reg.counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Inventory:Write"}, {"path_class", "mcp"}})
+              .value() == 1.0);
 }
 
 // ── list_pending_approvals / get_pending_approval_count (#2146 A2-R4) ────────
