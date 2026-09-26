@@ -2081,12 +2081,18 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // `auth.users.is_active` is stable between the lock SELECT above and
         // the DELETE below — `auth.users` is deliberately left unlocked by
         // this guard, out of scope per the "never lock auth.users rows here"
-        // note further up. The only scenario this narrowing newly permits is
-        // a principal reactivated inside that same sub-millisecond window
-        // who is also the fleet's sole Administrator grant — but the fleet
-        // was already at zero COUNTED admins at lock time in that scenario,
-        // and A2 has a documented bootstrap-from-zero path, so this is not a
-        // new exposure.)
+        // note further up. The scenario this narrowing newly permits is a
+        // principal reactivated inside that same window who is also the
+        // fleet's sole Administrator grant. UPDATE (Doomgoose external
+        // review, PR #4985, finding #1): this WAS a real, live exposure, not
+        // merely a theoretical one — "the fleet was already at zero COUNTED
+        // admins at lock time" does not make removing a since-reactivated
+        // sole admin's grant safe; A2's bootstrap-from-zero path covers a
+        // fleet that has NEVER had an admin, not one whose real admin just
+        // got reactivated mid-unassign. Closed below by a fresh, targeted
+        // post-DELETE re-check of `auth.users.is_active` for the specific
+        // deleted principal_id — see that comment, further down, for the
+        // fix and its own honestly-documented residual window.)
         std::unordered_set<std::string> locked_admin_principal_ids;
         if (role_name == "Administrator") {
             pg::PgResult lock_rows = pg::exec_params(
