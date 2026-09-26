@@ -1463,9 +1463,9 @@ further recorded limits.
      `run()`'s teardown, ends in `hard_exit(4)` rather than an indefinite hang). Since #4704 the
      two mechanisms share one shape for their pass-outcome lines (`pass failed`, `failing
      persistently`, `pass recovered`): each is written OFF `mu_`, after the pass's bookkeeping
-     has released the lock. File: `log_pass_outcome()` (`spark_file.cpp:2924-2939`), called
-     after `lk.unlock()` at `:3299-3300` and `:3354-3355`. Registry: its own `PassOutcome` /
-     `log_pass_outcome()` (`spark_registry.cpp:1883-1898`), called after the `lk.unlock()` on
+     has released the lock. File: `log_pass_outcome()` (`spark_file.cpp:2928-2943`), called
+     after `lk.unlock()` at `:3303-3304` and `:3358-3359`. Registry: its own `PassOutcome` /
+     `log_pass_outcome()` (`spark_registry.cpp:1888-1903`), called after the `lk.unlock()` on
      each of `sweeper_main()`'s two branches (recovery, and failure with the inert transition).
      Before #4704 those three Registry lines ran while `mu_` was held, so a stalled sink there
      also stalled every other `mu_` caller (`arm()`, `disarm()`, `apply_test_controls()`), a
@@ -1473,9 +1473,14 @@ further recorded limits.
      primitive (ruled 2026-09-24). What a stalled sink still stalls, on either mechanism, is
      that worker's own loop (File: IOCP draining; Registry: the next sweeper pass and any
      re-arm or establishment report it owes) and the worker join in `stop()`;
-     `arm()`/`disarm()`/`stats()` keep working. Registry's per-key `warn` lines
-     (`fail_backend_locked()`, `resolve_probe_locked()`, `park_lost_locked()`) are still
-     written under `mu_`; they were outside #4704's ruled scope and are tracked as #4999.
+     `arm()`/`disarm()`/`stats()` keep working for a stall on one of the three pass-outcome
+     lines above. Registry's per-key `warn` lines (`fail_backend_locked()`,
+     `resolve_probe_locked()`, `park_lost_locked()`) are still written under `mu_`; they were
+     outside #4704's ruled scope and are tracked as #4999. File has its own analogous per-key
+     sites still under its own lock (e.g. `defer_backend_retry_locked()`/`fail_backend_locked()`
+     reached from `watch_incarnation()`); #4999 does not yet cover them, and they need either a
+     widened scope on that issue or a sibling issue before this residual can be called closed on
+     either mechanism.
 5. The `pass_failed`, `pass_failures_consecutive` and `pass_backoff_ms` counters are readable only
    through the test seam (`file_debug_counters_for_test`, Windows only). The operator-visible
    signals are the log lines `spark_file: worker pass failed (consecutive #N) - retrying in M ms`,

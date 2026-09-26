@@ -1876,13 +1876,14 @@ private:
     };
 
     /// Off-lock, static (touches no member), noexcept with an internal catch:
-    /// spdlog already catches a single formatting/allocation failure
-    /// internally (its own SPDLOG_TRY/CATCH) and routes it to a rate-limited
-    /// error handler without rethrowing, so only a second, double allocation
-    /// failure inside that handler's own formatting can reach the catch(...)
-    /// below - which would otherwise terminate the sole producer of health
-    /// edges via std::thread. Content, level and the 1/2/4/8 gate are exactly
-    /// what sweeper_main() wrote under mu_ before #4704; a default-constructed
+    /// an ordinary formatting/allocation failure is already handled inside
+    /// spdlog's own logging pipeline and does not reach here (verified against
+    /// spdlog's SPDLOG_TRY/CATCH machinery, #4704 review). This catch(...) is
+    /// a last-resort backstop for a genuinely exceptional failure surviving
+    /// that pipeline, so the sole producer of health edges cannot be brought
+    /// down by a diagnostic log call - sweeper_main() has no outer catch of
+    /// its own. Content, level and the 1/2/4/8 gate are exactly what
+    /// sweeper_main() wrote under mu_ before #4704; a default-constructed
     /// outcome (a clean pass) logs nothing.
     static void log_pass_outcome(const PassOutcome& o) noexcept {
         try {

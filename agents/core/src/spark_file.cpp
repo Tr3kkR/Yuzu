@@ -2917,13 +2917,13 @@ private:
         return out;
     }
 
-    /// Off-lock, noexcept with an internal catch: spdlog already catches a
-    /// single formatting/allocation failure internally (its own SPDLOG_TRY/
-    /// CATCH) and routes it to a rate-limited error handler without
-    /// rethrowing, so only a second, double allocation failure inside that
-    /// handler's own formatting can reach the catch(...) below - which would
-    /// otherwise be worker death, the very thing the pass catch exists to
-    /// prevent (run() has NO outer catch of its own). Same wrapping rule as
+    /// Off-lock, noexcept with an internal catch: an ordinary formatting/
+    /// allocation failure is already handled inside spdlog's own logging
+    /// pipeline and does not reach here (verified against spdlog's
+    /// SPDLOG_TRY/CATCH machinery, #4704 review). This catch(...) is a
+    /// last-resort backstop for a genuinely exceptional failure surviving
+    /// that pipeline, so the worker cannot be brought down by a diagnostic
+    /// log call - run() has NO outer catch of its own. Same wrapping rule as
     /// every other diagnostic in a recovery path in this file.
     static void log_pass_outcome(const PassOutcome& o) noexcept {
         try {
