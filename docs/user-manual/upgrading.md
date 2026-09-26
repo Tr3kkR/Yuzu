@@ -244,7 +244,28 @@ What you may observe after upgrading:
   points at `/readyz`, move it to `/livez` before upgrading — otherwise a database blip restarts every
   server.
 - **One more Postgres connection per server** (the probe). Budget `N_servers × 2` connections beyond the
-  pool against `max_connections` (the other extra one is the leader-election connection).
+  pool against `max_connections` (the other extra one is the leader-election connection) — the full
+  formula is in `server-admin.md`, "Sizing `max_connections`".
+- **The shipped `yuzu-postgres` images now reserve connection slots for the app role** (#4943):
+  `reserved_connections = 40` (env `YUZU_PG_RESERVED_CONNECTIONS`) and `GRANT pg_use_reserved_connections`
+  to the app role, applied at **first boot only** (PostgreSQL 16 or newer). Three cases:
+  - **A fresh install or reinstall** (a new, empty data volume) picks up the new default **silently, with no
+    action needed** — but it also reduces headroom for third-party tooling (a backup job, a monitoring agent)
+    sized against `max_connections` alone with no margin by up to 40 connections versus a deployment built
+    before this release.
+  - **An in-place upgrade of an existing database does NOT pick this up** — the new default only applies at
+    first boot, and an existing data volume already had its first boot. Without action, a backup job or
+    ad-hoc session can still take the slot the `/readyz` probe needs to reconnect, same as before this release.
+  - **To apply it to that existing database**, run the `ALTER SYSTEM` (restart) and the `GRANT` by hand as
+    "Sizing `max_connections`" above shows.
+
+  **A new boot-time failure mode on the Postgres container itself**, not just the server binary: both
+  `yuzu-postgres` images now refuse to start if `YUZU_PG_RESERVED_CONNECTIONS` is set at or past
+  `max_connections − superuser_reserved_connections` — that value would leave zero connection slots any
+  other client could ever use. Only reachable by explicitly setting the env var too high; the shipped
+  default (40) never triggers it. On the single-node image this refusal happens after the role/database/grant
+  already exist, so restarting the same container with a corrected value does not retroactively apply
+  anything — see the note in "Sizing `max_connections`" above.
 - **A new alert, `YuzuServerPostgresUnreachable`**, and three `yuzu_server_pg_reachab*` metrics — see
   `docs/user-manual/metrics.md`.
 - **New flag `--shutdown-drain-seconds`** (`YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, max 60). On
@@ -262,8 +283,9 @@ What you may observe after upgrading:
   readiness, but under Docker Swarm or an auto-heal sidecar an outage longer than the healthcheck's
   retry window marks the container unhealthy and restarts it. Point restart-driving checks at `/livez`.
 
-**What to do:** point liveness probes at `/livez`, readiness at `/readyz`; check your Postgres
-`max_connections` headroom; set `--shutdown-drain-seconds` if a load balancer fronts the server.
+**What to do:** point liveness probes at `/livez`, readiness at `/readyz`; size `max_connections` by the
+formula and apply the reserved-slot grant on an existing database; set `--shutdown-drain-seconds` and the
+recommended health-check thresholds if a load balancer fronts the server.
 
 ## Behaviour change: legacy `/api/executions*` routes are now management-group confined (#3789)
 
