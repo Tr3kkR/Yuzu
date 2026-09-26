@@ -561,6 +561,83 @@ TEST_CASE("REST assign: an empty JSON body ({}) is rejected 400, missing "
     CHECK(res->status == 400);
 }
 
+// ── REST: wrong-typed body fields (Doomgoose external review, PR #4985
+// IMPORTANT finding #4) — body.value(key, default) THREW nlohmann's
+// type_error.302/.306 on a present-but-wrong-typed field or a non-object
+// top-level body, producing an uncaught exception instead of the documented
+// 400 and skipping this route's denial audit entirely. Fixed via the
+// established, non-throwing access_review_str_field extractor
+// (#4623/#2146 A2-R1) plus an explicit body.is_object() guard. ─────────────
+
+TEST_CASE("REST assign: a non-object top-level body (array/scalar) is "
+          "rejected 400, never an uncaught exception (PR #4985 finding #4)",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    for (const std::string bad_body : {"[1,2,3]", "42", "\"just a string\"", "true"}) {
+        auto res = h.assign_rest("Operator", bad_body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+}
+
+TEST_CASE("REST assign: a wrong-typed principal_type (number/bool/object/"
+          "array) is rejected 400 with an audited denial, never an uncaught "
+          "exception (PR #4985 finding #4)",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    for (nlohmann::json bad_type : {nlohmann::json(123), nlohmann::json(true),
+                                    nlohmann::json::object(), nlohmann::json::array()}) {
+        h.audit_log.clear();
+        nlohmann::json body = {{"principal_type", bad_type}, {"principal_id", "jane"}};
+        auto res = h.assign_rest("Operator", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        // access_review_str_field degrades the wrong-typed value to "" (the
+        // default), which then fails the EXISTING, already-audited
+        // `principal_type != "user"` check — never a client crash, never a
+        // silently-skipped audit.
+        bool found = false;
+        for (const auto& a : h.audit_log) {
+            if (a.action == "rbac.role.assigned" && a.result == "denied")
+                found = true;
+        }
+        CHECK(found);
+    }
+    CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+}
+
+TEST_CASE("REST assign: a wrong-typed principal_id (number/bool/object/"
+          "array) is rejected 400, never an uncaught exception (PR #4985 "
+          "finding #4)",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    // access_review_str_field degrades the wrong-typed value to "" (the
+    // default), which then fails the EXISTING `principal_id.empty()` check
+    // — the SAME 400 a genuinely-missing principal_id gets (see "a JSON
+    // body missing principal_id is rejected 400" above), which is
+    // deliberately unaudited on THIS codebase's own established convention:
+    // `audit_target_id` (the CWE-117-neutralized copy audit calls embed) is
+    // computed AFTER this check, precisely so a hostile/oversized principal_id
+    // is never embedded raw before it has been neutralized. This test's
+    // point is "no uncaught exception, no 500" — not that this specific
+    // branch newly becomes audited.
+    for (nlohmann::json bad_id : {nlohmann::json(123), nlohmann::json(false),
+                                  nlohmann::json::object(), nlohmann::json::array()}) {
+        nlohmann::json body = {{"principal_type", "user"}, {"principal_id", bad_id}};
+        auto res = h.assign_rest("Operator", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+}
+
 TEST_CASE("REST assign: unknown role rejected 400 with the SAME message as "
           "ITServiceOwner (M1 uniform reject)",
           "[pg][rest][rbac][a2]") {

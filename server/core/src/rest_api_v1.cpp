@@ -5633,8 +5633,30 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
-            auto principal_type = body.value("principal_type", "");
-            auto principal_id = body.value("principal_id", "");
+            // Doomgoose external review, PR #4985 IMPORTANT finding #4: a
+            // non-object top-level body (e.g. a JSON array/scalar) reaches
+            // nlohmann::json::value() below and THROWS type_error.306
+            // ("cannot use value() with <type>") — verified empirically, an
+            // uncaught exception rather than the documented 400. Reject it
+            // here with an honest message before either field is touched.
+            if (!body.is_object()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                                "application/json");
+                return;
+            }
+            // Doomgoose external review, PR #4985 IMPORTANT finding #4:
+            // body.value(key, default) THROWS nlohmann's type_error.302 when
+            // the key is present but not string-convertible (e.g.
+            // {"principal_id": 123}) — verified empirically, an uncaught
+            // exception rather than the documented 400.
+            // access_review_str_field (above) is the established,
+            // non-throwing extractor for this exact defect class
+            // (#4623/#2146 A2-R1) — EXTEND it, never fork a second copy;
+            // matches MCP's own param_str, which already degrades a
+            // wrong-typed value to the default rather than throwing.
+            auto principal_type = access_review_str_field(body, "principal_type");
+            auto principal_id = access_review_str_field(body, "principal_id");
             if (principal_id.empty()) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "principal_id is required"),
