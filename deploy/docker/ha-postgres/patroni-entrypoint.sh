@@ -39,15 +39,22 @@ if ! [[ "${YUZU_PG_RESERVED_CONNECTIONS}" =~ ^[0-9]{1,6}$ ]]; then
     echo "patroni-entrypoint: YUZU_PG_RESERVED_CONNECTIONS must be a non-negative integer (got '${YUZU_PG_RESERVED_CONNECTIONS}')" >&2
     exit 1
 fi
-# Bound against this file's own max_connections=200 below and Postgres's
-# superuser_reserved_connections default of 3 (not overridden here) — a value
-# at or past 197 leaves ZERO slots any ordinary (non-privileged) client can
-# ever use, not merely under load (security-guardian, Gate 2 finding #1).
-# Kept as a literal alongside max_connections rather than queried, since no
-# server is running yet at render time; the two numbers are read from the
-# SAME place a future change to either would need to touch.
-if (( YUZU_PG_RESERVED_CONNECTIONS >= 200 - 3 )); then
-    echo "patroni-entrypoint: YUZU_PG_RESERVED_CONNECTIONS=${YUZU_PG_RESERVED_CONNECTIONS} is >= max_connections(200) - superuser_reserved_connections(3) = 197" >&2
+# The bootstrap max_connections this cluster renders with, and Postgres's
+# superuser_reserved_connections default (not overridden below) — ONE shell
+# variable each, substituted into the YAML template further down AND used in
+# the bound check here, so the two can never drift apart (Gate 8 re-review,
+# #4943: two independent literals 86 lines apart was the exact drift the
+# clock-guarded-retention/dispatch-confined-arms rows warn about elsewhere —
+# a future edit to one without the other would silently reopen the gap).
+readonly PATRONI_MAX_CONNECTIONS=200
+readonly PATRONI_SUPERUSER_RESERVED_CONNECTIONS=3
+# A value at or past (max_connections - superuser_reserved_connections) leaves
+# ZERO slots any ordinary (non-privileged) client can ever use, not merely
+# under load (security-guardian, Gate 2 finding #1). No server is running yet
+# at render time, so this is a static check against the two constants above,
+# not a live query (contrast the single-node script's SHOW-based check).
+if (( YUZU_PG_RESERVED_CONNECTIONS >= PATRONI_MAX_CONNECTIONS - PATRONI_SUPERUSER_RESERVED_CONNECTIONS )); then
+    echo "patroni-entrypoint: YUZU_PG_RESERVED_CONNECTIONS=${YUZU_PG_RESERVED_CONNECTIONS} is >= max_connections(${PATRONI_MAX_CONNECTIONS}) - superuser_reserved_connections(${PATRONI_SUPERUSER_RESERVED_CONNECTIONS}) = $(( PATRONI_MAX_CONNECTIONS - PATRONI_SUPERUSER_RESERVED_CONNECTIONS ))" >&2
     exit 1
 fi
 YUZU_PG_DURABILITY="${YUZU_PG_DURABILITY:-quorum3}"
@@ -132,7 +139,7 @@ bootstrap:
       use_pg_rewind: true
       parameters:
         # Keep aligned with the single-node substrate's operational envelope.
-        max_connections: 200
+        max_connections: ${PATRONI_MAX_CONNECTIONS}
         # Slots only pg_use_reserved_connections members (the app role, granted
         # by post_init) may take once the free count drops this low — so a
         # foreign client can never hold the slot a server's /readyz probe needs
