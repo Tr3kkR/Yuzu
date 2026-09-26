@@ -4078,7 +4078,28 @@ TEST_CASE("#4685 AC2 (File, real mechanism): an already-armed rule undergoing a 
 
     // Open the runtime-degraded episode and wait for the mechanism to genuinely report
     // it (three consecutive failed passes, #4658) BEFORE the mid-episode full sync.
+    // A real, established, Idle File watch has NOTHING due - wait_timeout_locked()'s
+    // default is a 1h ceiling, and nothing else re-invokes run_pass_hook_locked() on
+    // its own once the initial arm's own control-wake pass already happened (before
+    // `failing` flipped true, so it didn't throw). Force exactly ONE more pass via
+    // apply_test_controls()'s own existing "nudge" (it unconditionally posts a control
+    // wake - see its own comment at the end of apply_test_controls()); that single
+    // hook throw alone starts note_pass_outcome_locked's backoff episode, which is then
+    // self-sustaining (every failed pass reschedules its own retry via
+    // wait_timeout_locked's pass-failure-backoff clause) all the way to the 3rd
+    // consecutive failure with no further nudging needed.
     failing.store(true, std::memory_order_release);
+    {
+        FileMechanismTestControls nudge;
+        nudge.sweep_cadence = std::chrono::milliseconds(50);
+        nudge.pass_fail_hook = [&] {
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1, std::memory_order_relaxed);
+                throw std::bad_alloc{};
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(nudge)));
+    }
     REQUIRE(yuzu::test::spin_until([&] { return mech->stats().inert; }, std::chrono::seconds(10)));
     CHECK_FALSE(mech->stats().boot_inert); // runtime, never boot-time
 
@@ -4172,8 +4193,39 @@ TEST_CASE("#4685 AC3 (Registry, real mechanism): an already-armed rule undergoin
     auto raw_sub = spark_engine.arm(*raw, spec);
     REQUIRE(raw_sub.has_value());
 
+    // Unlike File's wait_timeout_locked (which has an explicit "an open failure
+    // episode always has a retry scheduled" clause, #4658), spark_registry.cpp's
+    // next_wake_locked() has NO failure-backoff clause at all: sweeper_main()'s own
+    // post-failure cv_.wait_until(delay) (the "retrying in N ms" log line) elapses,
+    // but the very next loop iteration recomputes next_wake_locked() from scratch,
+    // which for an Idle/armed/no-resync-debt watch returns its ~1h default ceiling -
+    // so a single nudge opens the episode (confirmed: exactly one "consecutive #1"
+    // log line, then nothing for the rest of a 10s window) but does not keep it
+    // self-sustaining. Real production traffic (another Pending probe, a resync,
+    // etc.) would normally supply that wake; this test's single Idle watch has none,
+    // so it supplies its own repeated nudge instead - same primitive as the File
+    // twin above, just applied throughout the wait rather than once.
+    auto nudge_registry = [&] {
+        RegistryMechanismTestControls c;
+        c.sweep_cadence = std::chrono::milliseconds(5);
+        c.sweep_hook = [&] {
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1, std::memory_order_relaxed);
+                throw std::bad_alloc{};
+            }
+        };
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(c)));
+    };
+
     failing.store(true, std::memory_order_release);
-    REQUIRE(yuzu::test::spin_until([&] { return mech->stats().inert; }, std::chrono::seconds(10)));
+    bool became_degraded = false;
+    for (int i = 0; i < 2000 && !became_degraded; ++i) {
+        nudge_registry();
+        became_degraded = mech->stats().inert;
+        if (!became_degraded)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(became_degraded);
     CHECK_FALSE(mech->stats().boot_inert);
 
     gpb::GuaranteedStatePush p2;
@@ -4196,14 +4248,31 @@ TEST_CASE("#4685 AC3 (Registry, real mechanism): an already-armed rule undergoin
     REQUIRE(mid_est.has_value());
     CHECK(mid_est->coverage == yuzu::agent::SparkCoverage::None);
 
+    // Recovery: same gap as above - a successful pass needs the sweeper to actually
+    // run one, which next_wake_locked() alone will not schedule promptly for this
+    // test's single Idle watch. Keep supplying the nudge (now non-throwing, since
+    // `failing` is false) until the mechanism and the coverage overlay both observe
+    // the recovery - no second push, no restart, matching AC3's own acceptance
+    // criterion, just not a bare wall-clock wait.
     failing.store(false, std::memory_order_release);
-    REQUIRE(yuzu::test::spin_until([&] { return !mech->stats().inert; }, std::chrono::seconds(15)));
-    REQUIRE(yuzu::test::spin_until(
-        [&] {
-            const auto est = spark_engine.subscription_establishment(*raw_sub);
-            return est.has_value() && est->coverage != yuzu::agent::SparkCoverage::None;
-        },
-        std::chrono::seconds(15)));
+    bool recovered = false;
+    for (int i = 0; i < 3000 && !recovered; ++i) {
+        nudge_registry();
+        recovered = !mech->stats().inert;
+        if (!recovered)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(recovered);
+
+    bool coverage_restored = false;
+    for (int i = 0; i < 3000 && !coverage_restored; ++i) {
+        nudge_registry();
+        const auto est = spark_engine.subscription_establishment(*raw_sub);
+        coverage_restored = est.has_value() && est->coverage != yuzu::agent::SparkCoverage::None;
+        if (!coverage_restored)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(coverage_restored);
 
     engine.stop();
     spark_engine.stop();
