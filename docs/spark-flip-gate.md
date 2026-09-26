@@ -1808,10 +1808,16 @@ Spark runtime's own arm-committed/late-arm/sweep-residue lines and the `T_wire` 
 the legacy guard worker, now enqueues onto the bounded async queue and returns rather
 than blocking on sink I/O, on Linux confirmed and Windows inferred (single spdlog
 registry per process, measured directly on Linux via `tests/unit/test_log_handoff_multi_image.cpp`
-and `tests/shell/test_spdlog_registry_identity.sh`; Windows was not measured by either
-fixture — the shell probe explicitly SKIPs there — and is inferred from dynamic spdlog
-linkage rather than observed). See `docs/darwin-compat.md`'s "spdlog registry identity
-across images" row for the macOS result, now measured: TWO separate registries there, with
+and `tests/shell/test_spdlog_registry_identity.sh`). The two fixtures differ on Windows,
+not agree: the shell probe has an explicit Windows leg that SKIPs outright, but the C++
+fixture carries no platform gate and does run there — CI's `windows` job exercises the
+same `--suite agent` binary — so its MI-1b topology verdict is written (Catch2 `WARN` +
+a report file) on every Windows run; that output has simply not yet been pulled from a
+CI log and reviewed to turn it into a confirmed finding, which is different from "no
+Windows evidence exists." Absent that review, Windows single-registry status is still
+only inferred from dynamic spdlog linkage, not confirmed. See `docs/darwin-compat.md`'s
+"spdlog registry identity across images" row for the macOS result, now measured: TWO
+separate registries there, with
 the exe-image swap load-bearing on the teardown side only (install-side logging already
 reaches the async hand-off correctly regardless, since `LogHandoff::install()` is compiled
 into the core library). This is the mechanism the precondition asked for: it comes from installing

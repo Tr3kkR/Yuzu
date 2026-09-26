@@ -1,10 +1,14 @@
 // test_log_handoff_multi_image.cpp - #4666 PR-2 W3a: the macOS multi-image open
-// question. log_handoff.hpp's own MULTI-IMAGE note records that Linux and Windows are
-// ALREADY CONFIRMED to share one spdlog registry across the exe, libyuzu_agent_core, and
-// every plugin image - macOS is the one platform that note calls "LIKELY two registries
-// ... unproved, characterised by PR-2's own fixture." This file IS that fixture: it runs
-// the identical measurement on every platform the suite executes on, so the macOS run is
-// a genuine empirical observation rather than an inference from the other two legs.
+// question. log_handoff.hpp's own MULTI-IMAGE note records Linux as CONFIRMED (by
+// symbol inspection) to share one spdlog registry across the exe, libyuzu_agent_core,
+// and every plugin image; Windows is INFERRED to do the same from its dynamic spdlog
+// linkage, not directly measured; macOS was the open question at the time this file was
+// written. This file IS the fixture that closed it: it runs the identical measurement
+// on every platform the suite executes on (this binary carries no platform gate, so it
+// also runs on Windows CI, though its Windows output has not itself been reviewed to
+// turn it into a confirmed finding the way the Linux/macOS runs were), and the macOS run
+// is a genuine empirical observation (see docs/darwin-compat.md's "spdlog registry
+// identity across images" row: TWO separate registries there), not an inference.
 //
 // MI-1: correctness of install_log_handoff_in_this_image()/
 // release_log_handoff_from_this_image() across this test binary's own image, PLUS a FIRST
