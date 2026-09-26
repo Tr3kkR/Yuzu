@@ -255,7 +255,11 @@ What you may observe after upgrading:
   `yuzu-postgres` images now refuse to start if `YUZU_PG_RESERVED_CONNECTIONS` is set at or past
   `max_connections − superuser_reserved_connections` — that value would leave zero connection slots any
   other client could ever use. Only reachable by explicitly setting the env var too high; the shipped
-  default (40) never triggers it.
+  default (40) never triggers it. **A fresh install or reinstall (a new, empty data volume) picks up the new
+  default silently** — not just an in-place upgrade of an existing database, which the point above already covers.
+  If you size third-party tooling (a backup job, a monitoring agent) against `max_connections` alone with no
+  margin, this reduces their available headroom by up to 40 connections versus a deployment built before this
+  release.
 - **A new alert, `YuzuServerPostgresUnreachable`**, and three `yuzu_server_pg_reachab*` metrics — see
   `docs/user-manual/metrics.md`.
 - **New flag `--shutdown-drain-seconds`** (`YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, max 60). On

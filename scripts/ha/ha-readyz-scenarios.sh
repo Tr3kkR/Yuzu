@@ -46,7 +46,7 @@
 #   K. the same setting from a pg_service.conf entry (service=): the DSN-only
 #                       guard cannot see it, so the server checks what libpq resolved
 #                       on its first connection and refuses to boot (Gate 8 round 7).
-#   L. CPU-starved primary (#4944)  `docker update --cpus 0.05` on the database
+#   L. CPU-starved primary (#4944)  `docker update --cpus 0.01` on the database
 #      under a pgbench select load: the probe query misses its 2 s deadline, so
 #      /readyz goes red (sustained overload IS an outage from the operator's
 #      seat — the same database cannot answer real requests either); restoring
@@ -92,7 +92,7 @@ PG_IMAGE="${YUZU_HA_READYZ_PG_IMAGE:-postgres:18.4-bookworm@sha256:efef99e1558f8
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server-bin) SERVER_BIN="$2"; shift 2 ;;
-        -h|--help)    sed -n '2,70p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,64p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
