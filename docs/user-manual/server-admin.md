@@ -2461,6 +2461,14 @@ A nonzero result means that host's `installed_count` will report a higher number
 
 **Before upgrading, check whether this affects you.** If your `delete` automation for Windows hosts does not already treat a non-zero exit / an `error|...` result as a hard failure requiring investigation, add that check now. There is no way to pre-check for the specific `LOCAL_MACHINE`-unopenable-with-a-`CURRENT_USER`-fallback condition from outside the action itself; the fix is unconditional and has no opt-out.
 
+### vNEXT — service-scoped tokens can no longer create a result set from an inventory query (#4980) (breaking)
+
+**What changed.** `POST /api/v1/result-sets/from-inventory-query` now denies a service-scoped API token outright (`403`), matching its 8 non-dispatch sibling result-set routes. Before this fix, the route gated only through the `Inventory:Read` fleet-read chokepoint (`fleet_read_fn`), which admits and confines a service-scoped caller rather than denying it — but the result set this route creates is owner-scoped to the minting principal's identity, not the token's own service tag, so a service-scoped token holding `Inventory:Read` could mint a set that its minting principal's other tokens/session could then read back.
+
+**Who this affects.** Any integration using a service-scoped API token to call this specific route. No legitimate use of a service-scoped token should have depended on this — the other 8 result-set routes have always denied this way, and the MCP twin (`create_result_set_from_inventory_query`) was never affected. There is no opt-out.
+
+**What to do.** Nothing for a correctly-built integration. If a service-scoped workflow did depend on this route, it needs a non-service-scoped credential going forward, same as the flip notes above; there is no per-route or per-deployment allow.
+
 ---
 
 ## Settings Page
