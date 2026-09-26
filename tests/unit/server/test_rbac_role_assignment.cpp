@@ -57,6 +57,7 @@
 #include "mcp_jsonrpc.hpp" // mcp::kApprovalRequired — the ticket-then-recall dance
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp" // input_schemas_for_test — SHOULD #3's schema<->header sync test
+#include "rbac_admin_predicate.hpp" // kRbacAdminGateUnavailableAuditReason
 #include "rbac_assignable_roles.hpp"
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
@@ -954,6 +955,85 @@ TEST_CASE("REST unassign C1(c): removing the fleet's real Administrator is "
     CHECK(res->status == 409);
     CHECK(h.rbac->get_principal_roles("user", "deletedadmin").size() == 1);
     CHECK(h.rbac->get_principal_roles("user", "realadmin").size() == 1);
+}
+
+// ── REST/MCP: the admin gate's own kUnavailable outcome (Doomgoose external
+// review, PR #4985 IMPORTANT finding #2) — a genuinely degraded-but-open
+// RBAC store reaching is_rbac_administrator's RBAC-on branch (as opposed to
+// a null/closed store, already covered elsewhere) must log AND audit the
+// denial. Closes a2-p7-doomgoose-11's own gap ("is_rbac_administrator's
+// kUnavailable outcome was exercised only via null-pointer inputs"). ───────
+
+TEST_CASE("REST assign: the admin gate's own kUnavailable outcome (RBAC-on, "
+          "genuinely degraded store) is 503 with an audited denial (PR "
+          "#4985 finding #2)",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    // RBAC-on: the gate re-reads principal_roles for durable Administrator
+    // authority, unlike the RBAC-off branch (a durable AuthDB re-read),
+    // which the DROP below would not affect.
+    h.make_caller_admin(/*rbac_on=*/true);
+
+    // DROP TABLE on a second connection — rbac_enforcement_label() reads
+    // ONLY rbac_meta (untouched), so enforcement still reads as ON; but
+    // get_principal_roles_checked's own query against principal_roles now
+    // fails, which the gate maps to kUnavailable rather than kDenied.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.assign_rest("Operator",
+                             R"({"principal_type":"user","principal_id":"jane"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    bool found = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action == "rbac.role.assigned" && a.result == "denied" &&
+            a.detail == std::string(yuzu::server::kRbacAdminGateUnavailableAuditReason))
+            found = true;
+    }
+    CHECK(found);
+}
+
+TEST_CASE("MCP assign_rbac_role: the admin gate's own kUnavailable outcome "
+          "(RBAC-on, genuinely degraded store) is kInternalError with an "
+          "audited denial (PR #4985 finding #2)",
+          "[pg][mcp][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    // Full ticket-then-recall, matching every other admin-gate test in this
+    // file: the mint/approve dance itself has no notion of admin status —
+    // only the RECALL reaches is_rbac_administrator (see "MCP
+    // assign_rbac_role: a non-admin caller is denied" above for the same
+    // reasoning).
+    auto res = h.mcp_call_tool_approved(
+        "assign_rbac_role",
+        {{"principal_type", "user"}, {"principal_id", "jane"}, {"role", "Operator"}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    bool found = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action == "rbac.role.assigned" && a.result == "denied" &&
+            a.detail == std::string(yuzu::server::kRbacAdminGateUnavailableAuditReason))
+            found = true;
+    }
+    CHECK(found);
 }
 
 // ── REST: assign_role store-fault classification (Doomgoose external
