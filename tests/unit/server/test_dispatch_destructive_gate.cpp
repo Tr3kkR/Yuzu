@@ -54,6 +54,7 @@
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -578,7 +579,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 20> sources{{
+    const std::array<std::span<const CommandCapability>, 21> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
@@ -598,6 +599,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
+        capdecls::plugin_action_catalogue_pkg_inventory(),
         capdecls::core_dispatch_capabilities(),
     }};
 
@@ -634,7 +636,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
     CHECK(destructive_execution_securable_count == 4);
 
     // Composability spot check — mirrors test_capability_catalogue.cpp's own
-    // `build_registry`: the same twenty spans compose into a real registry
+    // `build_registry`: the same twenty-one spans compose into a real registry
     // exactly as the production composition site does, and a known
     // Destructive row still resolves through it.
     CommandCapabilityRegistry registry{
@@ -657,6 +659,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
+        capdecls::plugin_action_catalogue_pkg_inventory(),
         capdecls::core_dispatch_capabilities(),
     };
     auto classified = registry.classify("tar", "purge_source");
