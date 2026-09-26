@@ -141,6 +141,7 @@ The Linux capture is taken from a real Debian container that was seeded, for the
 - Plugin: `agents/plugins/browser_policy/src/browser_policy_legs.hpp` · `agents/plugins/browser_policy/src/browser_policy_linux.cpp` · `agents/plugins/browser_policy/src/browser_policy_linux_parsers.hpp` · `agents/plugins/browser_policy/src/browser_policy_macos.cpp` · `agents/plugins/browser_policy/src/browser_policy_parsers.hpp` · `agents/plugins/browser_policy/src/browser_policy_plugin.cpp` · `agents/plugins/browser_policy/src/browser_policy_win.cpp`
 - Definitions: `content/definitions/browser_policy.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_browser_policy.hpp`
-- Tests: `tests/unit/test_browser_policy_local_dispatcher.cpp` · `tests/unit/test_browser_policy_parsers.cpp`
+- Tests: `tests/test_browser_policy_definition.py` · `tests/unit/test_browser_policy_local_dispatcher.cpp` · `tests/unit/test_browser_policy_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/wave10-pr10.2b-browser_policy.added.md`
 <!-- END GENERATED -->

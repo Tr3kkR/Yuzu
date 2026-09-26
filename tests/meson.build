@@ -2358,6 +2358,17 @@ test('runtimes definition columns',
   timeout: 30,
 )
 
+# browser_policy's definition-column contract (content/definitions/browser_policy.yaml):
+# row_kind first and the column order match the wire row browser_policy_parsers.hpp emits;
+# parses the YAML directly -- catches a reordered or renamed column the C++ test's
+# hard-coded literal cannot.
+test('browser_policy definition columns',
+  _python3_test,
+  args: [files('test_browser_policy_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Plugin README standard (docs/plugin-readme-standard.md): unit tests of the
 # generator's pure functions, then the tree gate — README-existence ratchet,
 # section contract, generated fences/index/nav/manifests byte-match the
