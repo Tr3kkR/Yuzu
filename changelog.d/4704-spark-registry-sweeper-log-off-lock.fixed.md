@@ -1,0 +1,1 @@
+- Spark Registry sweeper (Windows): the `sweeper pass failed` / `failing persistently` / `pass recovered` log lines are now written after the mechanism's internal lock is released, matching the File worker, so a blocked or slow log sink no longer stalls adding or removing registry rules on that agent (#4704).
