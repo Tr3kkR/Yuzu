@@ -248,18 +248,24 @@ What you may observe after upgrading:
   formula is in `server-admin.md`, "Sizing `max_connections`".
 - **The shipped `yuzu-postgres` images now reserve connection slots for the app role** (#4943):
   `reserved_connections = 40` (env `YUZU_PG_RESERVED_CONNECTIONS`) and `GRANT pg_use_reserved_connections`
-  to the app role, applied at **first boot only**. An existing database does not pick this up on upgrade —
-  apply the `ALTER SYSTEM` (restart) and the `GRANT` by hand as that section shows, or a backup job or ad-hoc
-  session can still take the slot the `/readyz` probe needs to reconnect. PostgreSQL 16 or newer.
+  to the app role, applied at **first boot only** (PostgreSQL 16 or newer). Three cases:
+  - **A fresh install or reinstall** (a new, empty data volume) picks up the new default **silently, with no
+    action needed** — but it also reduces headroom for third-party tooling (a backup job, a monitoring agent)
+    sized against `max_connections` alone with no margin by up to 40 connections versus a deployment built
+    before this release.
+  - **An in-place upgrade of an existing database does NOT pick this up** — the new default only applies at
+    first boot, and an existing data volume already had its first boot. Without action, a backup job or
+    ad-hoc session can still take the slot the `/readyz` probe needs to reconnect, same as before this release.
+  - **To apply it to that existing database**, run the `ALTER SYSTEM` (restart) and the `GRANT` by hand as
+    "Sizing `max_connections`" above shows.
+
   **A new boot-time failure mode on the Postgres container itself**, not just the server binary: both
   `yuzu-postgres` images now refuse to start if `YUZU_PG_RESERVED_CONNECTIONS` is set at or past
   `max_connections − superuser_reserved_connections` — that value would leave zero connection slots any
   other client could ever use. Only reachable by explicitly setting the env var too high; the shipped
-  default (40) never triggers it. **A fresh install or reinstall (a new, empty data volume) picks up the new
-  default silently** — not just an in-place upgrade of an existing database, which the point above already covers.
-  If you size third-party tooling (a backup job, a monitoring agent) against `max_connections` alone with no
-  margin, this reduces their available headroom by up to 40 connections versus a deployment built before this
-  release.
+  default (40) never triggers it. On the single-node image this refusal happens after the role/database/grant
+  already exist, so restarting the same container with a corrected value does not retroactively apply
+  anything — see the note in "Sizing `max_connections`" above.
 - **A new alert, `YuzuServerPostgresUnreachable`**, and three `yuzu_server_pg_reachab*` metrics — see
   `docs/user-manual/metrics.md`.
 - **New flag `--shutdown-drain-seconds`** (`YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, max 60). On

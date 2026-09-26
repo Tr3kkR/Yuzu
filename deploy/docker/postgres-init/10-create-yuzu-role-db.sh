@@ -177,6 +177,11 @@ EOSQL
             echo "  is >= max_connections(${max_conn}) - superuser_reserved_connections(${su_reserved}) = ${ordinary_floor}." >&2
             echo "  That leaves ZERO connection slots any ordinary (non-privileged) client can ever use —" >&2
             echo "  not merely under load. Lower YUZU_PG_RESERVED_CONNECTIONS or raise max_connections." >&2
+            echo "  NOTE: the role/database above already exist on this data directory now — restarting" >&2
+            echo "  this same container with a corrected value will NOT re-run this script (initdb-once)" >&2
+            echo "  and will silently start WITHOUT the fix applied. Either wipe this data volume and" >&2
+            echo "  start fresh, or apply reserved_connections/the GRANT by hand per the 'Existing" >&2
+            echo "  databases' steps in docs/user-manual/server-admin.md." >&2
             exit 1
         fi
         psql -v ON_ERROR_STOP=1 -v n="${YUZU_PG_RESERVED_CONNECTIONS}" \
