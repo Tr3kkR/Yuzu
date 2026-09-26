@@ -2550,19 +2550,31 @@ currently-deactivated account; the two are not distinguished by this field
 confirm either way — the third state exists specifically so a degraded read
 is never misreported as "no active account."
 
-**Errors:** `400` — invalid/missing JSON body, missing `principal_id`,
-`principal_type` other than `"user"`, a malformed `principal_id`, or `{name}`
-is not one of the 6 assignable roles (`ITServiceOwner` and a genuinely
-unknown/custom role name return the identical client-facing message — no
-role-catalog oracle; the specific reason is audited server-side only; use
-`POST /api/v1/management-groups/{id}/roles` for `ITServiceOwner` instead);
-`401` — not authenticated, or MFA step-up not satisfied; `403` — the caller
-does not hold a durable Administrator role, is a service-scoped/engine
-session, or presented an MCP-tier bearer token of any tier (use the
-`assign_rbac_role` MCP tool instead); `503` — the RBAC
-or `AuthDB` store is unavailable, or (on an otherwise-successful assignment)
-its audit row could not persist — treat the grant as unconfirmed and
-reconcile via a read. Audited `rbac.role.assigned` — see
+**Errors:** `400` — invalid JSON, a non-object top-level body (e.g. a JSON
+array or scalar), missing `principal_id`, a `principal_type`/`principal_id`
+field present with the wrong JSON type (degrades to "missing"/"invalid",
+never an uncaught exception), `principal_type` other than `"user"`, a
+malformed `principal_id`, `{name}` is not one of the 6 assignable roles
+(`ITServiceOwner` and a genuinely unknown/custom role name return the
+identical client-facing message — no role-catalog oracle; the specific
+reason is audited server-side only; use `POST
+/api/v1/management-groups/{id}/roles` for `ITServiceOwner` instead), or the
+store rejects the grant for a genuine client-validation reason (a malformed
+or reserved-namespace `principal_id`); `401` — not authenticated, or MFA
+step-up not satisfied; `403` — the caller does not hold a durable
+Administrator role, is a service-scoped/engine session, or presented an
+MCP-tier bearer token of any tier (use the `assign_rbac_role` MCP tool
+instead); `503` — the RBAC or `AuthDB` store is unavailable (including when
+the admin gate itself cannot confirm durable authority — now logged and
+audited as a `denied` row, not silently invisible), a genuine store/query
+fault while writing the grant (as opposed to a client-validation rejection,
+which stays `400` — classified via an allow-list of known validation-error
+shapes, never a denylist, so an unrecognized future error defaults to the
+safer `503`), the defense-in-depth role lookup finding an already-validated
+role name missing from the store (a tampered/hand-edited store — a
+store-integrity fault, never a client error), or (on an otherwise-successful
+assignment) its audit row could not persist — treat the grant as unconfirmed
+and reconcile via a read. Audited `rbac.role.assigned` — see
 `docs/user-manual/audit-log.md`.
 
 ---
@@ -2593,10 +2605,12 @@ through this route, even to hand it to someone else first); `409` —
 with zero **authenticatable** Administrators — the guard counts a grant only
 when its `principal_id` names an active `auth.users` row, so a grant naming a
 nonexistent, deactivated, soft-deleted, or group-held (not creatable via this
-surface) principal is never counted as a surviving administrator; `503` — the RBAC store is unavailable, or (on an
-otherwise-successful unassignment) its audit row could not persist — treat
-the removal as unconfirmed and reconcile via a read. Audited
-`rbac.role.unassigned`.
+surface) principal is never counted as a surviving administrator; `503` — the
+RBAC store is unavailable (including when the admin gate itself cannot
+confirm durable authority — logged and audited as a `denied` row), a
+genuine store/query fault removing the grant, or (on an otherwise-successful
+unassignment) its audit row could not persist — treat the removal as
+unconfirmed and reconcile via a read. Audited `rbac.role.unassigned`.
 
 MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see
 `docs/user-manual/mcp.md`.

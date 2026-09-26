@@ -5735,12 +5735,22 @@ void RestApiV1::register_routes(
             // resolves as a no-op hole, discoverable only by confusion, not
             // by an error.
             if (!rbac_store->get_role(role_name)) {
+                // Doomgoose external review, PR #4985 IMPORTANT finding #3:
+                // reclassified from 400 to 503 — `role_name` has ALREADY
+                // passed the closed six-name allow-list above, so the
+                // caller's input was never wrong; a missing row here is a
+                // tampered/hand-edited store (see the comment above), a
+                // store-integrity fault, never a client-facing rejection.
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "rbac.role.assigned", "denied", "User", audit_target_id,
                     role_name + ": assignable role name missing from store (internal "
                                 "inconsistency)");
-                res.status = 400;
-                res.set_content(detail::a4_error(res, kUniformReject), "application/json");
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "role store integrity fault — an allow-listed role "
+                                          "name is missing from the store; escalate to an "
+                                          "operator"),
+                    "application/json");
                 return;
             }
 
@@ -5764,15 +5774,31 @@ void RestApiV1::register_routes(
 
             auto result = rbac_store->assign_role(assignment);
             if (!result) {
-                // validate_assignment rejects a malformed/reserved-namespace
-                // principal_id here — a 4xx denial, never a 500. Same
-                // uniform client message as the unknown-role/ITServiceOwner
-                // cases (M1); specific reason audited.
+                // Doomgoose external review, PR #4985 IMPORTANT finding #3:
+                // this used to map EVERY assign_role failure to 400
+                // unconditionally — a genuine store fault ("database not
+                // open", a raw PQerrorMessage, the "assign_role failed"
+                // fallback) was misreported as a client rejection instead of
+                // the retryable 503 it actually is. Classify via the shared,
+                // ALLOWLIST-based chokepoint (rbac_store.hpp) — only a
+                // recognized validate_assignment/F1 client-validation shape
+                // maps to 400 (M1's uniform reject message, matching the
+                // unknown-role/ITServiceOwner cases); everything else
+                // (including an unrecognized future error string) defaults
+                // to 503, the safer classification.
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
                                                     "denied", "User", audit_target_id,
                                                     role_name + ": " + result.error());
-                res.status = 400;
-                res.set_content(detail::a4_error(res, kUniformReject), "application/json");
+                if (rbac_assign_error_is_client_fault(result.error())) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, kUniformReject), "application/json");
+                } else {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "role assignment store fault — retry; "
+                                                          "if this persists, escalate to an "
+                                                          "operator"),
+                                    "application/json");
+                }
                 return;
             }
             // #2466/#2406: a privileged mutation whose audit row did not

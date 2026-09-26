@@ -22115,11 +22115,23 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // Defense-in-depth — see the REST route's own comment.
                 if (!rbac_store->get_role(role_name)) {
+                    // Doomgoose external review, PR #4985 IMPORTANT finding
+                    // #3: reclassified from kInvalidParams to kInternalError
+                    // (503-analog, retryable) — role_name has ALREADY passed
+                    // the closed six-name allow-list above, so the caller's
+                    // input was never wrong; a missing row here is a
+                    // store-integrity fault, matching the REST route's own
+                    // fix.
                     (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
                                    role_name + ": assignable role name missing from store "
                                                 "(internal inconsistency)");
-                    res.set_content(error_response(id, kInvalidParams, kUniformReject),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "role store integrity fault — an allow-listed role name is "
+                                 "missing from the store; escalate to an operator",
+                                 "escalate to an operator",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
                     return;
                 }
 
@@ -22136,13 +22148,31 @@ McpServer::HandlerFn McpServer::build_handler(
                 assignment.role_name = role_name;
                 auto result = rbac_store->assign_role(assignment);
                 if (!result) {
-                    // retry-hint-exempt: validate_assignment's business-rule
-                    // rejection (malformed/reserved-namespace principal_id),
-                    // not a store fault.
+                    // Doomgoose external review, PR #4985 IMPORTANT finding
+                    // #3: this used to map EVERY assign_role failure to
+                    // kInvalidParams unconditionally — a genuine store fault
+                    // was misreported as a permanent client rejection
+                    // instead of the retryable kInternalError it actually
+                    // is. Classify via the shared, ALLOWLIST-based
+                    // chokepoint (rbac_store.hpp) — matches the REST route's
+                    // own fix.
                     (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
                                    role_name + ": " + result.error());
-                    res.set_content(error_response(id, kInvalidParams, kUniformReject),
-                                    "application/json");
+                    if (rbac_assign_error_is_client_fault(result.error())) {
+                        // retry-hint-exempt: validate_assignment's
+                        // business-rule rejection (malformed/reserved-
+                        // namespace principal_id), not a store fault.
+                        res.set_content(error_response(id, kInvalidParams, kUniformReject),
+                                        "application/json");
+                    } else {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "role assignment store fault — retry; if this persists, "
+                                     "escalate to an operator",
+                                     "retry shortly",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                    }
                     return;
                 }
                 bool audit_ok = yuzu::server::detail::try_persist_audit(

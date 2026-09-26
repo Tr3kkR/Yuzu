@@ -879,6 +879,70 @@ TEST_CASE("REST unassign C1(c): removing the fleet's real Administrator is "
     CHECK(h.rbac->get_principal_roles("user", "realadmin").size() == 1);
 }
 
+// ── REST: assign_role store-fault classification (Doomgoose external
+// review, PR #4985 IMPORTANT finding #3) — a genuine store/query fault on
+// assign_role must map to 503, never the 400 a genuine client-input
+// rejection gets (the pre-fix behavior mapped BOTH to 400 unconditionally).
+// ──────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("REST assign: a genuine store fault on assign_role's own write "
+          "maps to 503, never the 400 a client-input rejection gets (PR "
+          "#4985 finding #3)",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false); // admin gate never touches principal_roles
+
+    // DROP TABLE on a second connection forces a genuine query-level
+    // failure (same technique the target_provisioned=="unknown" test above,
+    // test_device_lens_routes.cpp, and test_dex_api.cpp use) — RBAC-off so
+    // the admin gate itself (a durable AuthDB re-read) is unaffected by the
+    // dropped table, isolating the failure to assign_role's own INSERT.
+    // Each TEST_CASE gets its own cloned database, so the DDL is contained.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.assign_rest("Operator",
+                             R"({"principal_type":"user","principal_id":"jane"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "rbac.role.assigned");
+    CHECK(h.audit_log.back().result == "denied");
+}
+
+TEST_CASE("REST assign: the get_role() internal-inconsistency check maps to "
+          "503, not 400 — an allow-listed role name is a store-integrity "
+          "fault, never a client rejection (PR #4985 finding #3)",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    // Delete the (already-seeded, allow-listed) "Operator" row from
+    // rbac_store.roles directly — role_name still passes
+    // is_rbac_assignable_role() (a compile-time constant list, not a store
+    // read), so the request itself is well-formed; only the defense-in-
+    // depth get_role() lookup fails, exactly the "tampered/hand-edited
+    // store" scenario that check's own comment describes.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DELETE FROM rbac_store.roles WHERE name = 'Operator'")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.assign_rest("Operator",
+                             R"({"principal_type":"user","principal_id":"jane"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+}
+
 // ── REST: audit fail-closed ──────────────────────────────────────────────────
 
 TEST_CASE("REST assign: fails CLOSED (503) when its audit write drops",
@@ -977,6 +1041,41 @@ TEST_CASE("MCP assign_rbac_role: a non-admin caller is denied",
     REQUIRE(res);
     CHECK(res->body.find("\"error\"") != std::string::npos);
     CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+}
+
+// Doomgoose external review, PR #4985 IMPORTANT finding #3 — MCP twin of the
+// REST store-fault classification tests above: a genuine store/query fault
+// on assign_role must map to kInternalError (retryable), never the
+// kInvalidParams a genuine client-input rejection gets.
+TEST_CASE("MCP assign_rbac_role: a genuine store fault on assign_role's own "
+          "write maps to kInternalError, never the kInvalidParams a "
+          "client-input rejection gets (PR #4985 finding #3)",
+          "[pg][mcp][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false); // admin gate never touches principal_roles
+
+    // DROP TABLE on a second connection — see the REST twin's identical
+    // comment above for the full reasoning. Dropped BEFORE the ticket mint
+    // (mcp_call_tool_approved): ApprovalManager lives on its own separate
+    // database, so the mint/approve dance is unaffected; only the RECALL's
+    // reach into assign_role's own INSERT fails.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.mcp_call_tool_approved(
+        "assign_rbac_role",
+        {{"principal_type", "user"}, {"principal_id", "jane"}, {"role", "Operator"}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["code"] != yuzu::server::mcp::kInvalidParams);
 }
 
 TEST_CASE("MCP unassign_rbac_role: last-Administrator refusal is a JSON-RPC "

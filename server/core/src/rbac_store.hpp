@@ -680,6 +680,41 @@ inline constexpr std::string_view kRbacLastAdminRefusalMarker = "zero administra
     return msg.find(kRbacLastAdminRefusalMarker) != std::string::npos;
 }
 
+/// True iff `msg` (an `RbacStore::assign_role` error string) is a genuine
+/// CLIENT-facing validation rejection — one of `validate_assignment`'s own
+/// messages, or `assign_role`'s own built-in-system-role rejection (F1) —
+/// rather than a store/query fault (`"database not open"`, a raw
+/// `PQerrorMessage` string, or the ambiguous `"assign_role failed"`
+/// fallback). Doomgoose external review, PR #4985 IMPORTANT finding #3: both
+/// the REST and MCP `assign_rbac_role` twins previously mapped EVERY
+/// `!assign_role(...)` outcome to a 400/`kInvalidParams` client error
+/// unconditionally — a genuine store fault (a dropped connection, a Postgres
+/// error) was misreported as "your input was rejected" rather than the
+/// retryable 503/`kInternalError` it actually is.
+///
+/// ALLOWLIST, not a denylist, by design: an unrecognized FUTURE error string
+/// from `assign_role` (one this list has not been updated for) defaults to
+/// the SAFER "store fault, retryable" classification rather than silently
+/// masquerading as a permanent client rejection. EXTEND this allowlist
+/// whenever `validate_assignment`/`assign_role` grows a new genuine
+/// client-validation message — match the FIXED, non-interpolated wording
+/// only, never a caller-controlled substring (`role_name`/`principal_id` are
+/// interpolated into several of these messages).
+///
+/// Scoped to `assign_role` only — `unassign_role`'s error vocabulary is
+/// different (no `validate_assignment` call) and is already correctly
+/// classified via `is_rbac_last_admin_refusal` above; do not reuse this
+/// helper for unassign's errors.
+[[nodiscard]] inline bool rbac_assign_error_is_client_fault(std::string_view msg) noexcept {
+    return msg.find("reserved 'engine:' namespace may only be assigned under") !=
+               std::string_view::npos ||
+           msg.find("unrecognized principal_type '") != std::string_view::npos ||
+           msg.find("must be in the reserved 'engine:<slug>' namespace") !=
+               std::string_view::npos ||
+           msg.find("cannot be granted the admin/full-access role") != std::string_view::npos ||
+           msg.find("cannot be granted a built-in system role") != std::string_view::npos;
+}
+
 /// Build the `groups.name` used for an IdP-sourced group: `source:external_id`.
 /// `source == "local"` groups are NOT namespaced — returns `external_id`
 /// unchanged. The confused-deputy fix for #1832.
