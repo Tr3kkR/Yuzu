@@ -1640,7 +1640,11 @@ fail-closed LB turns a degradation into an outage.
   keeps probe/pool fidelity: the shipped images set `reserved_connections` (default 40, env
   `YUZU_PG_RESERVED_CONNECTIONS`, PG 16+) and grant `pg_use_reserved_connections` to the app role, so the
   pool **and** the probe draw from the same reserve ahead of a backup job or an ad-hoc `psql` — the app is
-  privileged over other clients, not the probe over the pool. WS-9 scenario N reproduces both halves:
+  privileged over other clients, not the probe over the pool. Both scripts refuse to boot if
+  `YUZU_PG_RESERVED_CONNECTIONS` reaches `max_connections − superuser_reserved_connections` (Gate 2 finding
+  #1, added in the same PR before merge) — that value would leave zero ordinary slots any non-privileged
+  client could ever use, not merely under load, which is a self-inflicted version of the exact failure this
+  decision closes. WS-9 scenario N reproduces both halves:
   with every unreserved slot held by foreign sessions, a killed probe backend reconnects into the reserve
   and `/readyz` stays 200; with the grant revoked the same kill leaves the probe refused and `/readyz` reads
   `503 unreachable` — the failure the default prevents. Accepted residual: exhaustion by other *privileged*

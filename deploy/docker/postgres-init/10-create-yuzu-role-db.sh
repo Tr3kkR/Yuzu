@@ -162,6 +162,23 @@ SELECT format('GRANT pg_use_reserved_connections TO %I', :'yuzu_user')
 \gexec
 EOSQL
     if [[ -z "${PATRONI_SCOPE:-}" ]]; then
+        # Bound the reserve against the LIVE cluster (an operator may have passed
+        # their own -c max_connections=... to `docker run`, so the check reads it
+        # back rather than assuming the image default). reserved_connections is a
+        # hard carve-out on Postgres: set it at or past max_connections minus
+        # superuser_reserved_connections and NO ordinary (non-privileged) client —
+        # a backup job, Grafana's DSN, an operator's own psql — can ever connect
+        # again, not merely under load (security-guardian, Gate 2 finding #1).
+        max_conn=$(psql -At -v ON_ERROR_STOP=1             --username "${POSTGRES_USER}" --dbname postgres -c "SHOW max_connections")
+        su_reserved=$(psql -At -v ON_ERROR_STOP=1             --username "${POSTGRES_USER}" --dbname postgres -c "SHOW superuser_reserved_connections")
+        ordinary_floor=$(( max_conn - su_reserved ))
+        if (( YUZU_PG_RESERVED_CONNECTIONS >= ordinary_floor )); then
+            echo "yuzu-postgres init: ERROR — YUZU_PG_RESERVED_CONNECTIONS=${YUZU_PG_RESERVED_CONNECTIONS}" >&2
+            echo "  is >= max_connections(${max_conn}) - superuser_reserved_connections(${su_reserved}) = ${ordinary_floor}." >&2
+            echo "  That leaves ZERO connection slots any ordinary (non-privileged) client can ever use —" >&2
+            echo "  not merely under load. Lower YUZU_PG_RESERVED_CONNECTIONS or raise max_connections." >&2
+            exit 1
+        fi
         psql -v ON_ERROR_STOP=1 -v n="${YUZU_PG_RESERVED_CONNECTIONS}" \
              --username "${POSTGRES_USER}" --dbname postgres <<'EOSQL'
 SELECT format('ALTER SYSTEM SET reserved_connections = %s', :'n'::int)

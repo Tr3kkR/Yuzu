@@ -39,6 +39,17 @@ if ! [[ "${YUZU_PG_RESERVED_CONNECTIONS}" =~ ^[0-9]{1,6}$ ]]; then
     echo "patroni-entrypoint: YUZU_PG_RESERVED_CONNECTIONS must be a non-negative integer (got '${YUZU_PG_RESERVED_CONNECTIONS}')" >&2
     exit 1
 fi
+# Bound against this file's own max_connections=200 below and Postgres's
+# superuser_reserved_connections default of 3 (not overridden here) — a value
+# at or past 197 leaves ZERO slots any ordinary (non-privileged) client can
+# ever use, not merely under load (security-guardian, Gate 2 finding #1).
+# Kept as a literal alongside max_connections rather than queried, since no
+# server is running yet at render time; the two numbers are read from the
+# SAME place a future change to either would need to touch.
+if (( YUZU_PG_RESERVED_CONNECTIONS >= 200 - 3 )); then
+    echo "patroni-entrypoint: YUZU_PG_RESERVED_CONNECTIONS=${YUZU_PG_RESERVED_CONNECTIONS} is >= max_connections(200) - superuser_reserved_connections(3) = 197" >&2
+    exit 1
+fi
 YUZU_PG_DURABILITY="${YUZU_PG_DURABILITY:-quorum3}"
 # CIDR permitted to open host (TCP) connections — replication + app. Defaults
 # OPEN so a bring-your-own network works out of the box; the shipped compose

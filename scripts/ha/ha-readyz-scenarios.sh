@@ -71,6 +71,15 @@
 # the self-hosted CI runners share one OS identity (#1871). Manual today, like
 # the other scripts/ha/ harnesses (no workflow runs it).
 #
+# Passwords generated here (PG_PASS, APP_PASS) are for THROWAWAY, localhost-only
+# containers this script creates and destroys, and this is a LOCAL harness, not
+# a shipped artifact. Scenarios that grep the server log for a password's
+# ABSENCE (e.g. N) prove only that the SERVER never logs it — every DSN/password
+# is still visible in this process's own argv (`docker run`/`docker exec`/the
+# server invocation itself), same as every earlier scenario's `$PG_PASS`-bearing
+# DSN. Do not read a clean server-log grep as a complete secrecy proof
+# (security-guardian, Gate 2 finding #6).
+#
 # usage: ha-readyz-scenarios.sh [--server-bin PATH]
 set -uo pipefail
 
