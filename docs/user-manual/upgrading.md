@@ -244,7 +244,13 @@ What you may observe after upgrading:
   points at `/readyz`, move it to `/livez` before upgrading — otherwise a database blip restarts every
   server.
 - **One more Postgres connection per server** (the probe). Budget `N_servers × 2` connections beyond the
-  pool against `max_connections` (the other extra one is the leader-election connection).
+  pool against `max_connections` (the other extra one is the leader-election connection) — the full
+  formula is in `server-admin.md`, "Sizing `max_connections`".
+- **The shipped `yuzu-postgres` images now reserve connection slots for the app role** (#4943):
+  `reserved_connections = 40` (env `YUZU_PG_RESERVED_CONNECTIONS`) and `GRANT pg_use_reserved_connections`
+  to the app role, applied at **first boot only**. An existing database does not pick this up on upgrade —
+  apply the `ALTER SYSTEM` (restart) and the `GRANT` by hand as that section shows, or a backup job or ad-hoc
+  session can still take the slot the `/readyz` probe needs to reconnect. PostgreSQL 16 or newer.
 - **A new alert, `YuzuServerPostgresUnreachable`**, and three `yuzu_server_pg_reachab*` metrics — see
   `docs/user-manual/metrics.md`.
 - **New flag `--shutdown-drain-seconds`** (`YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, max 60). On
@@ -262,8 +268,9 @@ What you may observe after upgrading:
   readiness, but under Docker Swarm or an auto-heal sidecar an outage longer than the healthcheck's
   retry window marks the container unhealthy and restarts it. Point restart-driving checks at `/livez`.
 
-**What to do:** point liveness probes at `/livez`, readiness at `/readyz`; check your Postgres
-`max_connections` headroom; set `--shutdown-drain-seconds` if a load balancer fronts the server.
+**What to do:** point liveness probes at `/livez`, readiness at `/readyz`; size `max_connections` by the
+formula and apply the reserved-slot grant on an existing database; set `--shutdown-drain-seconds` and the
+recommended health-check thresholds if a load balancer fronts the server.
 
 ## Behaviour change: legacy `/api/executions*` routes are now management-group confined (#3789)
 
